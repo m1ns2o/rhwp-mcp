@@ -81,6 +81,13 @@ export class CanvasKitLayerRenderer {
     const resolvedSurfaceRequest = typeof surfaceRequest === 'string'
       ? { ...DEFAULT_CANVASKIT_SURFACE_REQUEST, preference: surfaceRequest, requested: surfaceRequest }
       : surfaceRequest;
+    // P16 한계 (후속 폰트 작업에서 보강 예정):
+    // 이 단계는 단일 기본 CJK typeface (NotoSansKR-Regular) 만 로드한다. 문서가
+    // 지정한 fontFamily 별 typeface 매핑, glyph sidecar direct replay, fontFace
+    // 폴백 체인은 아직 없다. 기본 typeface 로딩이 실패하면 (네트워크/디코딩 실패)
+    // defaultTypeface=null 이 되고, 그 상태에서는 textRun 이 거의 그려지지 않아
+    // "글자가 안 나오는" 현상이 나타날 수 있다. 이는 P16 foundation 의 알려진
+    // non-goal 이며, 동일 컨트리뷰터의 후속 폰트 단계에서 다룬다 (Refs #536).
     let defaultTypeface: Typeface | null = null;
     try {
       const response = await fetch('fonts/NotoSansKR-Regular.woff2');
@@ -388,6 +395,10 @@ export class CanvasKitLayerRenderer {
     const paint = this.makeFillPaint(style.color ?? '#000000');
     paint.setAntiAlias?.(true);
     const fontSize = style.fontSize ?? Math.max(1, op.bbox.height || 12);
+    // P16 한계: 기본 typeface 가 없으면 (로딩 실패) 비-Latin (CJK 등) 텍스트는
+    // 글리프를 만들 수 없어 조용히 skip 하고 진단(unsupportedOps)에만 남긴다.
+    // Canvas2D 로 덮지 않는 것이 P16 본질이다. fontFamily 별 typeface 매핑과
+    // 폴백 체인은 동일 컨트리뷰터의 후속 폰트 단계에서 보강한다 (Refs #536).
     if (!this.defaultTypeface && /[^\u0000-\u00ff]/.test(op.text)) {
       this.unsupportedOps.add('textRunFont');
       paint.delete();
