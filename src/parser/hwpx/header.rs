@@ -1062,7 +1062,9 @@ fn parse_border_fill(
                             let mut grad = GradientFill::default();
                             for attr in ce.attributes().flatten() {
                                 match attr.key.as_ref() {
-                                    b"type" => grad.gradient_type = parse_gradient_type(&attr_str(&attr)),
+                                    b"type" => {
+                                        grad.gradient_type = parse_gradient_type(&attr_str(&attr))
+                                    }
                                     b"angle" => grad.angle = parse_i16(&attr),
                                     b"centerX" => grad.center_x = parse_i16(&attr),
                                     b"centerY" => grad.center_y = parse_i16(&attr),
