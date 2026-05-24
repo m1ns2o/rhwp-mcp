@@ -578,24 +578,62 @@ impl TypesetEngine {
                     .map(|ps| ps.spacing_before)
                     .unwrap_or(0.0);
                 let para_sb_hu = (para_sb * 7200.0 / 96.0) as i32;
-                if para_sb_hu >= 500 {
-                    let is_synth = |ls: &crate::model::paragraph::LineSeg| ls.tag & 0x80000000 != 0;
-                    let prev_real = variant_prev_para_idx.and_then(|prev_pi| {
-                        (0..=prev_pi).rev().find_map(|i| {
-                            paragraphs
-                                .get(i)
-                                .and_then(|p| p.line_segs.last())
-                                .filter(|ls| !is_synth(ls))
+                let is_synth = |ls: &crate::model::paragraph::LineSeg| ls.tag & 0x80000000 != 0;
+                let prev_real_idx_and_ls = variant_prev_para_idx.and_then(|prev_pi| {
+                    (0..=prev_pi).rev().find_map(|i| {
+                        paragraphs
+                            .get(i)
+                            .and_then(|p| p.line_segs.last())
+                            .filter(|ls| !is_synth(ls))
+                            .map(|ls| (i, ls))
+                    })
+                });
+                let curr_real = para.line_segs.first().filter(|ls| !is_synth(ls));
+                if let Some((prev_real_idx, prev_last)) = prev_real_idx_and_ls {
+                    let prev_end_vpos = prev_last.vertical_pos + prev_last.line_height;
+                    let high_threshold = body_height_hu_for_variant * 95 / 100;
+                    let table_heading_reset = prev_real_idx + 1 == para_idx
+                        && para.line_segs.is_empty()
+                        && para.controls.is_empty()
+                        && para_has_visible_text(para)
+                        && para_sb_hu >= 500
+                        && prev_end_vpos > body_height_hu_for_variant * 85 / 100
+                        && paragraphs.get(prev_real_idx).is_some_and(|prev_para| {
+                            prev_para
+                                .controls
+                                .iter()
+                                .any(|c| matches!(c, Control::Table(t) if t.common.treat_as_char))
                         })
-                    });
-                    let curr_real = para.line_segs.first().filter(|ls| !is_synth(ls));
-                    if let (Some(prev_last), Some(curr_first)) = (prev_real, curr_real) {
-                        let prev_end_vpos = prev_last.vertical_pos + prev_last.line_height;
+                        && paragraphs
+                            .get(para_idx + 1)
+                            .and_then(|next_para| next_para.line_segs.first())
+                            .filter(|ls| !is_synth(ls))
+                            .is_some_and(|ls| ls.vertical_pos <= 4000);
+
+                    let real_heading_or_bridge_reset = curr_real.is_some_and(|curr_first| {
                         let curr_first_vpos = curr_first.vertical_pos;
-                        let high_threshold = body_height_hu_for_variant * 95 / 100;
-                        if prev_end_vpos > high_threshold && curr_first_vpos < 1500 {
-                            variant_vpos_reset_break = true;
-                        }
+                        let strict_heading_reset = para_sb_hu >= 500
+                            && prev_end_vpos > high_threshold
+                            && curr_first_vpos < 1500;
+                        let bridge_missing_count = (prev_real_idx + 1..para_idx)
+                            .filter(|&i| {
+                                paragraphs.get(i).is_some_and(|p| {
+                                    p.line_segs.is_empty()
+                                        && p.controls.is_empty()
+                                        && para_has_visible_text(p)
+                                })
+                            })
+                            .count();
+                        let bridged_reset = bridge_missing_count >= 2
+                            && para.controls.is_empty()
+                            && para_has_visible_text(para)
+                            && curr_first_vpos <= 1500
+                            && prev_end_vpos > body_height_hu_for_variant * 75 / 100;
+                        strict_heading_reset || bridged_reset
+                    });
+
+                    if table_heading_reset || real_heading_or_bridge_reset {
+                        variant_vpos_reset_break = true;
                     }
                 }
             }
@@ -3049,6 +3087,7 @@ impl TypesetEngine {
         // [Task #993] advance_row_cut 호출용 LayoutEngine — 컷 측정은 dpi 와
         // 셀 패딩/중첩 표 높이 계산에만 의존하므로 ad hoc 인스턴스로 충분하다.
         let layout_engine = crate::renderer::layout::LayoutEngine::new(self.dpi);
+        layout_engine.set_hwp3_variant(st.is_hwp3_variant);
         // [Task #993] rowspan(row_span>1) 셀이 걸친 행 — 컷 모델(advance_row_cut)은
         // row_span==1 셀만 다루므로 rowspan 셀 높이를 측정하지 못한다. 구현계획서
         // §4대로 rowspan 행은 MeasuredTable 행 높이를 권위로 쓴다(렌더러도 동일).

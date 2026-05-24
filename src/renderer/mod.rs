@@ -561,6 +561,52 @@ pub fn corrected_line_height(
     }
 }
 
+/// LINE_SEG의 line_height/line_spacing 의미를 보존하면서 폴백 line_height를 보정한다.
+///
+/// raw line_height가 글자 크기보다 작은 합성 줄은 한컴의
+/// `(line_height=base, line_spacing=extra)` 모델에 맞춰 분해한다.
+#[inline]
+pub fn corrected_line_metrics(
+    raw_lh: f64,
+    raw_ls: f64,
+    max_fs: f64,
+    ls_type: LineSpacingType,
+    ls_val: f64,
+) -> (f64, f64) {
+    if max_fs > 0.0 && raw_lh < max_fs {
+        match ls_type {
+            LineSpacingType::Percent => {
+                let extra = (max_fs * (ls_val - 100.0) / 100.0).max(0.0);
+                (max_fs, extra)
+            }
+            LineSpacingType::Fixed => (ls_val.max(max_fs), 0.0),
+            LineSpacingType::SpaceOnly => (max_fs, ls_val.max(0.0)),
+            LineSpacingType::Minimum => (ls_val.max(max_fs), 0.0),
+        }
+    } else {
+        (raw_lh, raw_ls)
+    }
+}
+
+/// HWP3-origin HWP5 conversions may omit PARA_LINE_SEG for body paragraphs.
+/// The composer then emits synthetic lines with a tiny raw line height. For
+/// those synthetic lines, applying ParaShape's percent line spacing again makes
+/// the paragraph too tall compared with Hancom's converted layout.
+#[inline]
+pub fn corrected_line_height_for_variant_synthetic(
+    raw_lh: f64,
+    max_fs: f64,
+    ls_type: LineSpacingType,
+    ls_val: f64,
+    hwp3_variant_synthetic: bool,
+) -> f64 {
+    if hwp3_variant_synthetic && max_fs > 0.0 && raw_lh < max_fs {
+        max_fs
+    } else {
+        corrected_line_height(raw_lh, max_fs, ls_type, ls_val)
+    }
+}
+
 /// HWPUNIT을 픽셀로 변환
 #[inline]
 pub fn hwpunit_to_px(hwpunit: i32, dpi: f64) -> f64 {

@@ -10,6 +10,10 @@ use crate::model::shape::CaptionDirection;
 use crate::renderer::height_measurer::{HeightMeasurer, MeasuredSection};
 use crate::renderer::page_layout::PageLayoutInfo;
 
+fn para_has_visible_text(para: &Paragraph) -> bool {
+    para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
+}
+
 impl Paginator {
     pub fn paginate_with_measured(
         &self,
@@ -59,7 +63,7 @@ impl Paginator {
             0
         };
         let layout = PageLayoutInfo::from_page_def(page_def, column_def, self.dpi);
-        let measurer = HeightMeasurer::new(self.dpi);
+        let measurer = HeightMeasurer::new(self.dpi).with_hwp3_variant(is_hwp3_variant);
 
         // 머리말/꼬리말/쪽 번호 위치/새 번호 지정 컨트롤 수집
         let (hf_entries, page_number_pos, page_hides, new_page_numbers) =
@@ -179,24 +183,62 @@ impl Paginator {
                     .get(para.para_shape_id as usize)
                     .map(|ps| (ps.spacing_before * 7200.0 / 96.0) as i32)
                     .unwrap_or(0);
-                if para_sb_hu >= 500 {
-                    let is_synth = |ls: &crate::model::paragraph::LineSeg| ls.tag & 0x80000000 != 0;
-                    let prev_real = prev_pagination_para.and_then(|prev_pi| {
-                        (0..=prev_pi).rev().find_map(|i| {
-                            paragraphs
-                                .get(i)
-                                .and_then(|p| p.line_segs.last())
-                                .filter(|ls| !is_synth(ls))
+                let is_synth = |ls: &crate::model::paragraph::LineSeg| ls.tag & 0x80000000 != 0;
+                let prev_real_idx_and_ls = prev_pagination_para.and_then(|prev_pi| {
+                    (0..=prev_pi).rev().find_map(|i| {
+                        paragraphs
+                            .get(i)
+                            .and_then(|p| p.line_segs.last())
+                            .filter(|ls| !is_synth(ls))
+                            .map(|ls| (i, ls))
+                    })
+                });
+                let curr_real = para.line_segs.first().filter(|ls| !is_synth(ls));
+                if let Some((prev_real_idx, prev_last)) = prev_real_idx_and_ls {
+                    let prev_end_vpos = prev_last.vertical_pos + prev_last.line_height;
+                    let high_threshold = body_height_hu_for_variant * 95 / 100;
+                    let table_heading_reset = prev_real_idx + 1 == para_idx
+                        && para.line_segs.is_empty()
+                        && para.controls.is_empty()
+                        && para_has_visible_text(para)
+                        && para_sb_hu >= 500
+                        && prev_end_vpos > body_height_hu_for_variant * 85 / 100
+                        && paragraphs.get(prev_real_idx).is_some_and(|prev_para| {
+                            prev_para
+                                .controls
+                                .iter()
+                                .any(|c| matches!(c, Control::Table(t) if t.common.treat_as_char))
                         })
-                    });
-                    let curr_real = para.line_segs.first().filter(|ls| !is_synth(ls));
-                    if let (Some(prev_last), Some(curr_first)) = (prev_real, curr_real) {
-                        let prev_end_vpos = prev_last.vertical_pos + prev_last.line_height;
+                        && paragraphs
+                            .get(para_idx + 1)
+                            .and_then(|next_para| next_para.line_segs.first())
+                            .filter(|ls| !is_synth(ls))
+                            .is_some_and(|ls| ls.vertical_pos <= 4000);
+
+                    let real_heading_or_bridge_reset = curr_real.is_some_and(|curr_first| {
                         let curr_first_vpos = curr_first.vertical_pos;
-                        let high_threshold = body_height_hu_for_variant * 95 / 100;
-                        if prev_end_vpos > high_threshold && curr_first_vpos < 1500 {
-                            variant_vpos_reset_break = true;
-                        }
+                        let strict_heading_reset = para_sb_hu >= 500
+                            && prev_end_vpos > high_threshold
+                            && curr_first_vpos < 1500;
+                        let bridge_missing_count = (prev_real_idx + 1..para_idx)
+                            .filter(|&i| {
+                                paragraphs.get(i).is_some_and(|p| {
+                                    p.line_segs.is_empty()
+                                        && p.controls.is_empty()
+                                        && para_has_visible_text(p)
+                                })
+                            })
+                            .count();
+                        let bridged_reset = bridge_missing_count >= 2
+                            && para.controls.is_empty()
+                            && para_has_visible_text(para)
+                            && curr_first_vpos <= 1500
+                            && prev_end_vpos > body_height_hu_for_variant * 75 / 100;
+                        strict_heading_reset || bridged_reset
+                    });
+
+                    if table_heading_reset || real_heading_or_bridge_reset {
+                        variant_vpos_reset_break = true;
                     }
                 }
             }

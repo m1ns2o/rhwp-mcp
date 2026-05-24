@@ -1186,12 +1186,18 @@ impl LayoutEngine {
             // PARA_LINE_SEG가 없는 폴백(400 HWPUNIT=5.333px) 등 line_height가 폰트 크기보다 작으면,
             // ParaShape의 줄간격 설정(line_spacing_type + line_spacing)으로 올바른 줄 높이를 계산한다.
             let raw_lh = hwpunit_to_px(comp_line.line_height, self.dpi);
-            let line_height = {
+            let (line_height, line_spacing_px) = {
                 let ls_val = para_style.map(|s| s.line_spacing).unwrap_or(160.0);
                 let ls_type = para_style
                     .map(|s| s.line_spacing_type)
                     .unwrap_or(LineSpacingType::Percent);
-                crate::renderer::corrected_line_height(raw_lh, max_fs, ls_type, ls_val)
+                crate::renderer::corrected_line_metrics(
+                    raw_lh,
+                    hwpunit_to_px(comp_line.line_spacing, self.dpi),
+                    max_fs,
+                    ls_type,
+                    ls_val,
+                )
             };
             // 인라인 Shape(글상자)가 있는 줄: line_height에 Shape 높이가 포함됨
             // Shape는 별도 패스에서 para_y 기준으로 렌더링되므로,
@@ -3645,7 +3651,6 @@ impl LayoutEngine {
             } else if skip_advance_empty_wrap {
                 // no advance
             } else {
-                let line_spacing_px = hwpunit_to_px(comp_line.line_spacing, self.dpi);
                 y += line_height + line_spacing_px;
             }
         }

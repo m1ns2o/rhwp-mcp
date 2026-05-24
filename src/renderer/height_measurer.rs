@@ -160,11 +160,20 @@ pub struct MeasuredSection {
 /// 높이 측정 엔진
 pub struct HeightMeasurer {
     dpi: f64,
+    is_hwp3_variant: bool,
 }
 
 impl HeightMeasurer {
     pub fn new(dpi: f64) -> Self {
-        Self { dpi }
+        Self {
+            dpi,
+            is_hwp3_variant: false,
+        }
+    }
+
+    pub fn with_hwp3_variant(mut self, enabled: bool) -> Self {
+        self.is_hwp3_variant = enabled;
+        self
     }
 
     pub fn with_default_dpi() -> Self {
