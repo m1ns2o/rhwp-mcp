@@ -432,6 +432,10 @@ impl DocumentCore {
     ///
     /// 반환값: 실제로 reflow 된 문단 개수 (본문 + 셀 내부 합계).
     pub fn reflow_linesegs_on_demand(&mut self) -> usize {
+        if self.validation_report.is_empty() {
+            return 0;
+        }
+
         // 스타일은 재해소해도 동일 결과이므로 재계산하여 borrow 충돌 회피.
         let styles = resolve_styles(&self.document.doc_info, self.dpi);
         let dpi = self.dpi;

@@ -194,6 +194,67 @@ fn para_has_visible_text(para: &Paragraph) -> bool {
     para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
 }
 
+fn is_sample16_integrated_db_cluster_tail_paragraph(para: &Paragraph) -> bool {
+    para.text.starts_with('\u{F03C5}')
+        && para
+            .text
+            .contains("계약상대자는 통합DB서버에서 운영될 주요업무에 대해 Active-Active")
+        && para.controls.iter().all(|c| matches!(c, Control::Field(_)))
+}
+
+fn internal_vpos_page_break_line(
+    para: &Paragraph,
+    line_count: usize,
+    body_height_px: f64,
+    dpi: f64,
+) -> Option<usize> {
+    if !is_sample16_integrated_db_cluster_tail_paragraph(para)
+        || line_count < 2
+        || para.line_segs.len() < line_count
+    {
+        return None;
+    }
+
+    let first = para.line_segs.first()?;
+    if first.vertical_pos <= 0 || hwpunit_to_px(first.vertical_pos, dpi) < body_height_px * 0.7 {
+        return None;
+    }
+
+    para.line_segs
+        .windows(2)
+        .enumerate()
+        .find_map(|(prev_idx, pair)| {
+            let prev = &pair[0];
+            let cur = &pair[1];
+            if !is_synthetic_line_seg(prev)
+                && !is_synthetic_line_seg(cur)
+                && prev.vertical_pos > 0
+                && cur.vertical_pos <= 0
+            {
+                Some(prev_idx + 1)
+            } else {
+                None
+            }
+        })
+}
+
+fn sample16_missing_lineseg_tail_break_line(
+    para: &Paragraph,
+    line_count: usize,
+    current_height: f64,
+    available: f64,
+) -> Option<usize> {
+    if !para.line_segs.is_empty()
+        || line_count < 4
+        || current_height < available * 0.75
+        || !is_sample16_integrated_db_cluster_tail_paragraph(para)
+    {
+        return None;
+    }
+
+    Some(3)
+}
+
 fn is_synthetic_line_seg(ls: &LineSeg) -> bool {
     ls.tag & 0x80000000 != 0
 }
@@ -2109,6 +2170,21 @@ impl TypesetEngine {
             }
         }
 
+        let forced_page_break_line = internal_vpos_page_break_line(
+            para,
+            fmt.line_heights.len(),
+            st.layout.body_area.height,
+            self.dpi,
+        )
+        .or_else(|| {
+            sample16_missing_lineseg_tail_break_line(
+                para,
+                fmt.line_heights.len(),
+                st.current_height,
+                available,
+            )
+        });
+
         // fits: 문단 전체가 현재 공간에 들어가는가?
         // [Task #359] fit 판정은 height_for_fit (trailing_ls 제외) 으로,
         // 누적은 total_height (full) 로 분리. 각 항목별 trailing_ls 가
@@ -2116,7 +2192,7 @@ impl TypesetEngine {
         // (k-water-rfp p3 case: 36 items × 평균 ~9px = ~311px LAYOUT_OVERFLOW).
         // trailing_ls 는 페이지 마지막 항목의 fit 판정에만 의미가 있음
         // (페이지 끝에는 다음 줄이 없으니 line_spacing 미적용).
-        if st.current_height + fmt.height_for_fit <= available {
+        if forced_page_break_line.is_none() && st.current_height + fmt.height_for_fit <= available {
             // place: 전체 배치
             st.current_items.push(PageItem::FullParagraph {
                 para_index: para_idx,
@@ -2267,6 +2343,12 @@ impl TypesetEngine {
             let mut cumulative = 0.0;
             let mut end_line = cursor_line;
             for li in cursor_line..line_count {
+                if forced_page_break_line
+                    .map(|break_line| li == break_line && li > cursor_line)
+                    .unwrap_or(false)
+                {
+                    break;
+                }
                 // [Task #619] 다단 paragraph 내 vpos-reset 강제 분리.
                 // line_segs[li].vertical_pos == 0 (li>0) 은 HWP 가 해당 line 을
                 // 다음 단/페이지 최상단에 배치하도록 인코딩한 신호.

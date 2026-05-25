@@ -79,11 +79,11 @@ fn decode_hwp3_extra(ch: u16) -> Option<char> {
         0x3479 => 0x25B7,  // ▷ WHITE RIGHT-POINTING TRIANGLE
         0x347A => 0x25B6,  // ▶ BLACK RIGHT-POINTING TRIANGLE
         0x3441 => 0x25A0,  // ■ BLACK SQUARE
-        // [Task #877 Stage 3 v4 → Stage 4] sample16 paragraph 89 등의 글머리 prefix.
-        // HWP3 0x3366 → 한컴 HWP5 변환본 paragraph 89 첫 char "\u{f03c5}" (PUA — ⓛ 비슷한 글머리).
-        // rhwp-studio 의 font fallback 이 PUA glyph 미보유 → invisible 회귀. 표준
-        // unicode '○' (U+25CB WHITE CIRCLE) 로 매핑하여 모든 font 에서 가시 표시.
-        0x3366 => 0x25CB,
+        // [Task #1105] sample16 글머리 prefix.
+        // HWP3 0x3366 은 한컴 HWP5 변환본에서 U+F03C5 로 보존되고, 렌더러가
+        // 이를 한컴오피스 표시값인 □(U+25A1)로 확장한다. 여기서 ○로 직접
+        // 낮추면 HWP3 원본만 정답지와 다른 bullet 로 보이므로 PUA를 보존한다.
+        0x3366 => 0xF03C5,
         _ => return None,
     };
     char::from_u32(codepoint)

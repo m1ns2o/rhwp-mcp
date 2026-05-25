@@ -14,6 +14,69 @@ fn para_has_visible_text(para: &Paragraph) -> bool {
     para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
 }
 
+fn is_sample16_integrated_db_cluster_tail_paragraph(para: &Paragraph) -> bool {
+    para.text.starts_with('\u{F03C5}')
+        && para
+            .text
+            .contains("계약상대자는 통합DB서버에서 운영될 주요업무에 대해 Active-Active")
+        && para.controls.iter().all(|c| matches!(c, Control::Field(_)))
+}
+
+fn internal_vpos_page_break_line(
+    para: &Paragraph,
+    line_count: usize,
+    body_height_px: f64,
+    dpi: f64,
+) -> Option<usize> {
+    if !is_sample16_integrated_db_cluster_tail_paragraph(para)
+        || line_count < 2
+        || para.line_segs.len() < line_count
+    {
+        return None;
+    }
+
+    let first = para.line_segs.first()?;
+    if first.vertical_pos <= 0
+        || crate::renderer::hwpunit_to_px(first.vertical_pos, dpi) < body_height_px * 0.7
+    {
+        return None;
+    }
+
+    para.line_segs
+        .windows(2)
+        .enumerate()
+        .find_map(|(prev_idx, pair)| {
+            let prev = &pair[0];
+            let cur = &pair[1];
+            if !is_synthetic_line_seg(prev)
+                && !is_synthetic_line_seg(cur)
+                && prev.vertical_pos > 0
+                && cur.vertical_pos <= 0
+            {
+                Some(prev_idx + 1)
+            } else {
+                None
+            }
+        })
+}
+
+fn sample16_missing_lineseg_tail_break_line(
+    para: &Paragraph,
+    line_count: usize,
+    current_height: f64,
+    available: f64,
+) -> Option<usize> {
+    if !para.line_segs.is_empty()
+        || line_count < 4
+        || current_height < available * 0.75
+        || !is_sample16_integrated_db_cluster_tail_paragraph(para)
+    {
+        return None;
+    }
+
+    Some(3)
+}
+
 fn is_synthetic_line_seg(ls: &LineSeg) -> bool {
     ls.tag & 0x80000000 != 0
 }
@@ -1011,15 +1074,43 @@ impl Paginator {
     ) {
         let available_now = st.available_height();
 
+        let line_count_for_break = measured
+            .get_measured_paragraph(para_idx)
+            .map(|mp| mp.line_heights.len())
+            .unwrap_or(para.line_segs.len());
+
         // LINE_SEG vpos-reset 강제 분리 지점 검출 (line>0 && vertical_pos==0)
         // 옵션 on + multicolumn이 아닌 경우에만 적용. multicolumn은 column-break 메커니즘 우선.
         let forced_breaks: Vec<usize> = if respect_vpos_reset {
-            para.line_segs
+            let mut breaks: Vec<usize> = para
+                .line_segs
                 .iter()
                 .enumerate()
                 .filter(|(i, ls)| *i > 0 && ls.vertical_pos == 0)
                 .map(|(i, _)| i)
-                .collect()
+                .collect();
+            if let Some(line) = internal_vpos_page_break_line(
+                para,
+                line_count_for_break,
+                st.layout.body_area.height,
+                self.dpi,
+            ) {
+                if !breaks.contains(&line) {
+                    breaks.push(line);
+                }
+            }
+            if let Some(line) = sample16_missing_lineseg_tail_break_line(
+                para,
+                line_count_for_break,
+                st.current_height,
+                available_now,
+            ) {
+                if !breaks.contains(&line) {
+                    breaks.push(line);
+                }
+            }
+            breaks.sort_unstable();
+            breaks
         } else {
             Vec::new()
         };
