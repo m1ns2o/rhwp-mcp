@@ -1222,9 +1222,9 @@ impl LayoutEngine {
                 //   - #920: paper_based = (attr & 0x01) == 0 — 시험지 정합, sample16 회귀
                 //   - #952: paper_based = true 전역 — 당시 모든 sample 정합 판정
                 //   - #987: bfid 정정 + attr 존중 — 변환본 logo overlap 회귀 (#1006)
-                // 정답 (#1006): 포맷별 분리 (PageBorderFill.basis) + 모두 PaperBased.
-                // 작업지시자 Hancom Office close-up 시각 판정: HWP3/HWP5/HWPX 모두
-                // logo 가 outline 내부 top-left 위치 → 세 포맷 모두 PaperBased contract.
+                // 정답: PageBorderFill.basis 를 직접 따른다.
+                // HWP3 원본은 쪽 기준(BodyBased), HWP5/HWPX는 저장된 UI 기준에 따라
+                // PaperBased/BodyBased를 분리한다.
                 // 또한 머리말 conditional clip 제거 (그림 이동 시 외곽선 shrink 회귀 해소),
                 // 꼬리말 clip 은 유지 (페이지 번호 외곽선 안쪽 회귀 해소 — PR #1011).
                 // [Task #1029] PR #1003 cherry-pick `--theirs` 충돌 해소로 본 로직이

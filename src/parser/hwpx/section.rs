@@ -1000,8 +1000,8 @@ fn parse_page_border_fill_empty(e: &quick_xml::events::BytesStart) -> PageBorder
         footer_inside,
     );
     page_border_fill.ui_basis = if text_border.eq_ignore_ascii_case("PAPER") {
-        // Task #1129 Stage 22: textBorder=PAPER is shown as page basis in the
-        // dialog and must render from the body area edge on initial load.
+        // Task #1129 Stage 28: textBorder=PAPER is shown as page basis in the
+        // dialog and renders from the page/body area edge.
         page_border_fill.basis = PageBorderBasis::BodyBased;
         PageBorderUiBasis::Page
     } else {

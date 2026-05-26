@@ -61,10 +61,10 @@ pub struct PageBorderFill {
     pub spacing_bottom: HwpUnit16,
     /// 테두리/배경 ID 참조
     pub border_fill_id: u16,
-    /// [Task #1006, #1129 Stage 22] 쪽 테두리 렌더 기준 (포맷별 분리).
-    /// HWP3 parser → `PaperBased` (Task #1006 close-up visual decision).
+    /// [Task #1006, #1129 Stage 22/24] 쪽 테두리 렌더 기준 (포맷별 분리).
+    /// HWP3 parser → `BodyBased` (HWP3 원본에는 종이 기준 선택이 없으므로 쪽 기준).
     /// HWP5/HWPX parser → 저장된 UI 기준에 따라 `PaperBased`/`BodyBased`
-    /// 분리 (Task #1129 Stage 22 초기 로드 기준 정합).
+    /// 분리 (Task #1129 Stage 28 초기 로드 기준 정합).
     /// renderer 가 attr bit 0 단일 해석 대신 본 필드를 직접 사용 — 포맷/출처별
     /// 계약 분리로 #987(HWP3) ↔ #956(HWP5/HWPX) ↔ #1006(변환본 logo) 동시 충족.
     pub basis: PageBorderBasis,

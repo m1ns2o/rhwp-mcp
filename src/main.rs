@@ -407,8 +407,8 @@ fn parse_grid_mm(value: &str) -> Option<f64> {
     }
 }
 
-/// SVG에 mm 단위 격자 오버레이를 삽입한다.
-/// `<svg ...>` 태그 직후에 격자 패턴 정의와 배경 rect를 추가.
+/// SVG에 mm 단위 점 격자 오버레이를 삽입한다.
+/// export-svg 디버그용 격자는 한컴오피스의 "종이 기준" 격자처럼 SVG 원점에서 시작한다.
 fn insert_grid_overlay(svg: &str, grid_mm: f64) -> String {
     // SVG viewBox에서 크기 추출
     let (width, height) = extract_svg_dimensions(svg);
@@ -418,9 +418,12 @@ fn insert_grid_overlay(svg: &str, grid_mm: f64) -> String {
     let g = format!("{:.4}", grid_size);
     let w = format!("{:.2}", width);
     let h = format!("{:.2}", height);
-    let grid_defs = format!(
-        "<defs><pattern id=\"rhwp-grid\" width=\"{g}\" height=\"{g}\" patternUnits=\"userSpaceOnUse\"><path d=\"M {g} 0 L 0 0 0 {g}\" fill=\"none\" stroke=\"#CCCCCC\" stroke-width=\"0.3\"/></pattern></defs>\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>\n"
+    let defs_part = format!(
+        "<defs><pattern id=\"rhwp-grid\" width=\"{g}\" height=\"{g}\" patternUnits=\"userSpaceOnUse\"><rect x=\"0\" y=\"0\" width=\"1\" height=\"1\" fill=\"#002096\" fill-opacity=\"0.9\"/></pattern></defs>"
     );
+    let grid_rect = format!("\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>");
+    let grid_defs =
+        format!("{defs_part}\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>\n");
 
     // 페이지 배경(fill="#ffffff") rect 직후에 격자를 삽입
     // 이렇게 해야 흰색 배경 위에, 본문 컨텐츠 아래에 격자가 표시됨
@@ -428,10 +431,6 @@ fn insert_grid_overlay(svg: &str, grid_mm: f64) -> String {
     if let Some(pos) = svg.find(bg_pattern) {
         let insert_pos = pos + bg_pattern.len();
         // defs는 SVG 시작 부분에, 격자 rect는 배경 뒤에
-        let defs_part = format!(
-            "<defs><pattern id=\"rhwp-grid\" width=\"{g}\" height=\"{g}\" patternUnits=\"userSpaceOnUse\"><path d=\"M {g} 0 L 0 0 0 {g}\" fill=\"none\" stroke=\"#CCCCCC\" stroke-width=\"0.3\"/></pattern></defs>"
-        );
-        let grid_rect = format!("\n<rect width=\"{w}\" height=\"{h}\" fill=\"url(#rhwp-grid)\"/>");
         // defs를 <svg> 태그 직후에 삽입
         let mut result = svg.to_string();
         // 배경 rect 뒤에 격자 rect 삽입

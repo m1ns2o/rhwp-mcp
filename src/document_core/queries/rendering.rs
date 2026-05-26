@@ -3709,7 +3709,7 @@ mod tests {
         );
         assert!(
             (sample16_top - 15.9).abs() < 0.2,
-            "sample16 page-basis UI should use page margin, not header/body top: top={sample16_top}"
+            "sample16 page-basis UI should use page margin, not paper edge: top={sample16_top}"
         );
     }
 

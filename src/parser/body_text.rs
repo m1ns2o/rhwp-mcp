@@ -870,8 +870,8 @@ fn parse_page_border_fill(data: &[u8]) -> PageBorderFill {
     pbf.border_fill_id = r.read_u16().unwrap_or(0);
     // HWP5 PAGE_BORDER_FILL attr bit0 is the stored textBorder value.
     // Hancom Office dialog shows bit0=0 as paper basis and bit0=1 as page basis.
-    // Task #1129 Stage 22: on initial load, a Hancom page-basis setting must
-    // render from the body area edge, not the paper edge.
+    // Task #1129 Stage 28: on initial load, a Hancom page-basis setting must
+    // render from the page/body area edge, not the paper edge.
     pbf.ui_basis = if (pbf.attr & 0x01) != 0 {
         pbf.basis = crate::model::page::PageBorderBasis::BodyBased;
         crate::model::page::PageBorderUiBasis::Page
