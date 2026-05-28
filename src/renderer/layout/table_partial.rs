@@ -229,12 +229,15 @@ impl LayoutEngine {
                         row_heights[r] = h;
                     }
                 } else {
-                    // 기존 per-row 경로: rowspan 행은 atomic(resolve_row_heights) 유지.
-                    if rowspan_touched {
-                        continue;
-                    }
                     let su: &[usize] = if r == start_row { start_cut } else { &[] };
                     let eu: &[usize] = if r == split_last_row { end_cut } else { &[] };
+                    // 기존 per-row 경로에서 rowspan 행은 기본적으로 atomic
+                    // (resolve_row_heights) 유지. 단 RowBreak 의 큰 rowspan 블록 내부
+                    // 행을 typeset 이 per-row cut 으로 분할한 split boundary 에서는
+                    // 렌더러도 같은 cut 높이를 적용해야 한다.
+                    if rowspan_touched && su.is_empty() && eu.is_empty() {
+                        continue;
+                    }
                     let h = self.row_cut_content_height(table, r, su, eu, styles);
                     if h > 0.0 {
                         row_heights[r] = h;

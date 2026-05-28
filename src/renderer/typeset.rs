@@ -4051,9 +4051,15 @@ impl TypesetEngine {
                         break;
                     }
 
-                    // rowspan 셀이 걸친 행 — 컷 분할 불가, MeasuredTable 높이로
-                    // 통째 배치(컷 모델은 row_span>1 셀을 측정 못 함).
-                    if rowspan_touched[r] {
+                    // rowspan 셀이 걸친 행 — 기본은 MeasuredTable 높이로 통째 배치한다.
+                    //
+                    // 다만 RowBreak 표의 큰 rowspan 블록 안에 있는 일반 내용 행은 한컴처럼
+                    // 해당 행의 row_span==1 셀을 기준으로 내부 분할을 허용한다. 작은 보호
+                    // 블록은 위의 block path 에서 이미 처리되며, 여기서는 block path 대상이
+                    // 아닌 큰 블록의 과도한 이월만 줄인다.
+                    let rowbreak_rowspan_row_splittable =
+                        mt.allows_row_break_split() && can_intra_split && mt.is_row_splittable(r);
+                    if rowspan_touched[r] && !rowbreak_rowspan_row_splittable {
                         let h = cut_row_h[r];
                         if r == cursor_row || consumed + cs_before + h <= avail_for_rows {
                             consumed += cs_before + h;
@@ -4115,9 +4121,6 @@ impl TypesetEngine {
                     if r > cursor_row && res.consumed_height < MIN_TOP_KEEP_PX {
                         end_row = r;
                     } else {
-                        end_row = r + 1;
-                        split_end_cut = res.end_cut.clone();
-                        split_end_limit = res.consumed_height;
                         // 분할 행의 행 총 높이(per-cell content+pad) 를 consumed 에 가산.
                         let split_total = layout_engine.row_cut_content_height(
                             table,
@@ -4126,7 +4129,18 @@ impl TypesetEngine {
                             &res.end_cut,
                             styles,
                         );
-                        consumed += cs_before + split_total;
+                        let split_candidate_rows_height = consumed + cs_before + split_total;
+                        if r > cursor_row && split_candidate_rows_height > avail_for_rows + 0.1 {
+                            // 보이는 조각은 orphan 기준을 통과해도 row-area 예산은 넘을 수 있다.
+                            // 마지막으로 온전히 들어간 행까지만 유지하고 이 행은 다음 쪽에서
+                            // 계속한다. avail_for_rows 는 이미 반복 제목행 높이를 제외한 값이다.
+                            end_row = r;
+                        } else {
+                            end_row = r + 1;
+                            split_end_cut = res.end_cut.clone();
+                            split_end_limit = res.consumed_height;
+                            consumed += cs_before + split_total;
+                        }
                     }
                     break;
                 }
@@ -4144,7 +4158,7 @@ impl TypesetEngine {
                 eprintln!(
                     "TABLE_SPLIT_RESULT: pi={} sec={} cursor_row={} end_row={} consumed={:.1} partial_h={:.1} split_end_limit={:.1} avail_for_rows={:.1} fits={}",
                     para_idx, st.section_index, cursor_row, end_row, consumed, partial_height,
-                    split_end_limit, avail_for_rows, partial_height <= avail_for_rows + 0.1,
+                    split_end_limit, avail_for_rows, consumed <= avail_for_rows + 0.1,
                 );
             }
 
