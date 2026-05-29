@@ -4649,6 +4649,10 @@ impl LayoutEngine {
                                     brightness: pic.image_attr.brightness,
                                     contrast: pic.image_attr.contrast,
                                     transform: utils::extract_shape_transform(&pic.shape_attr),
+                                    // [Issue #1167] wrap 모드 보존 — SVG plane multi-pass z-order
+                                    // 판별에 사용 (BehindText 워터마크가 본문 뒤로). PaintOp
+                                    // 경로(skia/canvaskit)는 별도로 image.text_wrap 을 set 하므로 무관.
+                                    text_wrap: Some(pic.common.text_wrap),
                                     ..ImageNode::new(bin_data_id, image_data)
                                 }),
                                 BoundingBox::new(pic_x, pic_y, pic_w, pic_h),
