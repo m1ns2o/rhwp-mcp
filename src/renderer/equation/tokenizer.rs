@@ -539,6 +539,12 @@ const GLUE_SAFE: &[&str] = &[
     "angle",
     "cap",
     "cup",
+    // [#1204] 생략기호(dots) — `cdotscdots`(⋯⋯) 처럼 공백 없이 연접하면 leak.
+    // 5자 명시 키워드만(모호 4자 `dots` 는 일반 변수 충돌 우려로 제외).
+    "cdots",
+    "ldots",
+    "vdots",
+    "ddots",
 ];
 
 fn is_glue_safe(s: &str) -> bool {
@@ -830,6 +836,15 @@ mod tests {
     fn test_cap_cup_glued_split() {
         assert_eq!(values(&tokenize("capB")), vec!["cap", "B"]);
         assert_eq!(values(&tokenize("cupB")), vec!["cup", "B"]);
+    }
+
+    // [#1204] 생략기호 연접 분리 (`cdotscdots`→⋯⋯). 단일/공백형은 기존대로.
+    #[test]
+    fn test_dots_glued_split() {
+        assert_eq!(values(&tokenize("cdotscdots")), vec!["cdots", "cdots"]);
+        assert_eq!(values(&tokenize("cdots")), vec!["cdots"]);
+        assert_eq!(values(&tokenize("a cdots b")), vec!["a", "cdots", "b"]);
+        assert_eq!(values(&tokenize("ldotsldots")), vec!["ldots", "ldots"]);
     }
 
     // [#1204-E] over/atop 가 짧은(≤2) 글자 피연산자에 붙으면 분리(분수), 긴 word 는 유지.
