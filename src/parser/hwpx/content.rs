@@ -32,6 +32,11 @@ pub struct PackageInfo {
     /// HWPX manifest는 masterpage 항목을 section 항목 앞에 배치하는 형태가 관찰된다.
     /// 예: masterpage0..2, section0, masterpage3..5, section1 ...
     pub section_master_page_files: Vec<Vec<String>>,
+    /// 바탕쪽 XML manifest 항목 목록 (id/href 보존).
+    ///
+    /// section XML의 `<hp:masterPage idRef="...">`와 manifest item id를 매칭해
+    /// 명시적으로 연결하기 위한 원본 정보다.
+    pub master_page_items: Vec<PackageItem>,
     /// BinData 항목 목록
     pub bin_data_items: Vec<PackageItem>,
 }
@@ -115,6 +120,7 @@ pub fn parse_content_hpf(xml: &str) -> Result<PackageInfo, HwpxError> {
     }
 
     info.section_master_page_files = collect_section_master_pages(&all_items, &info.section_files);
+    info.master_page_items = collect_master_page_items(&all_items);
 
     // BinData 항목 추출
     // [Task #873] 기존: BinData/ 폴더 내 항목만 수집 → isEmbeded="0" (외부 file 참조)
@@ -134,6 +140,21 @@ pub fn parse_content_hpf(xml: &str) -> Result<PackageInfo, HwpxError> {
     }
 
     Ok(info)
+}
+
+fn collect_master_page_items(all_items: &[(String, String, String, bool)]) -> Vec<PackageItem> {
+    all_items
+        .iter()
+        .filter(|(_, href, media_type, _)| {
+            media_type == "application/xml" && href.to_ascii_lowercase().contains("masterpage")
+        })
+        .map(|(id, href, media_type, is_embedded)| PackageItem {
+            href: href.clone(),
+            media_type: media_type.clone(),
+            id: id.clone(),
+            is_embedded: *is_embedded,
+        })
+        .collect()
 }
 
 fn collect_section_master_pages(
@@ -283,6 +304,13 @@ mod tests {
 </opf:package>"#;
 
         let info = parse_content_hpf(xml).unwrap();
+        assert_eq!(info.master_page_items.len(), 3);
+        assert_eq!(info.master_page_items[0].id, "masterpage0");
+        assert_eq!(info.master_page_items[0].href, "Contents/masterpage0.xml");
+        assert_eq!(info.master_page_items[1].id, "masterpage1");
+        assert_eq!(info.master_page_items[1].href, "Contents/masterpage1.xml");
+        assert_eq!(info.master_page_items[2].id, "masterpage2");
+        assert_eq!(info.master_page_items[2].href, "Contents/masterpage2.xml");
         assert_eq!(
             info.section_master_page_files,
             vec![

@@ -69,6 +69,45 @@ pub fn parse_hwpx_section(xml: &str) -> Result<Section, HwpxError> {
     Ok(section)
 }
 
+/// section XML의 `<hp:masterPage idRef="...">` 참조를 문서 순서대로 수집한다.
+pub fn collect_hwpx_section_master_page_refs(xml: &str) -> Result<Vec<String>, HwpxError> {
+    let mut reader = Reader::from_str(xml);
+    let mut refs = Vec::new();
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                if local_name(e.name().as_ref()) == b"masterPage" {
+                    push_master_page_id_ref(e, &mut refs);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(HwpxError::XmlError(format!(
+                    "section masterPage refs: {}",
+                    e
+                )))
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(refs)
+}
+
+fn push_master_page_id_ref(e: &quick_xml::events::BytesStart, refs: &mut Vec<String>) {
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"idRef" {
+            let id_ref = attr_str(&attr);
+            if !id_ref.is_empty() {
+                refs.push(id_ref);
+            }
+        }
+    }
+}
+
 /// masterpage*.xml을 파싱하여 기존 HWP 바탕쪽 모델로 변환한다.
 pub fn parse_hwpx_master_page(xml: &str) -> Result<MasterPage, HwpxError> {
     let mut master_page = MasterPage::default();
@@ -120,27 +159,55 @@ pub fn parse_hwpx_master_page(xml: &str) -> Result<MasterPage, HwpxError> {
     Ok(master_page)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HwpxMasterPageType {
+    Both,
+    Even,
+    Odd,
+    LastPage,
+    OptionalPage,
+}
+
+fn parse_hwpx_master_page_type(value: &str) -> HwpxMasterPageType {
+    let normalized: String = value
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_uppercase())
+        .collect();
+
+    match normalized.as_str() {
+        "EVEN" => HwpxMasterPageType::Even,
+        "ODD" => HwpxMasterPageType::Odd,
+        "LASTPAGE" => HwpxMasterPageType::LastPage,
+        "OPTIONALPAGE" => HwpxMasterPageType::OptionalPage,
+        _ => HwpxMasterPageType::Both,
+    }
+}
+
 fn parse_master_page_start(e: &quick_xml::events::BytesStart, master_page: &mut MasterPage) {
     let mut is_last_page = false;
     let mut is_optional_page = false;
     let mut page_duplicate: Option<bool> = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"type" => match attr_str(&attr).as_str() {
-                "EVEN" => master_page.apply_to = HeaderFooterApply::Even,
-                "ODD" => master_page.apply_to = HeaderFooterApply::Odd,
-                "LAST_PAGE" => {
-                    is_last_page = true;
-                    master_page.apply_to = HeaderFooterApply::Both;
-                    master_page.is_extension = true;
+            b"type" => {
+                let value = attr_str(&attr);
+                match parse_hwpx_master_page_type(&value) {
+                    HwpxMasterPageType::Even => master_page.apply_to = HeaderFooterApply::Even,
+                    HwpxMasterPageType::Odd => master_page.apply_to = HeaderFooterApply::Odd,
+                    HwpxMasterPageType::LastPage => {
+                        is_last_page = true;
+                        master_page.apply_to = HeaderFooterApply::Both;
+                        master_page.is_extension = true;
+                    }
+                    HwpxMasterPageType::OptionalPage => {
+                        is_optional_page = true;
+                        master_page.apply_to = HeaderFooterApply::Both;
+                        master_page.is_extension = true;
+                    }
+                    HwpxMasterPageType::Both => master_page.apply_to = HeaderFooterApply::Both,
                 }
-                "OPTIONAL_PAGE" => {
-                    is_optional_page = true;
-                    master_page.apply_to = HeaderFooterApply::Both;
-                    master_page.is_extension = true;
-                }
-                _ => master_page.apply_to = HeaderFooterApply::Both,
-            },
+            }
             b"pageDuplicate" => {
                 let duplicate = attr_str(&attr) != "0";
                 page_duplicate = Some(duplicate);
@@ -5823,6 +5890,127 @@ mod tests {
             }
             buf.clear();
         }
+    }
+
+    #[test]
+    fn test_collect_hwpx_section_master_page_refs() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:masterPage idRef="masterpage0"/>
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0"><hp:t>body</hp:t></hp:run>
+  </hp:p>
+  <masterPage idRef="masterpage1"/>
+</hs:sec>"#;
+
+        let refs = collect_hwpx_section_master_page_refs(xml).unwrap();
+        assert_eq!(refs, vec!["masterpage0", "masterpage1"]);
+    }
+
+    #[test]
+    fn test_collect_hwpx_section_master_page_refs_ignores_root_masterpage_without_id_ref() {
+        let xml = r#"<masterPage xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+            id="masterpage0" type="EVEN">
+  <hp:subList textWidth="1000" textHeight="2000"/>
+</masterPage>"#;
+
+        let refs = collect_hwpx_section_master_page_refs(xml).unwrap();
+        assert!(refs.is_empty());
+    }
+
+    #[test]
+    fn test_parse_hwpx_master_page_type_accepts_official_and_sample_spellings() {
+        assert_eq!(
+            parse_hwpx_master_page_type("BOTH"),
+            HwpxMasterPageType::Both
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("Both"),
+            HwpxMasterPageType::Both
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("both"),
+            HwpxMasterPageType::Both
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("EVEN"),
+            HwpxMasterPageType::Even
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("Even"),
+            HwpxMasterPageType::Even
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("even"),
+            HwpxMasterPageType::Even
+        );
+        assert_eq!(parse_hwpx_master_page_type("ODD"), HwpxMasterPageType::Odd);
+        assert_eq!(parse_hwpx_master_page_type("Odd"), HwpxMasterPageType::Odd);
+        assert_eq!(parse_hwpx_master_page_type("odd"), HwpxMasterPageType::Odd);
+        assert_eq!(
+            parse_hwpx_master_page_type("LAST_PAGE"),
+            HwpxMasterPageType::LastPage
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("LastPage"),
+            HwpxMasterPageType::LastPage
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("lastPage"),
+            HwpxMasterPageType::LastPage
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("OPTIONAL_PAGE"),
+            HwpxMasterPageType::OptionalPage
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("OptionalPage"),
+            HwpxMasterPageType::OptionalPage
+        );
+        assert_eq!(
+            parse_hwpx_master_page_type("optionalPage"),
+            HwpxMasterPageType::OptionalPage
+        );
+    }
+
+    #[test]
+    fn test_parse_master_page_mixed_case_type_attrs() {
+        fn parse_type(type_value: &str) -> MasterPage {
+            let xml = format!(
+                r#"<masterPage xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+            type="{type_value}" pageNumber="4" pageDuplicate="0">
+  <hp:subList textWidth="1000" textHeight="2000" hasTextRef="0" hasNumRef="0"/>
+</masterPage>"#
+            );
+            parse_hwpx_master_page(&xml).unwrap()
+        }
+
+        let both = parse_type("Both");
+        assert_eq!(both.apply_to, HeaderFooterApply::Both);
+        assert!(!both.is_extension);
+
+        let even = parse_type("Even");
+        assert_eq!(even.apply_to, HeaderFooterApply::Even);
+        assert!(!even.is_extension);
+
+        let odd = parse_type("odd");
+        assert_eq!(odd.apply_to, HeaderFooterApply::Odd);
+        assert!(!odd.is_extension);
+
+        let last_page = parse_type("LastPage");
+        assert_eq!(last_page.apply_to, HeaderFooterApply::Both);
+        assert!(last_page.is_extension);
+        assert!(last_page.overlap);
+        assert!(last_page.replace_base);
+        assert_eq!(last_page.ext_flags, 0x0003);
+
+        let optional_page = parse_type("optionalPage");
+        assert_eq!(optional_page.apply_to, HeaderFooterApply::Both);
+        assert!(optional_page.is_extension);
+        assert!(optional_page.overlap);
+        assert!(!optional_page.replace_base);
+        assert_eq!(optional_page.ext_flags, 0x0007);
     }
 
     #[test]

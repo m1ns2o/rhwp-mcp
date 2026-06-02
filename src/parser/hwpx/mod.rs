@@ -17,6 +17,8 @@ pub mod reader;
 pub mod section;
 pub mod utils;
 
+use std::collections::{HashMap, HashSet};
+
 use crate::model::bin_data::{BinData, BinDataContent, BinDataType};
 use crate::model::document::{Document, FileHeader, HwpVersion, Section};
 
@@ -55,6 +57,52 @@ impl From<zip::result::ZipError> for HwpxError {
 impl From<quick_xml::Error> for HwpxError {
     fn from(e: quick_xml::Error) -> Self {
         HwpxError::XmlError(e.to_string())
+    }
+}
+
+fn resolve_master_page_hrefs<'a, 'b>(
+    id_refs: &'b [String],
+    master_page_items: &'a [content::PackageItem],
+) -> (Vec<&'a str>, Vec<&'b str>) {
+    let href_by_id: HashMap<&str, &str> = master_page_items
+        .iter()
+        .map(|item| (item.id.as_str(), item.href.as_str()))
+        .collect();
+    let mut seen_hrefs = HashSet::new();
+    let mut hrefs = Vec::new();
+    let mut missing_refs = Vec::new();
+
+    for id_ref in id_refs {
+        match href_by_id.get(id_ref.as_str()).copied() {
+            Some(href) if seen_hrefs.insert(href) => hrefs.push(href),
+            Some(_) => {}
+            None => missing_refs.push(id_ref.as_str()),
+        }
+    }
+
+    (hrefs, missing_refs)
+}
+
+fn attach_hwpx_master_page(
+    reader: &mut reader::HwpxReader,
+    section: &mut Section,
+    master_page_href: &str,
+) -> bool {
+    match reader.read_file(master_page_href) {
+        Ok(master_page_xml) => match section::parse_hwpx_master_page(&master_page_xml) {
+            Ok(master_page) => {
+                section.section_def.master_pages.push(master_page);
+                true
+            }
+            Err(e) => {
+                eprintln!("경고: {} 파싱 실패: {}", master_page_href, e);
+                false
+            }
+        },
+        Err(e) => {
+            eprintln!("경고: {} 읽기 실패: {}", master_page_href, e);
+            false
+        }
     }
 }
 
@@ -101,25 +149,43 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     let mut sections = Vec::new();
     for (section_idx, section_href) in package_info.section_files.iter().enumerate() {
         let section_xml = reader.read_file(section_href)?;
+        let master_page_refs = match section::collect_hwpx_section_master_page_refs(&section_xml) {
+            Ok(refs) => refs,
+            Err(e) => {
+                eprintln!("경고: {} masterPage 참조 파싱 실패: {}", section_href, e);
+                Vec::new()
+            }
+        };
         match section::parse_hwpx_section(&section_xml) {
             Ok(mut section) => {
-                if let Some(master_page_files) =
-                    package_info.section_master_page_files.get(section_idx)
-                {
-                    for master_page_href in master_page_files {
-                        match reader.read_file(master_page_href) {
-                            Ok(master_page_xml) => {
-                                match section::parse_hwpx_master_page(&master_page_xml) {
-                                    Ok(master_page) => {
-                                        section.section_def.master_pages.push(master_page);
-                                    }
-                                    Err(e) => {
-                                        eprintln!("경고: {} 파싱 실패: {}", master_page_href, e);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("경고: {} 읽기 실패: {}", master_page_href, e);
+                let (master_page_hrefs, missing_master_page_refs) =
+                    resolve_master_page_hrefs(&master_page_refs, &package_info.master_page_items);
+                for missing_ref in missing_master_page_refs {
+                    eprintln!(
+                        "경고: {} masterPage idRef '{}' manifest 항목 없음",
+                        section_href, missing_ref
+                    );
+                }
+
+                let mut attached_master_page_count = 0usize;
+                for master_page_href in master_page_hrefs {
+                    if attach_hwpx_master_page(&mut reader, &mut section, master_page_href) {
+                        attached_master_page_count += 1;
+                    }
+                }
+
+                if attached_master_page_count == 0 {
+                    if let Some(master_page_files) =
+                        package_info.section_master_page_files.get(section_idx)
+                    {
+                        let mut fallback_seen = HashSet::new();
+                        for master_page_href in master_page_files {
+                            if fallback_seen.insert(master_page_href.as_str()) {
+                                attach_hwpx_master_page(
+                                    &mut reader,
+                                    &mut section,
+                                    master_page_href,
+                                );
                             }
                         }
                     }
@@ -241,5 +307,37 @@ mod tests {
         // CFB/HWP 데이터로 시도
         let result = parse_hwpx(&[0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_master_page_hrefs_uses_id_ref_order_and_dedups() {
+        let items = vec![
+            content::PackageItem {
+                id: "masterpage1".to_string(),
+                href: "Contents/masterpage1.xml".to_string(),
+                media_type: "application/xml".to_string(),
+                is_embedded: true,
+            },
+            content::PackageItem {
+                id: "masterpage0".to_string(),
+                href: "Contents/masterpage0.xml".to_string(),
+                media_type: "application/xml".to_string(),
+                is_embedded: true,
+            },
+        ];
+        let id_refs = vec![
+            "masterpage0".to_string(),
+            "missing".to_string(),
+            "masterpage1".to_string(),
+            "masterpage0".to_string(),
+        ];
+
+        let (hrefs, missing_refs) = resolve_master_page_hrefs(&id_refs, &items);
+
+        assert_eq!(
+            hrefs,
+            vec!["Contents/masterpage0.xml", "Contents/masterpage1.xml"]
+        );
+        assert_eq!(missing_refs, vec!["missing"]);
     }
 }
