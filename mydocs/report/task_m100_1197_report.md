@@ -4,7 +4,7 @@
 - 제목: HWPX 용지 기준 BehindText 그림/표 z-order 보존
 - 브랜치: `local/task1197`
 - 작성일: 2026-06-02
-- 상태: Stage 8 자동 검증 완료, 작업지시자 원본 시각검증 대기
+- 상태: 작업지시자 원본 시각검증 완료, 작업 완료
 
 ## 1. 문제
 
@@ -57,6 +57,7 @@ wasm-pack build --target web
 - Stage 6 후 `01`은 표시됐지만 중앙 배경 그림이 사라지는 문제가 남아, Stage 7에서 page background filtered canvas 를 추가했다.
 - Stage 7 후에도 `01`만 보이는 문제는 `front` overlay canvas 가 `#scroll-content canvas`의 흰 배경을 상속해 하위 layer 를 덮는 문제였고, Stage 8에서 overlay canvas 배경을 투명하게 고정했다.
 - 제공 PDF는 46쪽, rhwp pagination 은 47쪽으로 확인됐다. PDF 2쪽 `MEMO`는 rhwp 3쪽, PDF 3쪽 `01 / 1주차`는 rhwp 4쪽에 대응한다. 이 page count 차이는 별도 pagination/partial table 문제로 판단한다.
+- 작업지시자 원본 시각검증에서 중앙 배경 이미지, `01` 전면 표기, 하단 `1주차` 및 설명 텍스트 표시를 확인했다.
 - Docker daemon 이 실행 중이 아니어서 Docker WASM 빌드는 수행하지 못했고, 로컬 `wasm-pack build --target web`로 `pkg/`를 갱신했다.
 
 ## 4. 시각검증 산출물
@@ -81,13 +82,15 @@ wasm-pack build --target web
 - `e56cc029` Task #1197: document final verification
 - `2b89333a` Task #1197: fix studio layer replay
 - `047db9e0` Task #1197: add studio background layer
+- `713fac99` Task #1197: keep studio overlays transparent
 
 Stage 8 커밋은 `rhwp-studio` overlay canvas 투명 배경 보정, Stage 8 완료보고서, orders/최종 보고서 갱신을 포함한다.
+마무리 커밋은 작업지시자 원본 시각검증 완료 상태를 최종 보고서와 orders 에 반영한다.
 
 ## 6. 남은 결정
 
-시각검증 승인 후 다음 중 하나를 진행한다.
+현재 작업 범위는 완료했다. 다음 항목은 별도 승인 후 진행한다.
 
-- 작업지시자 원본 샘플 재시각검증
 - PR 생성
 - 작업지시자 승인 시 issue close
+- PDF 46쪽 vs rhwp 47쪽 page count 차이 별도 pagination 후속 이슈 처리
