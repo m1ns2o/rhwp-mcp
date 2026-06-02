@@ -994,6 +994,33 @@ fn issue_1209_2022_page8_question29_square_picture_starts_at_wrap_line() {
 }
 
 #[test]
+fn issue_1245_2022_page7_square_pictures_use_relative_line_vpos() {
+    let bytes = std::fs::read("samples/3-09월_교육_통합_2022.hwp").expect("sample");
+    let doc = HwpDocument::from_bytes(&bytes).expect("parse");
+    let tree = doc.build_page_render_tree(6).expect("page 7 render tree");
+
+    let question25_picture = find_image_bbox(&tree.root, 386, 11).expect("문25 타원 그림");
+    let question25_wrap_line =
+        find_text_line_bbox(&tree.root, 386, 3).expect("문25 그림 옆 첫 좁은 줄");
+    assert!(
+        (question25_picture.y - question25_wrap_line.y).abs() <= 2.0,
+        "문25 어울림 그림은 누적 LINE_SEG vpos를 중복 적용하지 않고 좁아지는 줄에 붙어야 함: picture={question25_picture:?}, wrap_line={question25_wrap_line:?}"
+    );
+    assert!(
+        question25_picture.y + question25_picture.height < 920.0,
+        "문25 그림이 페이지 하단 밖으로 밀리면 안 됨: picture={question25_picture:?}"
+    );
+
+    let question28_picture = find_image_bbox(&tree.root, 420, 9).expect("문28 포물선 그림");
+    let question28_wrap_line =
+        find_text_line_bbox(&tree.root, 420, 3).expect("문28 그림 옆 첫 좁은 줄");
+    assert!(
+        (question28_picture.y - question28_wrap_line.y).abs() <= 2.0,
+        "문28 어울림 그림도 문단 첫 줄 대비 상대 LINE_SEG vpos로 배치되어야 함: picture={question28_picture:?}, wrap_line={question28_wrap_line:?}"
+    );
+}
+
+#[test]
 fn issue_1139_2023_page4_question26_square_table_uses_anchor_line() {
     let bytes = std::fs::read("samples/3-09월_교육_통합_2023.hwp").expect("sample");
     let doc = HwpDocument::from_bytes(&bytes).expect("parse");

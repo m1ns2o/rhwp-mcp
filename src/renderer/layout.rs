@@ -57,6 +57,11 @@ struct ColumnItemCtx<'a> {
 /// `LINE_SEG`에서 그림 옆으로 좁아지는 첫 줄의 `vertical_pos`를 저장한다.
 /// 개체 자체도 그 줄의 top에 맞춰야 한컴의 “서로 자리를 침범하지 않는”
 /// 어울림 배치가 된다.
+///
+/// 일부 HWP5 원본은 문단 첫 줄의 `vertical_pos`가 0이 아니라 페이지/구역
+/// 흐름 기준 누적값이다. 이때 좁아지는 줄의 raw vpos를 그대로 문단 y에
+/// 더하면 `para_y + absolute_vpos`가 되어 그림이 페이지 하단 밖으로 밀린다.
+/// 따라서 그림 배치에는 문단 첫 줄 대비 상대 delta만 사용한다.
 fn square_wrap_first_narrow_line_vpos_px(
     para: &Paragraph,
     col_area: &LayoutRect,
@@ -79,10 +84,12 @@ fn square_wrap_first_narrow_line_vpos_px(
     if !has_full_width_before {
         return None;
     }
-    Some(hwpunit_to_px(
-        para.line_segs[first_wrap_idx].vertical_pos,
-        dpi,
-    ))
+    let base_vpos = para.line_segs.first()?.vertical_pos;
+    let narrow_vpos = para.line_segs[first_wrap_idx].vertical_pos;
+    if narrow_vpos < base_vpos {
+        return None;
+    }
+    Some(hwpunit_to_px(narrow_vpos - base_vpos, dpi))
 }
 
 type ParaFloatLanes = std::collections::HashMap<usize, FloatLaneSet>;
