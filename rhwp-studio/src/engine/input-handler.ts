@@ -5,8 +5,8 @@ import { CaretRenderer } from './caret-renderer';
 import { FieldMarkerRenderer } from './field-marker-renderer';
 import { SelectionRenderer } from './selection-renderer';
 import { CommandHistory } from './history';
-import { DeleteSelectionCommand, ApplyCharFormatCommand, SnapshotCommand } from './command';
-import type { OperationDescriptor } from './command';
+import { DeleteSelectionCommand, ApplyCharFormatCommand, ApplyParaFormatCommand, SnapshotCommand } from './command';
+import type { OperationDescriptor, ParaFormatTarget } from './command';
 import { VirtualScroll } from '@/view/virtual-scroll';
 import { ViewportManager } from '@/view/viewport-manager';
 import type { DocumentPosition, CharProperties, ParaProperties, CursorRect, FormObjectHitResult } from '@/core/types';
@@ -1446,53 +1446,86 @@ export class InputHandler {
 
   /** 커서 위치 문단에 문단 서식을 적용한다 */
   private applyParaFormat(props: Record<string, unknown>): void {
-    const pos = this.cursor.getPosition();
-    const propsJson = JSON.stringify(props);
     try {
-      if (this.cursor.isInFootnote()) {
-        const fnSel = this.cursor.getFootnoteSelectionOrdered();
-        const startPara = fnSel ? fnSel.start.fnParaIdx : this.cursor.fnInnerParaIdx;
-        const endPara = fnSel ? fnSel.end.fnParaIdx : this.cursor.fnInnerParaIdx;
-        for (let fp = startPara; fp <= endPara; fp++) {
-          this.wasm.applyParaFormatInFootnote(
-            this.cursor.fnSectionIdx,
-            this.cursor.fnParaIdx,
-            this.cursor.fnControlIdx,
-            fp,
-            propsJson,
-          );
-        }
-      } else if (pos.parentParaIndex !== undefined) {
-        // 셀 내 선택이 있으면 선택 범위 내 모든 셀 문단에 적용
-        const sel = this.cursor.getSelectionOrdered();
-        if (sel && sel.start.cellParaIndex !== undefined && sel.end.cellParaIndex !== undefined) {
-          for (let cp = sel.start.cellParaIndex; cp <= sel.end.cellParaIndex; cp++) {
-            this.wasm.applyParaFormatInCell(
-              pos.sectionIndex, pos.parentParaIndex, pos.controlIndex!,
-              pos.cellIndex!, cp, propsJson,
-            );
-          }
-        } else {
-          this.wasm.applyParaFormatInCell(
-            pos.sectionIndex, pos.parentParaIndex, pos.controlIndex!,
-            pos.cellIndex!, pos.cellParaIndex!, propsJson,
-          );
-        }
-      } else {
-        // 선택이 있으면 선택 범위 내 모든 문단에 적용
-        const sel = this.cursor.getSelectionOrdered();
-        if (sel) {
-          for (let p = sel.start.paragraphIndex; p <= sel.end.paragraphIndex; p++) {
-            this.wasm.applyParaFormat(pos.sectionIndex, p, propsJson);
-          }
-        } else {
-          this.wasm.applyParaFormat(pos.sectionIndex, pos.paragraphIndex, propsJson);
-        }
-      }
-      this.afterEdit();
+      const targets = this.getParaFormatTargetsAtCursor();
+      this.executeParaFormatCommand(targets, props);
     } catch (err) {
       console.warn('[InputHandler] applyParaFormat 실패:', err);
     }
+  }
+
+  private executeParaFormatCommand(targets: ParaFormatTarget[], props: Record<string, unknown>): boolean {
+    if (targets.length === 0) {
+      console.info('[InputHandler] 문단 서식 Undo/Redo: unsupported context');
+      return false;
+    }
+    const cmd = new ApplyParaFormatCommand(targets, props as Partial<ParaProperties>, this.cursor.getPosition());
+    this.executeOperation({ kind: 'command', command: cmd });
+    return true;
+  }
+
+  private getParaFormatTargetsAtCursor(): ParaFormatTarget[] {
+    const sel = this.cursor.getSelectionOrdered();
+    if (sel) return this.getParaFormatTargetsForRange(sel.start, sel.end);
+    const pos = this.cursor.getPosition();
+    return this.getParaFormatTargetsForRange(pos, pos);
+  }
+
+  private getParaFormatTargetsForRange(start: DocumentPosition, end: DocumentPosition): ParaFormatTarget[] {
+    if (this.cursor.isInHeaderFooter() || this.cursor.isInFootnote()) return [];
+    if (start.isTextBox || end.isTextBox) return [];
+    if ((start.cellPath?.length ?? 0) > 1 || (end.cellPath?.length ?? 0) > 1) return [];
+
+    const startInCell = start.parentParaIndex !== undefined;
+    const endInCell = end.parentParaIndex !== undefined;
+    if (startInCell || endInCell) {
+      if (!startInCell || !endInCell) return [];
+      if (start.sectionIndex !== end.sectionIndex) return [];
+      if (start.parentParaIndex !== end.parentParaIndex) return [];
+      const startPath = start.cellPath?.[0];
+      const endPath = end.cellPath?.[0];
+      const startControl = startPath?.controlIndex ?? start.controlIndex;
+      const endControl = endPath?.controlIndex ?? end.controlIndex;
+      const startCell = startPath?.cellIndex ?? start.cellIndex;
+      const endCell = endPath?.cellIndex ?? end.cellIndex;
+      const startCellPara = startPath?.cellParaIndex ?? start.cellParaIndex;
+      const endCellPara = endPath?.cellParaIndex ?? end.cellParaIndex;
+      if (
+        startControl === undefined ||
+        endControl === undefined ||
+        startCell === undefined ||
+        endCell === undefined ||
+        startCellPara === undefined ||
+        endCellPara === undefined ||
+        startControl !== endControl ||
+        startCell !== endCell
+      ) {
+        return [];
+      }
+      const from = Math.min(startCellPara, endCellPara);
+      const to = Math.max(startCellPara, endCellPara);
+      const targets: ParaFormatTarget[] = [];
+      for (let cp = from; cp <= to; cp++) {
+        targets.push({
+          kind: 'cell',
+          sec: start.sectionIndex,
+          parentPara: start.parentParaIndex!,
+          controlIdx: startControl,
+          cellIdx: startCell,
+          cellParaIdx: cp,
+        });
+      }
+      return targets;
+    }
+
+    if (start.sectionIndex !== end.sectionIndex) return [];
+    const from = Math.min(start.paragraphIndex, end.paragraphIndex);
+    const to = Math.max(start.paragraphIndex, end.paragraphIndex);
+    const targets: ParaFormatTarget[] = [];
+    for (let p = from; p <= to; p++) {
+      targets.push({ kind: 'body', sec: start.sectionIndex, para: p });
+    }
+    return targets;
   }
 
   /** 한컴식 Shift+Tab: 현재 커서 x 위치를 기준으로 문단 내어쓰기를 설정한다. */
@@ -1566,15 +1599,17 @@ export class InputHandler {
         }
 
         const hangingPx = Math.max(0, cursorRect.x - lineStartRect.x);
-        this.wasm.applyParaFormatInCell(
-          pos.sectionIndex,
-          pos.parentParaIndex,
-          controlIndex,
-          cellIndex,
-          cellParaIndex,
-          JSON.stringify({ indent: -pxToRaw2x(hangingPx) }),
+        this.executeParaFormatCommand(
+          [{
+            kind: 'cell',
+            sec: pos.sectionIndex,
+            parentPara: pos.parentParaIndex,
+            controlIdx: controlIndex,
+            cellIdx: cellIndex,
+            cellParaIdx: cellParaIndex,
+          }],
+          { indent: -pxToRaw2x(hangingPx) },
         );
-        this.afterEdit();
         return true;
       }
 
@@ -1587,12 +1622,10 @@ export class InputHandler {
       cursorRect ??= this.wasm.getCursorRect(pos.sectionIndex, pos.paragraphIndex, pos.charOffset);
 
       const hangingPx = Math.max(0, cursorRect.x - lineStartRect.x);
-      this.wasm.applyParaFormat(
-        pos.sectionIndex,
-        pos.paragraphIndex,
-        JSON.stringify({ indent: -pxToRaw2x(hangingPx) }),
+      this.executeParaFormatCommand(
+        [{ kind: 'body', sec: pos.sectionIndex, para: pos.paragraphIndex }],
+        { indent: -pxToRaw2x(hangingPx) },
       );
-      this.afterEdit();
       return true;
     } catch (err) {
       console.warn('[InputHandler] Shift+Tab hanging indent 실패:', err);
@@ -1711,8 +1744,8 @@ export class InputHandler {
       case 'command': {
         const beforePos = this.cursor.getPosition();
         const newPos = this.history.execute(desc.command, this.wasm);
-        // 글자 서식 변경은 문서 구조 불변 → 선택 영역 유지
-        if (desc.command.type !== 'applyCharFormat') {
+        // 글자/문단 서식 변경은 문서 구조 불변 → 선택 영역 유지
+        if (desc.command.type !== 'applyCharFormat' && desc.command.type !== 'applyParaFormat') {
           this.cursor.moveTo(newPos);
           this.cursor.resetPreferredX();
         }
@@ -2976,48 +3009,17 @@ export class InputHandler {
     end: DocumentPosition,
     props: Partial<ParaProperties>,
   ): void {
-    const propsJson = JSON.stringify(props);
     try {
-      // 머리말/꼬리말 모드
-      if (this.cursor.isInHeaderFooter()) {
-        const isHeader = this.cursor.headerFooterMode === 'header';
-        this.wasm.applyParaFormatInHf(
-          this.cursor.hfSectionIdx, isHeader, this.cursor.hfApplyTo,
-          this.cursor.hfParaIdx, propsJson,
-        );
-        this.afterEdit();
-        return;
-      }
-      if (this.cursor.isInFootnote()) {
-        const fnSel = this.cursor.getFootnoteSelectionOrdered();
-        const startPara = fnSel ? fnSel.start.fnParaIdx : this.cursor.fnInnerParaIdx;
-        const endPara = fnSel ? fnSel.end.fnParaIdx : this.cursor.fnInnerParaIdx;
-        for (let fp = startPara; fp <= endPara; fp++) {
-          this.wasm.applyParaFormatInFootnote(
-            this.cursor.fnSectionIdx,
-            this.cursor.fnParaIdx,
-            this.cursor.fnControlIdx,
-            fp,
-            propsJson,
-          );
-        }
-        this.afterEdit();
-        return;
-      }
-      if (start.parentParaIndex !== undefined) {
-        this.wasm.applyParaFormatInCell(
-          start.sectionIndex, start.parentParaIndex, start.controlIndex!,
-          start.cellIndex!, start.cellParaIndex!, propsJson,
-        );
-      } else {
-        for (let p = start.paragraphIndex; p <= end.paragraphIndex; p++) {
-          this.wasm.applyParaFormat(start.sectionIndex, p, propsJson);
-        }
-      }
-      this.afterEdit();
+      const targets = this.getParaFormatTargetsForRange(start, end);
+      this.executeParaFormatCommand(targets, props as Record<string, unknown>);
     } catch (err) {
       console.warn('[InputHandler] applyParaPropsToRange 실패:', err);
     }
+  }
+
+  /** 커서 위치 문단에 문단 서식을 적용한다 (커맨드 시스템용) */
+  applyParaPropsAtCursor(props: Partial<ParaProperties>): void {
+    this.applyParaFormat(props as Record<string, unknown>);
   }
 
   /** 양식 개체 클릭 처리 */
