@@ -5011,7 +5011,16 @@ impl LayoutEngine {
                 y_offset = global_y_before.max(lanes.max_bottom());
             }
             if tac_seg_applied {
-                if let Some(seg) = para.line_segs.get(control_index) {
+                // [hwpdf cycle#3] control_index 는 컨트롤 배열 인덱스지 줄 인덱스가
+                // 아니다 — 표 앞에 비가시 컨트롤(SectionDef/ColumnDef 등)이 있으면
+                // get(control_index)=None 이 되어 호스트 줄간격이 통째로 탈락,
+                // 이후 본문 전체가 위로 당겨진다(한컴 lineseg: sp 포함이 정답).
+                // 줄 seg 폴백: 마지막 seg(단일 줄 호스트 문단의 유일 seg).
+                if let Some(seg) = para
+                    .line_segs
+                    .get(control_index)
+                    .or_else(|| para.line_segs.last())
+                {
                     if seg.line_spacing > 0 {
                         y_offset += hwpunit_to_px(seg.line_spacing, self.dpi);
                     } else if seg.line_spacing < 0 {
