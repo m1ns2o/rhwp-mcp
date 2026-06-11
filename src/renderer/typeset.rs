@@ -3635,7 +3635,10 @@ impl TypesetEngine {
                                 // [Task #1363 v2 Stage 2] A2: 누적을 렌더 시뮬 bottom 으로 스냅.
                                 // compute_en_metrics(saved-delta) 대신 HeightCursor 시뮬레이션이
                                 // 단 실제 렌더 높이를 산출 → fit 결정(다음 para)이 렌더 정합.
-                                if ssot_level >= EnSsotLevel::A2 {
+                                // [Task #1370 Stage 2 실험] A3 한정: exact 스냅이 rewind/빈 para 를
+                                // hancom 보다 ~80px/단 높게 누적해 경계 split 을 막고 13건 cascade 유발.
+                                // 실험으로 A3 에서 스냅 OFF → break-결정 높이를 compact(acc)로 환원.
+                                if ssot_level == EnSsotLevel::A2 {
                                     if let Some(sim_bottom) = self.simulate_endnote_column_bottom_y(
                                         &st, paragraphs, styles, available, en_col_w, None,
                                     ) {
