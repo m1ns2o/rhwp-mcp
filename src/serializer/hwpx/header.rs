@@ -418,46 +418,57 @@ fn write_char_pr<W: Write>(
     if cs.bold {
         empty_tag(w, "hh:bold", &[])?;
     }
-    if !matches!(cs.underline_type, crate::model::style::UnderlineType::None) {
-        empty_tag(
-            w,
-            "hh:underline",
-            &[
-                ("type", underline_type_str(cs.underline_type)),
-                ("shape", line_shape_str(cs.underline_shape)),
-                ("color", &color_hex(cs.underline_color)),
-            ],
-        )?;
-    }
-    if cs.strikethrough {
-        empty_tag(
-            w,
-            "hh:strikeout",
-            &[
-                ("shape", line_shape_str(cs.strike_shape)),
-                ("color", &color_hex(cs.strike_color)),
-            ],
-        )?;
-    }
-    if cs.outline_type != 0 {
-        empty_tag(
-            w,
-            "hh:outline",
-            &[("type", outline_type_str(cs.outline_type))],
-        )?;
-    }
-    if cs.shadow_type != 0 {
-        empty_tag(
-            w,
-            "hh:shadow",
-            &[
-                ("type", "CONTINUOUS"),
-                ("color", &color_hex(cs.shadow_color)),
-                ("offsetX", &cs.shadow_offset_x.to_string()),
-                ("offsetY", &cs.shadow_offset_y.to_string()),
-            ],
-        )?;
-    }
+    // underline/strikeout/outline/shadow: 한컴은 비활성(NONE)이어도 항상 출력한다.
+    // 모델은 파서가 NONE 일 때도 shape/color/offset 을 보존하므로(역매핑 가능),
+    // 무조건 출력해 원본과 동일한 구조를 만든다.
+    empty_tag(
+        w,
+        "hh:underline",
+        &[
+            ("type", underline_type_str(cs.underline_type)),
+            ("shape", line_shape_str(cs.underline_shape)),
+            ("color", &color_hex(cs.underline_color)),
+        ],
+    )?;
+    // strikeout: 파서가 shape 값으로 strikethrough 여부를 결정하므로(is_real_strike_shape),
+    // 비활성일 때는 반드시 shape="NONE" 으로 출력해야 재파싱 시 켜지지 않는다.
+    empty_tag(
+        w,
+        "hh:strikeout",
+        &[
+            (
+                "shape",
+                if cs.strikethrough {
+                    line_shape_str(cs.strike_shape)
+                } else {
+                    "NONE"
+                },
+            ),
+            ("color", &color_hex(cs.strike_color)),
+        ],
+    )?;
+    empty_tag(
+        w,
+        "hh:outline",
+        &[("type", outline_type_str(cs.outline_type))],
+    )?;
+    empty_tag(
+        w,
+        "hh:shadow",
+        &[
+            (
+                "type",
+                if cs.shadow_type == 0 {
+                    "NONE"
+                } else {
+                    "CONTINUOUS"
+                },
+            ),
+            ("color", &color_hex(cs.shadow_color)),
+            ("offsetX", &cs.shadow_offset_x.to_string()),
+            ("offsetY", &cs.shadow_offset_y.to_string()),
+        ],
+    )?;
     if cs.emboss {
         empty_tag(w, "hh:emboss", &[])?;
     }
@@ -1171,6 +1182,34 @@ mod tests {
         assert!(
             !xml.contains("<hh:intent"),
             "margin 자식이 hh: 네임스페이스로 남으면 안 됨: {xml}"
+        );
+    }
+
+    #[test]
+    fn write_char_pr_always_emits_underline_strikeout_outline_shadow() {
+        // 한컴은 비활성(NONE)이어도 네 요소를 항상 출력한다. 기본 CharShape 도
+        // 동일 구조를 내야 하며, 특히 strikeout 은 shape="NONE" 이어야 재파싱 시
+        // 취소선이 켜지지 않는다.
+        let cs = CharShape::default();
+        let mut writer = Writer::new(Vec::new());
+        write_char_pr(&mut writer, 0, &cs).expect("write charPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(
+            xml.contains(r##"<hh:underline type="NONE" shape="SOLID" color="#000000"/>"##),
+            "underline NONE 항상 출력: {xml}"
+        );
+        assert!(
+            xml.contains(r##"<hh:strikeout shape="NONE" color="#000000"/>"##),
+            "strikeout 은 비활성 시 shape=NONE: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hh:outline type="NONE"/>"#),
+            "outline NONE 항상 출력: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hh:shadow type="NONE""#),
+            "shadow NONE 항상 출력: {xml}"
         );
     }
 
