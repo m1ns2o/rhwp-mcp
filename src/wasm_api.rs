@@ -257,10 +257,32 @@ impl HwpDocument {
     }
 
     /// 빈 문서 생성 (테스트/미리보기용)
+    ///
+    /// 기본 A4 구역 1개 + 빈 문단 1개를 포함한다. 구역 0개 문서는 모든
+    /// 편집/조회 API가 "구역 인덱스 0 범위 초과"로 실패해 사용 불가하므로
+    /// 생성 직후 바로 편집 가능한 최소 구조를 보장한다 (#1386).
     #[wasm_bindgen(js_name = createEmpty)]
     pub fn create_empty() -> HwpDocument {
         let mut core = DocumentCore::new_empty();
-        core.paginate();
+        let mut section = Section::default();
+        // 한컴 새 문서 기본 용지: A4 세로, 여백 좌우 30mm / 위 20mm / 아래 15mm /
+        // 머리말·꼬리말 15mm (renderer/page_layout.rs의 a4_page_def와 동일 값)
+        section.section_def.page_def = crate::model::page::PageDef {
+            width: 59528,
+            height: 84188,
+            margin_left: 8504,
+            margin_right: 8504,
+            margin_top: 5669,
+            margin_bottom: 4252,
+            margin_header: 4252,
+            margin_footer: 4252,
+            margin_gutter: 0,
+            ..Default::default()
+        };
+        section.paragraphs.push(Paragraph::new_empty());
+        let mut document = Document::default();
+        document.sections.push(section);
+        core.set_document(document);
         HwpDocument { core }
     }
 

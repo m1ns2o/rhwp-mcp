@@ -11,6 +11,48 @@ fn test_create_empty_document() {
     assert_eq!(doc.page_count(), 1);
 }
 
+/// [#1386] createEmpty는 구역 1개 + 빈 문단 1개를 포함해 생성 직후
+/// 편집/조회/내보내기가 가능해야 한다 (구역 0개 → 모든 API 실패 회귀 방지).
+#[test]
+fn test_create_empty_document_is_editable() {
+    let mut doc = HwpDocument::create_empty();
+    assert_eq!(doc.get_section_count(), 1, "기본 구역 1개");
+
+    // 편집: 구역 0 / 문단 0에 텍스트 삽입이 성공해야 한다
+    doc.insert_text_native(0, 0, 0, "새 문서 첫 문단")
+        .expect("createEmpty 문서에 insertText가 동작해야 한다 (#1386)");
+
+    // 조회: 삽입한 텍스트가 읽혀야 한다
+    let text = doc
+        .get_text_range_native(0, 0, 0, 8)
+        .expect("getTextRange가 동작해야 한다");
+    assert!(
+        text.contains("새 문서"),
+        "삽입 텍스트가 조회되어야 한다: {text}"
+    );
+
+    // 내보내기: HWP/HWPX 직렬화가 모두 성공해야 한다
+    let hwp = doc
+        .export_hwp_with_adapter()
+        .expect("createEmpty 문서 exportHwp");
+    assert!(!hwp.is_empty());
+    let hwpx = doc
+        .export_hwpx_native()
+        .expect("createEmpty 문서 exportHwpx");
+    assert!(!hwpx.is_empty());
+
+    // 재파싱: 내보낸 HWP가 다시 열리고 텍스트가 보존되어야 한다
+    let reparsed =
+        crate::document_core::DocumentCore::from_bytes(&hwp).expect("exportHwp 결과 재파싱");
+    assert!(
+        reparsed.document().sections[0]
+            .paragraphs
+            .iter()
+            .any(|p| p.text.contains("새 문서")),
+        "재파싱 문서에 삽입 텍스트가 보존되어야 한다"
+    );
+}
+
 #[test]
 fn test_empty_document_info() {
     let doc = HwpDocument::create_empty();
