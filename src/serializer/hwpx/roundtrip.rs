@@ -32,6 +32,11 @@
 //! - 섹션별 `PageDef`(용지 크기·방향·제본 + 여백 7필드) 비교 (`diff_page_def`) 를
 //!   `SectionPageDef` 로 게이트 동승. serializer 의 secPr 템플릿 고정값 방출
 //!   (여백·gutterType 변형)을 검출한다.
+//!
+//! Task #1387 확장:
+//! - 표 캡션 비교 (`diff_table_caption`) 를 `TableCaption` 으로 게이트 동승 —
+//!   존재 비대칭/속성 5종/문단 수. 캡션 내부 문단은 char_shapes·controls·linesegs
+//!   재귀에 `tbl.caption.p[k]` 경로로 동승한다.
 
 #![allow(dead_code)]
 
@@ -147,6 +152,16 @@ pub enum IrDifference {
         section: usize,
         detail: String,
     },
+    /// 표 캡션 불일치 — 캡션 보존 게이트 (#1387).
+    ///
+    /// `path` 는 `…tbl.caption` 까지의 중첩 경로. `detail` 은 존재 비대칭 또는
+    /// 불일치 필드별 "field: expected=.. actual=.." 세미콜론 연결 (`diff_table_caption`).
+    TableCaption {
+        section: usize,
+        paragraph: usize,
+        path: String,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for IrDifference {
@@ -231,6 +246,16 @@ impl std::fmt::Display for IrDifference {
             SectionPageDef { section, detail } => {
                 write!(f, "section[{}] page_def: {}", section, detail)
             }
+            TableCaption {
+                section,
+                paragraph,
+                path,
+                detail,
+            } => write!(
+                f,
+                "section[{}] paragraph[{}]{} caption: {}",
+                section, paragraph, path, detail
+            ),
         }
     }
 }
@@ -354,6 +379,62 @@ pub fn diff_documents(a: &Document, b: &Document) -> IrDiff {
     }
 
     diff
+}
+
+/// 표 캡션 비교 (#1387). 존재 비대칭/속성/문단 수 불일치를 "field: expected=..
+/// actual=.." 세미콜론 연결로 돌려준다. 일치하면 `None`.
+///
+/// `vert_align` 은 비교 제외 — HWPX `hp:caption` 에 대응 속성이 없는 HWP5 유래
+/// 필드라(#1387 1단계 전수 측정) serializer 가 방출하지 않으며, HWP5 출발 플로우
+/// 비교에서 위양성을 만든다. 내부 문단의 상세 비교는 char_shapes/controls/linesegs
+/// 재귀가 담당하므로 여기서는 문단 수만 본다.
+fn diff_table_caption(
+    a: &Option<crate::model::shape::Caption>,
+    b: &Option<crate::model::shape::Caption>,
+) -> Option<String> {
+    let (a, b) = match (a, b) {
+        (None, None) => return None,
+        (Some(_), None) => return Some("missing: expected=Some actual=None".to_string()),
+        (None, Some(_)) => return Some("synthetic: expected=None actual=Some".to_string()),
+        (Some(a), Some(b)) => (a, b),
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if a.direction != b.direction {
+        parts.push(format!(
+            "side: expected={:?} actual={:?}",
+            a.direction, b.direction
+        ));
+    }
+    if a.include_margin != b.include_margin {
+        parts.push(format!(
+            "fullSz: expected={} actual={}",
+            a.include_margin, b.include_margin
+        ));
+    }
+    if a.width != b.width {
+        parts.push(format!("width: expected={} actual={}", a.width, b.width));
+    }
+    if a.spacing != b.spacing {
+        parts.push(format!("gap: expected={} actual={}", a.spacing, b.spacing));
+    }
+    if a.max_width != b.max_width {
+        parts.push(format!(
+            "lastWidth: expected={} actual={}",
+            a.max_width, b.max_width
+        ));
+    }
+    if a.paragraphs.len() != b.paragraphs.len() {
+        parts.push(format!(
+            "paragraphs: expected={} actual={}",
+            a.paragraphs.len(),
+            b.paragraphs.len()
+        ));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("; "))
+    }
 }
 
 /// 섹션 `PageDef` 비교 (#1388). 불일치 필드를 "field: expected=.. actual=.." 로 모아
@@ -549,6 +630,15 @@ fn diff_paragraph_linesegs(
                         diff_paragraph_linesegs(out, section, paragraph, &p, qa, qb);
                     }
                 }
+                // 표 캡션 내부 문단 lineseg 재귀 (#1387) — 존재/속성 비교는
+                // diff_paragraph_char_shapes 쪽 한 곳에서 수행.
+                if let (Some(ca), Some(cb)) = (&ta.caption, &tb.caption) {
+                    for (k, (qa, qb)) in ca.paragraphs.iter().zip(cb.paragraphs.iter()).enumerate()
+                    {
+                        let p = format!("{path}/ctrl[{ci}]tbl.caption.p[{k}]");
+                        diff_paragraph_linesegs(out, section, paragraph, &p, qa, qb);
+                    }
+                }
             }
             (Control::Shape(sa), Control::Shape(sb)) => {
                 let p = format!("{path}/ctrl[{ci}]shape");
@@ -662,6 +752,22 @@ fn diff_paragraph_char_shapes(
                         cea.paragraphs.iter().zip(ceb.paragraphs.iter()).enumerate()
                     {
                         let p = format!("{path}/ctrl[{ci}]tbl.cell[{cell_i}].p[{k}]");
+                        diff_paragraph_char_shapes(diff, section, paragraph, &p, qa, qb);
+                    }
+                }
+                // 표 캡션 비교 (#1387) — 존재/속성/문단 수 + 내부 문단 재귀.
+                if let Some(detail) = diff_table_caption(&ta.caption, &tb.caption) {
+                    diff.push(IrDifference::TableCaption {
+                        section,
+                        paragraph,
+                        path: format!("{path}/ctrl[{ci}]tbl.caption"),
+                        detail,
+                    });
+                }
+                if let (Some(ca), Some(cb)) = (&ta.caption, &tb.caption) {
+                    for (k, (qa, qb)) in ca.paragraphs.iter().zip(cb.paragraphs.iter()).enumerate()
+                    {
+                        let p = format!("{path}/ctrl[{ci}]tbl.caption.p[{k}]");
                         diff_paragraph_char_shapes(diff, section, paragraph, &p, qa, qb);
                     }
                 }
@@ -1333,6 +1439,97 @@ mod tests {
         let doc3 = parse_hwpx(&out2).expect("parse r2");
         let d2 = diff_documents(&doc2, &doc3);
         assert!(d2.is_empty(), "round2: {:?}", d2.differences);
+    }
+
+    // ---------- #1387: diff_table_caption (게이트 동승) ----------
+
+    fn caption_with_paras(n: usize) -> crate::model::shape::Caption {
+        let mut c = crate::model::shape::Caption::default();
+        for _ in 0..n {
+            c.paragraphs.push(Paragraph::default());
+        }
+        c
+    }
+
+    fn table_with_caption(
+        cap: Option<crate::model::shape::Caption>,
+    ) -> crate::model::control::Control {
+        match table_control(&[]) {
+            crate::model::control::Control::Table(mut t) => {
+                t.caption = cap;
+                crate::model::control::Control::Table(t)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn task1387_caption_loss_in_gate() {
+        // #1387 결함 본체였던 캡션 소실(원본 유 → RT 무)을 게이트가 검출하는지 고정.
+        let a = doc_with_control(table_with_caption(Some(caption_with_paras(1))));
+        let b = doc_with_control(table_with_caption(None));
+        let diff = diff_documents(&a, &b);
+        assert_eq!(diff.differences.len(), 1, "{:?}", diff.differences);
+        match &diff.differences[0] {
+            IrDifference::TableCaption { path, detail, .. } => {
+                assert_eq!(path, "/ctrl[0]tbl.caption");
+                assert_eq!(detail, "missing: expected=Some actual=None");
+            }
+            other => panic!("TableCaption 여야 함: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task1387_caption_attr_mismatch_in_gate() {
+        let mut ca = caption_with_paras(1);
+        ca.spacing = 850;
+        let mut cb = caption_with_paras(1);
+        cb.spacing = 0;
+        cb.direction = crate::model::shape::CaptionDirection::Top;
+        let a = doc_with_control(table_with_caption(Some(ca)));
+        let b = doc_with_control(table_with_caption(Some(cb)));
+        let diff = diff_documents(&a, &b);
+        assert_eq!(diff.differences.len(), 1, "{:?}", diff.differences);
+        match &diff.differences[0] {
+            IrDifference::TableCaption { detail, .. } => {
+                assert_eq!(
+                    detail,
+                    "side: expected=Bottom actual=Top; gap: expected=850 actual=0"
+                );
+            }
+            other => panic!("TableCaption 여야 함: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task1387_caption_paragraph_recursed_in_gate() {
+        // 캡션 내부 문단의 char_shapes 차이가 `tbl.caption.p[k]` 경로로 검출.
+        let mut ca = caption_with_paras(1);
+        ca.paragraphs[0].char_shapes = to_refs(&[(0, 6)]);
+        let mut cb = caption_with_paras(1);
+        cb.paragraphs[0].char_shapes = to_refs(&[(0, 7)]);
+        let a = doc_with_control(table_with_caption(Some(ca)));
+        let b = doc_with_control(table_with_caption(Some(cb)));
+        let diff = diff_documents(&a, &b);
+        assert_eq!(diff.differences.len(), 1, "{:?}", diff.differences);
+        match &diff.differences[0] {
+            IrDifference::ParagraphCharShapes { path, .. } => {
+                assert_eq!(path, "/ctrl[0]tbl.caption.p[0]");
+            }
+            other => panic!("ParagraphCharShapes 여야 함: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn task1387_ta_pic_001_r_roundtrip_caption_gate_zero() {
+        // 캡션 보유 실샘플의 roundtrip 게이트 0 — 2단계 serializer 수정 + 캡션
+        // 동승 후 기대치 (autoNum #1382 변위는 텍스트 축 — 게이트 비교 항목 밖).
+        let bytes = std::fs::read("samples/hwpx/ta-pic-001-r.hwpx").expect("샘플 읽기");
+        let doc1 = parse_hwpx(&bytes).expect("parse 원본");
+        let out = serialize_hwpx(&doc1).expect("serialize");
+        let doc2 = parse_hwpx(&out).expect("reparse");
+        let diff = diff_documents(&doc1, &doc2);
+        assert!(diff.is_empty(), "{:?}", diff.differences);
     }
 
     // ---------- #1388: diff_page_def (게이트 동승) ----------

@@ -918,13 +918,17 @@ fn render_page_num(pn: &PageNumberPos) -> String {
     )
 }
 
-/// 번호 종류 → HWPX `numType` 문자열. `parse_num_type`의 역매핑(Picture→FIGURE).
+/// 번호 종류 → HWPX `numType` 문자열. `parse_num_type`의 역매핑.
+///
+/// [#1387] Picture 는 "PICTURE" — 한컴 실물 표기. 종전 "FIGURE" 는 한컴 생산 파일에
+/// 비실재(samples/hwpx 전수 0건)하고 한컴에디터가 그림 번호로 인식하지 못해 캡션
+/// 번호가 미출력됐다 (한컴 판정 실증). 파서는 FIGURE/PICTURE 양쪽 수용 유지.
 fn auto_number_type_to_str(t: AutoNumberType) -> &'static str {
     match t {
         AutoNumberType::Page => "PAGE",
         AutoNumberType::Footnote => "FOOTNOTE",
         AutoNumberType::Endnote => "ENDNOTE",
-        AutoNumberType::Picture => "FIGURE",
+        AutoNumberType::Picture => "PICTURE",
         AutoNumberType::Table => "TABLE",
         AutoNumberType::Equation => "EQUATION",
     }

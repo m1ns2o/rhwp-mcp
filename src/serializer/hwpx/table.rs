@@ -88,10 +88,13 @@ pub fn write_table<W: Write>(
         ],
     )?;
 
-    // --- 자식: sz, pos, outMargin, inMargin, tr[] ---
+    // --- 자식: sz, pos, outMargin, (caption — 옵셔널), inMargin, tr[] ---
     write_sz(w, &table.common)?;
     write_pos(w, &table.common)?;
     write_out_margin(w, table)?;
+    if let Some(caption) = &table.caption {
+        write_caption(w, caption, ctx)?;
+    }
     write_in_margin(w, table)?;
 
     // tr[]: 행 단위 반복. 각 행에 속한 셀 (cell.row == r) 을 col 오름차순으로 출력.
@@ -246,12 +249,25 @@ fn write_sub_list<W: Write>(
         ],
     )?;
 
-    // 셀 내부 문단 재귀 — 본문과 동일한 공유 직렬화 경로(render_paragraph_parts)로
-    // 컨트롤 슬롯(표 재귀 포함) 방출 + run 분할 + lineseg IR 보존/fallback (#1379 2단계).
-    // sub_list_depth: 셀 경로 한정 colPr 인라인 방출 스코프 (#1379 3단계).
+    write_sub_list_paragraphs(w, &cell.paragraphs, ctx)?;
+
+    end_tag(w, "hp:subList")?;
+    Ok(())
+}
+
+/// subList 내부 문단 시퀀스 방출 — 셀(#1379)과 표 캡션(#1387)이 공유.
+///
+/// 본문과 동일한 공유 직렬화 경로(render_paragraph_parts)로 컨트롤 슬롯(표 재귀
+/// 포함) 방출 + run 분할 + lineseg IR 보존/fallback (#1379 2단계).
+/// sub_list_depth: subList 경로 한정 colPr 인라인 방출 스코프 (#1379 3단계).
+fn write_sub_list_paragraphs<W: Write>(
+    w: &mut Writer<W>,
+    paragraphs: &[crate::model::paragraph::Paragraph],
+    ctx: &mut SerializeContext,
+) -> Result<(), SerializeError> {
     ctx.sub_list_depth += 1;
     let mut vert_cursor: u32 = 0;
-    for para in cell.paragraphs.iter() {
+    for para in paragraphs {
         ctx.para_shape_ids.reference(para.para_shape_id);
         ctx.style_ids.reference(para.style_id as u16);
 
@@ -266,8 +282,61 @@ fn write_sub_list<W: Write>(
             .map_err(|e| SerializeError::XmlError(e.to_string()))?;
     }
     ctx.sub_list_depth -= 1;
+    Ok(())
+}
 
+/// `<hp:caption>` 직렬화 (#1387) — 자식 순서상 outMargin 과 inMargin 사이 (모듈 doc).
+///
+/// 속성 순서는 한컴 실물(ta-pic-001-r) 기준: side, fullSz, width, gap, lastWidth.
+/// 캡션 subList 속성은 파서가 적재하지 않으며 samples/hwpx 전수 17건 동일
+/// (vertAlign=TOP lineWrap=BREAK textDirection=HORIZONTAL — 1단계 측정) — 실물 고정값 방출.
+fn write_caption<W: Write>(
+    w: &mut Writer<W>,
+    caption: &crate::model::shape::Caption,
+    ctx: &mut SerializeContext,
+) -> Result<(), SerializeError> {
+    use crate::model::shape::CaptionDirection;
+
+    let side = match caption.direction {
+        CaptionDirection::Left => "LEFT",
+        CaptionDirection::Right => "RIGHT",
+        CaptionDirection::Top => "TOP",
+        CaptionDirection::Bottom => "BOTTOM",
+    };
+    let full_sz = bool01(caption.include_margin);
+    let width = caption.width.to_string();
+    let gap = caption.spacing.to_string();
+    let last_width = caption.max_width.to_string();
+    start_tag_attrs(
+        w,
+        "hp:caption",
+        &[
+            ("side", side),
+            ("fullSz", full_sz),
+            ("width", &width),
+            ("gap", &gap),
+            ("lastWidth", &last_width),
+        ],
+    )?;
+    start_tag_attrs(
+        w,
+        "hp:subList",
+        &[
+            ("id", ""),
+            ("textDirection", "HORIZONTAL"),
+            ("lineWrap", "BREAK"),
+            ("vertAlign", "TOP"),
+            ("linkListIDRef", "0"),
+            ("linkListNextIDRef", "0"),
+            ("textWidth", "0"),
+            ("textHeight", "0"),
+            ("hasTextRef", "0"),
+            ("hasNumRef", "0"),
+        ],
+    )?;
+    write_sub_list_paragraphs(w, &caption.paragraphs, ctx)?;
     end_tag(w, "hp:subList")?;
+    end_tag(w, "hp:caption")?;
     Ok(())
 }
 
@@ -433,6 +502,100 @@ mod tests {
             start_pos,
             char_shape_id,
         }
+    }
+
+    // ---------- #1387: write_caption — 표 캡션 직렬화 ----------
+
+    fn caption_with_text(text: &str) -> crate::model::shape::Caption {
+        let mut para = Paragraph::default();
+        para.text = text.to_string();
+        let mut caption = crate::model::shape::Caption::default();
+        caption.width = 8504;
+        caption.spacing = 850;
+        caption.max_width = 47624;
+        caption.paragraphs.push(para);
+        caption
+    }
+
+    #[test]
+    fn task1387_caption_attrs_reflect_ir() {
+        // 속성 5종 역매핑 + 한컴 실물 순서(side, fullSz, width, gap, lastWidth).
+        let mut t = empty_table(1, 1);
+        t.caption = Some(caption_with_text("캡션"));
+        let xml = serialize(&t);
+        assert!(
+            xml.contains(
+                r#"<hp:caption side="BOTTOM" fullSz="0" width="8504" gap="850" lastWidth="47624">"#
+            ),
+            "caption 속성이 IR 값·실물 순서로 방출되어야 함: {}",
+            xml
+        );
+        assert!(
+            xml.contains("<hp:t>캡션</hp:t>"),
+            "캡션 subList 문단 텍스트가 방출되어야 함"
+        );
+        // 자식 순서: outMargin → caption → inMargin (모듈 doc).
+        let om = xml.find("<hp:outMargin").unwrap();
+        let cp = xml.find("<hp:caption").unwrap();
+        let im = xml.find("<hp:inMargin").unwrap();
+        assert!(om < cp && cp < im, "caption 은 outMargin 과 inMargin 사이");
+    }
+
+    #[test]
+    fn task1387_caption_side_reflects_direction() {
+        use crate::model::shape::CaptionDirection;
+        for (dir, expected) in [
+            (CaptionDirection::Left, r#"side="LEFT""#),
+            (CaptionDirection::Right, r#"side="RIGHT""#),
+            (CaptionDirection::Top, r#"side="TOP""#),
+            (CaptionDirection::Bottom, r#"side="BOTTOM""#),
+        ] {
+            let mut t = empty_table(1, 1);
+            let mut c = caption_with_text("c");
+            c.direction = dir;
+            t.caption = Some(c);
+            let xml = serialize(&t);
+            assert!(xml.contains(expected), "{:?} → {}", dir, expected);
+        }
+    }
+
+    #[test]
+    fn task1387_caption_paragraph_controls_emitted() {
+        // 캡션 문단 내 인라인 컨트롤(autoNum — ta-pic-001-r 실물 패턴)이 공유 경로로 방출.
+        let mut para = Paragraph::default();
+        para.text = "\u{0}그림".to_string(); // 확장 컨트롤 문자 위치 0 + 텍스트
+        para.char_offsets = vec![0, 1, 2];
+        let auto_num = crate::model::control::AutoNumber {
+            number_type: crate::model::control::AutoNumberType::Picture,
+            ..Default::default()
+        };
+        para.controls
+            .push(crate::model::control::Control::AutoNumber(auto_num));
+        let mut caption = crate::model::shape::Caption::default();
+        caption.paragraphs.push(para);
+        let mut t = empty_table(1, 1);
+        t.caption = Some(caption);
+        let xml = serialize(&t);
+        assert!(
+            xml.contains("<hp:autoNum"),
+            "캡션 내 autoNum 컨트롤이 방출되어야 함: {}",
+            xml
+        );
+        assert!(
+            xml.contains(r#"numType="PICTURE""#),
+            "그림 번호는 한컴 실물 표기 PICTURE 로 방출 — FIGURE 는 한컴 미인식(#1387 판정): {}",
+            xml
+        );
+    }
+
+    #[test]
+    fn task1387_no_caption_no_emission() {
+        let t = empty_table(1, 1);
+        let xml = serialize(&t);
+        assert!(
+            !xml.contains("<hp:caption"),
+            "caption 없는 표는 hp:caption 미방출 (기존 동작 무변화)"
+        );
     }
 
     #[test]
@@ -875,6 +1038,76 @@ mod tests {
             "charPr 목록이 미설정(u32::MAX) 포함 그대로 방출되어야 함: {}",
             xml
         );
+    }
+
+    #[test]
+    fn task1387_ta_pic_001_r_roundtrip_preserves_caption() {
+        // 이슈 #1387 대표 샘플 — roundtrip 후 표 캡션(문단 텍스트 포함) 보존.
+        fn first_table_caption(doc: &Document) -> Option<crate::model::shape::Caption> {
+            doc.sections
+                .iter()
+                .flat_map(|s| &s.paragraphs)
+                .flat_map(|p| &p.controls)
+                .find_map(|c| match c {
+                    crate::model::control::Control::Table(t) => t.caption.clone(),
+                    _ => None,
+                })
+        }
+        let bytes = std::fs::read("samples/hwpx/ta-pic-001-r.hwpx").expect("샘플 읽기");
+        let doc1 = crate::parser::hwpx::parse_hwpx(&bytes).expect("파싱");
+        let cap1 = first_table_caption(&doc1).expect("픽스처 전제: 원본 표에 캡션 존재");
+        assert!(
+            cap1.paragraphs[0].text.contains("의정활동"),
+            "원본 캡션 텍스트 확인: {:?}",
+            cap1.paragraphs[0].text
+        );
+        let out = crate::serializer::hwpx::serialize_hwpx(&doc1).expect("직렬화");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&out).expect("재파싱");
+        let cap2 = first_table_caption(&doc2).expect("roundtrip 후 캡션이 보존되어야 함");
+        assert_eq!(cap1.paragraphs.len(), cap2.paragraphs.len());
+        assert_eq!(cap1.width, cap2.width);
+        assert_eq!(cap1.spacing, cap2.spacing);
+        assert_eq!(cap1.max_width, cap2.max_width);
+        assert_eq!(cap1.direction, cap2.direction);
+        assert_eq!(cap1.include_margin, cap2.include_margin);
+        // 캡션 내 autoNum 슬롯은 #1382(파서 축 비일관 — placeholder 1유닛 적재로
+        // inferred_control_slot_count=0 → mismatch 경로 끝 방출) 영향으로 재파싱 시
+        // 문단 끝 placeholder 공백 1자가 추가된다. 텍스트 본문은 보존 (#1382 귀속,
+        // 본 타스크 범위 밖 — 143E 본문 xfail 과 동일 계열).
+        assert_eq!(
+            cap2.paragraphs[0].text.trim_end(),
+            cap1.paragraphs[0].text.trim_end(),
+            "캡션 텍스트 본문 보존 (#1382 placeholder 변위 제외)"
+        );
+        assert_eq!(
+            cap1.paragraphs[0].controls.len(),
+            cap2.paragraphs[0].controls.len(),
+            "캡션 내 컨트롤(autoNum) 수 보존"
+        );
+    }
+
+    #[test]
+    fn task1387_mel_001_roundtrip_caption_text_exact() {
+        // autoNum 없는 캡션(mel-001, side=TOP) — 텍스트 완전 일치 + side 역매핑 검증.
+        fn first_table_caption(doc: &Document) -> Option<crate::model::shape::Caption> {
+            doc.sections
+                .iter()
+                .flat_map(|s| &s.paragraphs)
+                .flat_map(|p| &p.controls)
+                .find_map(|c| match c {
+                    crate::model::control::Control::Table(t) => t.caption.clone(),
+                    _ => None,
+                })
+        }
+        let bytes = std::fs::read("samples/hwpx/mel-001.hwpx").expect("샘플 읽기");
+        let doc1 = crate::parser::hwpx::parse_hwpx(&bytes).expect("파싱");
+        let cap1 = first_table_caption(&doc1).expect("픽스처 전제: 원본 표에 캡션 존재");
+        assert_eq!(cap1.direction, crate::model::shape::CaptionDirection::Top);
+        let out = crate::serializer::hwpx::serialize_hwpx(&doc1).expect("직렬화");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&out).expect("재파싱");
+        let cap2 = first_table_caption(&doc2).expect("roundtrip 후 캡션 보존");
+        assert_eq!(cap1.paragraphs[0].text, cap2.paragraphs[0].text);
+        assert_eq!(cap1.direction, cap2.direction);
     }
 
     #[test]
