@@ -505,7 +505,13 @@ fn arrow_size_str(v: u32) -> &'static str {
 
 /// `<hc:fillBrush>` — `parse_shape_fill_brush` 의 역매핑.
 /// `FillType::None` 은 원본에 fillBrush 부재로 간주하여 미방출.
-fn write_fill_brush<W: Write>(w: &mut Writer<W>, fill: &Fill) -> Result<(), SerializeError> {
+///
+/// 도형(rect/line)뿐 아니라 `header.rs` 의 borderFill 도 같은 fillBrush 구조를
+/// 쓰므로 `pub(crate)` 로 공유한다.
+pub(crate) fn write_fill_brush<W: Write>(
+    w: &mut Writer<W>,
+    fill: &Fill,
+) -> Result<(), SerializeError> {
     match fill.fill_type {
         FillType::None => Ok(()),
         FillType::Solid => {

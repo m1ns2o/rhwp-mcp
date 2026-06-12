@@ -228,13 +228,10 @@ fn write_border_fill<W: Write>(
     write_border_line(w, "hh:bottomBorder", &bf.borders[3])?;
     write_diagonal(w, &bf.diagonal)?;
 
-    // fillBrush: Fill이 존재할 때만
-    if !matches!(bf.fill.fill_type, FillType::None) {
-        start_tag(w, "hc:fillBrush")?;
-        // Stage 1에서는 Fill 내부를 완전 직렬화하지 않고 빈 래퍼만 출력.
-        // (한컴 관찰: ref_empty의 borderFill id=2 에 빈 fillBrush 존재)
-        end_tag(w, "hc:fillBrush")?;
-    }
+    // fillBrush: 도형과 동일한 fillBrush 구조를 공유한다.
+    // 종전 Stage 1 은 빈 래퍼만 출력해 winBrush(배경색)/gradation/imgBrush 를
+    // 전부 잃었다. 파서가 채운 Fill 을 shape 의 검증된 역매핑으로 직렬화한다.
+    super::shape::write_fill_brush(w, &bf.fill)?;
 
     end_tag(w, "hh:borderFill")?;
     Ok(())
@@ -1021,6 +1018,48 @@ mod tests {
         assert!(
             xml.contains(r#"<hh:backSlash type="CENTER_BELOW" Crooked="0" isCounter="0"/>"#),
             "backSlash 방향 비트가 CENTER_BELOW로 보존되어야 함: {xml}"
+        );
+    }
+
+    #[test]
+    fn write_border_fill_serializes_solid_winbrush_not_empty() {
+        // borderFill 의 Solid 배경색(셀 음영)이 빈 fillBrush 로 누락되지 않고
+        // 도형과 동일한 winBrush 구조로 직렬화되어야 한다.
+        use crate::model::style::{Fill, SolidFill};
+        let mut bf = BorderFill::default();
+        bf.fill = Fill {
+            fill_type: FillType::Solid,
+            solid: Some(SolidFill {
+                background_color: 0x00D6_D6D6, // #D6D6D6 (0xAABBGGRR, a=0)
+                pattern_color: 0x0000_0000,    // #000000
+                pattern_type: -1,
+            }),
+            alpha: 0,
+            ..Default::default()
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 5, &bf).expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(
+            xml.contains(
+                r##"<hc:fillBrush><hc:winBrush faceColor="#D6D6D6" hatchColor="#000000" alpha="0"/></hc:fillBrush>"##
+            ),
+            "Solid 배경색이 winBrush 로 직렬화되어야 함(빈 fillBrush 아님): {xml}"
+        );
+    }
+
+    #[test]
+    fn write_border_fill_omits_fillbrush_when_none() {
+        // FillType::None 은 fillBrush 자체를 출력하지 않는다.
+        let bf = BorderFill::default();
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 0, &bf).expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            !xml.contains("fillBrush"),
+            "FillType::None 은 fillBrush 미출력: {xml}"
         );
     }
 
