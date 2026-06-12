@@ -22,11 +22,12 @@
 use quick_xml::Writer;
 
 use crate::model::control::{
-    AutoNumber, AutoNumberType, Control, Equation, NewNumber, PageHide, PageNumberPos,
+    AutoNumber, AutoNumberType, CharOverlap, Control, Equation, NewNumber, PageHide, PageNumberPos,
 };
 use crate::model::document::{Document, Section};
 use crate::model::footnote::{Endnote, Footnote};
 use crate::model::header_footer::{Footer, Header, HeaderFooterApply};
+use crate::model::page::{ColumnDef, ColumnDirection, ColumnType};
 use crate::model::paragraph::{ColumnBreakType, LineSeg, Paragraph};
 use crate::model::shape::{
     CommonObjAttr, HorzAlign, HorzRelTo, ShapeObject, TextWrap, VertAlign, VertRelTo,
@@ -123,7 +124,7 @@ pub fn write_section(
 ///
 /// `id` 는 문단 순서 기반(0, 1, 2, ...)로 할당한다. 한컴 샘플은 랜덤 해시도 쓰지만
 /// 파서는 id 를 무시하므로 순차값으로 충분.
-fn render_hp_p_open(p: &Paragraph, id: u32) -> String {
+pub(crate) fn render_hp_p_open(p: &Paragraph, id: u32) -> String {
     let page_break = if matches!(p.column_type, ColumnBreakType::Page) {
         1
     } else {
@@ -151,7 +152,7 @@ fn first_run_char_shape_id(p: &Paragraph) -> u32 {
 /// `<hp:lineseg>` 출력 원칙 (#177):
 /// - `para.line_segs` 가 비어있지 않으면 **IR 값 그대로 출력**
 /// - 비어있을 때만 텍스트 내 `\n` 기반으로 fallback 생성 (빈 문단·`Document::default()` 호환)
-fn render_paragraph_parts(
+pub(crate) fn render_paragraph_parts(
     para: &Paragraph,
     vert_start: u32,
     ctx: &mut SerializeContext,
@@ -341,20 +342,6 @@ fn split_text_into(splitter: &mut RunSplitter, para: &Paragraph, tab_idx: &mut u
     );
 }
 
-/// 텍스트만 char_shapes 경계로 run 분할한 시퀀스 — 셀·글상자 경로 공유 헬퍼 (#1378 3단계).
-///
-/// 컨트롤 슬롯은 방출하지 않는다 (셀·글상자 컨트롤 보존은 #1379 범위).
-/// 문단의 모든 char_shapes entry 를 `ctx.char_shape_ids.reference()` 한다.
-pub(crate) fn render_text_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
-    for cs in &para.char_shapes {
-        ctx.char_shape_ids.reference(cs.char_shape_id);
-    }
-    let mut splitter = RunSplitter::new(para);
-    let mut tab_idx = 0usize;
-    split_text_into(&mut splitter, para, &mut tab_idx);
-    splitter.finish()
-}
-
 /// Paragraph 본문을 완전한 `<hp:run>` 시퀀스로 직렬화한다 (#1378 다중 run 분할).
 fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
     // ID 참조 무결성 (구현계획서 1.5): 실제 char_shapes entry 만 reference.
@@ -382,9 +369,15 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
     let slots: Vec<&Control> = if slot_count == para.controls.len() {
         para.controls.iter().collect()
     } else {
+        // [Task #1379] 셀·글상자 subList(depth > 0) 경로에서는 ColumnDef 도
+        // 인라인 슬롯으로 취급한다 (원본 XML 에 <hp:ctrl><hp:colPr/></hp:ctrl> 인라인 존재).
+        // 본문(depth 0) 경로는 섹션 템플릿 첫 run 의 colPr 가 받으므로 불변.
         para.controls
             .iter()
-            .filter(|c| is_hwpx_inline_slot(c))
+            .filter(|c| {
+                is_hwpx_inline_slot(c)
+                    || (ctx.sub_list_depth > 0 && matches!(c, Control::ColumnDef(_)))
+            })
             .collect()
     };
 
@@ -558,7 +551,7 @@ fn inferred_control_slot_count(para: &Paragraph) -> usize {
         .saturating_sub(para.field_ranges.len() as u32) as usize
 }
 
-fn is_hwpx_inline_slot(control: &Control) -> bool {
+pub(crate) fn is_hwpx_inline_slot(control: &Control) -> bool {
     matches!(
         control,
         Control::Table(_)
@@ -636,8 +629,114 @@ fn render_control_slot(out: &mut String, control: &Control, ctx: &mut SerializeC
             Ok(xml) => out.push_str(&xml),
             Err(e) => eprintln!("[hwpx] Form 직렬화 실패: {e}"),
         },
+        Control::CharOverlap(co) => out.push_str(&render_compose(co)),
+        // [Task #1379] 셀·글상자 subList 한정 인라인 colPr 방출.
+        // 본문 경로(depth 0)는 섹션 템플릿 첫 run 에서 처리하므로 미방출 유지.
+        Control::ColumnDef(cd) if ctx.sub_list_depth > 0 => {
+            out.push_str(&render_col_pr_ctrl(cd));
+        }
         _ => {}
     }
+}
+
+/// 셀·글상자 subList 인라인 `<hp:ctrl><hp:colPr .../></hp:ctrl>` (#1379 3단계).
+/// `parse_col_pr` / `parse_col_line`(parser/hwpx/section.rs)의 역매핑.
+fn render_col_pr_ctrl(cd: &ColumnDef) -> String {
+    let col_type = match cd.column_type {
+        ColumnType::Distribute => "BalancedNewspaper",
+        ColumnType::Parallel => "Parallel",
+        ColumnType::Normal => "NEWSPAPER",
+    };
+    let layout = match cd.direction {
+        ColumnDirection::RightToLeft => "RIGHT",
+        ColumnDirection::LeftToRight => "LEFT",
+    };
+    let mut out = format!(
+        r#"<hp:ctrl><hp:colPr id="" type="{}" layout="{}" colCount="{}" sameSz="{}" sameGap="{}""#,
+        col_type, layout, cd.column_count, cd.same_width as u8, cd.spacing,
+    );
+    if cd.separator_type != 0 {
+        out.push('>');
+        out.push_str(&format!(
+            r#"<hp:colLine type="{}" width="{} mm" color="{}"/>"#,
+            col_line_type_str(cd.separator_type),
+            line_width_mm(cd.separator_width),
+            super::shape::color_to_hex(cd.separator_color),
+        ));
+        out.push_str("</hp:colPr></hp:ctrl>");
+    } else {
+        out.push_str("/></hp:ctrl>");
+    }
+    out
+}
+
+/// `parse_hwpx_line_type` 역매핑 (colLine type).
+fn col_line_type_str(t: u8) -> &'static str {
+    match t {
+        2 => "DASH",
+        3 => "DOT",
+        4 => "DASH_DOT",
+        5 => "DASH_DOT_DOT",
+        6 => "LONG_DASH",
+        7 => "CIRCLE",
+        _ => "SOLID",
+    }
+}
+
+/// HWP 선 굵기 인덱스 → mm 수치 문자열 (`parse_hwpx_line_width` 역매핑).
+fn line_width_mm(w: u8) -> &'static str {
+    match w {
+        0 => "0.1",
+        1 => "0.12",
+        2 => "0.15",
+        3 => "0.2",
+        4 => "0.25",
+        5 => "0.3",
+        6 => "0.4",
+        7 => "0.5",
+        8 => "0.6",
+        9 => "0.7",
+        10 => "1.0",
+        11 => "1.5",
+        12 => "2.0",
+        13 => "3.0",
+        14 => "4.0",
+        _ => "5.0",
+    }
+}
+
+/// `<hp:compose>` 글자겹침(CharOverlap) — `<hp:run>` 직접 자식 (<hp:ctrl> 비포장).
+/// `parse_compose`(parser/hwpx/section.rs)의 역매핑. charPr 목록은 미설정(u32::MAX)
+/// 항목 포함 원본 그대로 방출한다 (ID 참조 등록 비대상).
+fn render_compose(co: &CharOverlap) -> String {
+    let circle_type = match co.border_type {
+        1 => "SHAPE_CIRCLE",
+        2 => "SHAPE_REVERSAL_CIRCLE",
+        3 => "SHAPE_RECTANGLE",
+        4 => "SHAPE_REVERSAL_RECTANGLE",
+        5 => "SHAPE_TRIANGLE",
+        6 => "SHAPE_REVERSAL_TIRANGLE",
+        _ => "CHAR",
+    };
+    let compose_type = if co.expansion == 1 {
+        "OVERLAP"
+    } else {
+        "SPREAD"
+    };
+    let text: String = co.chars.iter().collect();
+    let mut out = format!(
+        r#"<hp:compose circleType="{}" charSz="{}" composeType="{}" charPrCnt="{}" composeText="{}">"#,
+        circle_type,
+        co.inner_char_size,
+        compose_type,
+        co.char_shape_ids.len(),
+        xml_escape(&text),
+    );
+    for id in &co.char_shape_ids {
+        out.push_str(&format!(r#"<hp:charPr prIDRef="{}"/>"#, id));
+    }
+    out.push_str("</hp:compose>");
+    out
 }
 
 /// 장식 문자(userChar/prefixChar/suffixChar)용 속성값. '\0'(미설정)은 빈 문자열.

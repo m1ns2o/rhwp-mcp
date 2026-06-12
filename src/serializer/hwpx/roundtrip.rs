@@ -16,10 +16,16 @@
 //! Task #1378 확장:
 //! - 본문(top-level) 문단별 `char_shapes` 시퀀스 — `(start_pos, char_shape_id)` 전체 비교.
 //!   serializer 의 run 평탄화(첫 run 서식으로 통일)를 검출한다.
-//!   셀·글상자 내부 문단 재귀 비교는 #1378 3단계에서 확장 예정.
+//!   셀·글상자(Group 재귀)·각주/미주 내부 문단 재귀 비교 포함 (3단계).
+//!
+//! Task #1379 확장:
+//! - 문단별 인라인 슬롯 컨트롤 타입 시퀀스 비교 (`is_hwpx_inline_slot` 기준, 본문 +
+//!   #1378 재귀 동승). 셀·글상자 subList 의 컨트롤 소실(그림 등)을 검출한다.
+//!   Bookmark 등 위치 없는 비슬롯 컨트롤은 비교 대상에서 제외.
 
 #![allow(dead_code)]
 
+use super::section::is_hwpx_inline_slot;
 use crate::model::document::Document;
 use crate::parser::hwpx::parse_hwpx;
 use crate::serializer::hwpx::serialize_hwpx;
@@ -103,6 +109,16 @@ pub enum IrDifference {
         expected: String,
         actual: String,
     },
+    /// 문단의 인라인 슬롯 컨트롤 타입 시퀀스 불일치 — 컨트롤 보존 게이트 (#1379).
+    ///
+    /// `path` 표기는 `ParagraphCharShapes` 와 동일.
+    ParagraphControls {
+        section: usize,
+        paragraph: usize,
+        path: String,
+        expected: String,
+        actual: String,
+    },
 }
 
 impl std::fmt::Display for IrDifference {
@@ -161,6 +177,17 @@ impl std::fmt::Display for IrDifference {
             } => write!(
                 f,
                 "section[{}] paragraph[{}]{} char_shapes: expected={} actual={}",
+                section, paragraph, path, expected, actual
+            ),
+            ParagraphControls {
+                section,
+                paragraph,
+                path,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "section[{}] paragraph[{}]{} controls: expected={} actual={}",
                 section, paragraph, path, expected, actual
             ),
         }
@@ -269,11 +296,11 @@ pub fn diff_documents(a: &Document, b: &Document) -> IrDiff {
     diff
 }
 
-/// 문단 char_shapes 시퀀스를 비교하고, 컨트롤 내부 문단(셀·글상자·각주/미주)을
-/// 재귀 비교한다 (#1378 3단계).
+/// 문단 char_shapes 시퀀스(#1378)와 인라인 슬롯 컨트롤 타입 시퀀스(#1379)를 비교하고,
+/// 컨트롤 내부 문단(셀·글상자·각주/미주)을 재귀 비교한다.
 ///
-/// 컨트롤 쌍은 인덱스 대응(zip)으로만 비교한다 — 컨트롤 수·타입 불일치(보존 소실)는
-/// 본 게이트(run 분할 보존)의 범위 밖이다 (#1379).
+/// 컨트롤 쌍의 재귀는 인덱스 대응(zip)으로만 내려간다 — 수·타입 불일치는
+/// `ParagraphControls` 가 해당 문단 수준에서 검출한다.
 fn diff_paragraph_char_shapes(
     diff: &mut IrDiff,
     section: usize,
@@ -282,6 +309,8 @@ fn diff_paragraph_char_shapes(
     pa: &crate::model::paragraph::Paragraph,
     pb: &crate::model::paragraph::Paragraph,
 ) {
+    use crate::model::control::Control;
+
     let ca = &pa.char_shapes;
     let cb = &pb.char_shapes;
     let same = ca.len() == cb.len()
@@ -299,7 +328,33 @@ fn diff_paragraph_char_shapes(
         });
     }
 
-    use crate::model::control::Control;
+    // 인라인 슬롯 컨트롤 타입 시퀀스 비교 (#1379) — subList 컨트롤 소실 검출.
+    // Bookmark 등 위치 정보가 없는 비슬롯 컨트롤은 제외 (serializer 가 문단 선두로
+    // 재배치하므로 순서 비교가 성립하지 않음).
+    let sa: Vec<&Control> = pa
+        .controls
+        .iter()
+        .filter(|c| is_hwpx_inline_slot(c))
+        .collect();
+    let sb: Vec<&Control> = pb
+        .controls
+        .iter()
+        .filter(|c| is_hwpx_inline_slot(c))
+        .collect();
+    let ctrl_same = sa.len() == sb.len()
+        && sa
+            .iter()
+            .zip(sb.iter())
+            .all(|(x, y)| control_type_name(x) == control_type_name(y));
+    if !ctrl_same {
+        diff.push(IrDifference::ParagraphControls {
+            section,
+            paragraph,
+            path: path.to_string(),
+            expected: format_control_types(&sa),
+            actual: format_control_types(&sb),
+        });
+    }
     for (ci, (ctrl_a, ctrl_b)) in pa.controls.iter().zip(pb.controls.iter()).enumerate() {
         match (ctrl_a, ctrl_b) {
             (Control::Table(ta), Control::Table(tb)) => {
@@ -371,6 +426,40 @@ fn shape_text_box(s: &crate::model::shape::ShapeObject) -> Option<&crate::model:
         Ole(x) => x.drawing.text_box.as_ref(),
         Group(_) | Picture(_) => None,
     }
+}
+
+/// 컨트롤 타입 표기 — diff 메시지·시퀀스 비교용 (`render_control_slot` 디스패치 대상).
+fn control_type_name(c: &crate::model::control::Control) -> &'static str {
+    use crate::model::control::Control::*;
+    match c {
+        Table(_) => "tbl",
+        Picture(_) => "pic",
+        Shape(_) => "shape",
+        Equation(_) => "eq",
+        Footnote(_) => "fn",
+        Endnote(_) => "en",
+        Field(_) => "field",
+        Form(_) => "form",
+        Header(_) => "header",
+        Footer(_) => "footer",
+        AutoNumber(_) => "autoNum",
+        PageHide(_) => "pageHide",
+        PageNumberPos(_) => "pageNumPos",
+        NewNumber(_) => "newNum",
+        CharOverlap(_) => "charOverlap",
+        Ruby(_) => "ruby",
+        _ => "other",
+    }
+}
+
+/// 컨트롤 타입 시퀀스를 `[tbl,pic, ...]` 형태로 표기 (diff 메시지용).
+fn format_control_types(controls: &[&crate::model::control::Control]) -> String {
+    let inner = controls
+        .iter()
+        .map(|c| control_type_name(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{}]", inner)
 }
 
 /// char_shapes 시퀀스를 `[(start_pos,id), ...]` 형태로 표기 (diff 메시지용).
@@ -651,6 +740,106 @@ mod tests {
             other => panic!("Shape 컨트롤이어야 함: {:?}", other),
         };
         assert_eq!(shapes_of(tb_para), vec![(0, 1), (2, 2)], "글상자 문단");
+    }
+
+    /// 셀 문단에 지정한 컨트롤을 가진 1x1 표 컨트롤 (#1379 게이트 테스트용).
+    fn table_control_with_cell_controls(
+        ctrls: Vec<crate::model::control::Control>,
+    ) -> crate::model::control::Control {
+        use crate::model::table::{Cell, Table};
+        let mut cell_para = Paragraph::default();
+        cell_para.controls = ctrls;
+        let mut cell = Cell::default();
+        cell.col_span = 1;
+        cell.row_span = 1;
+        cell.paragraphs.push(cell_para);
+        let mut t = Table::default();
+        t.row_count = 1;
+        t.col_count = 1;
+        t.cells.push(cell);
+        t.rebuild_grid();
+        crate::model::control::Control::Table(Box::new(t))
+    }
+
+    fn picture_control() -> crate::model::control::Control {
+        crate::model::control::Control::Picture(Box::default())
+    }
+
+    /// 단일 ParagraphControls 차이의 path/expected/actual 을 단언.
+    fn assert_single_controls_diff(diff: &IrDiff, path0: &str, exp: &str, act: &str) {
+        assert_eq!(diff.differences.len(), 1, "차이 1건이어야 함: {:?}", diff);
+        match &diff.differences[0] {
+            IrDifference::ParagraphControls {
+                path,
+                expected,
+                actual,
+                ..
+            } => {
+                assert_eq!(path, path0);
+                assert_eq!(expected, exp);
+                assert_eq!(actual, act);
+            }
+            other => panic!("ParagraphControls 여야 함: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn diff_documents_detects_body_control_loss() {
+        // 본문 문단의 인라인 슬롯 컨트롤 소실 검출 (#1379).
+        let a = doc_with_control(picture_control());
+        let mut b = Document::default();
+        let mut section: crate::model::document::Section = Default::default();
+        section.paragraphs.push(Paragraph::default());
+        b.sections.push(section);
+        assert_single_controls_diff(&diff_documents(&a, &b), "", "[pic]", "[]");
+    }
+
+    #[test]
+    fn diff_documents_detects_cell_control_loss() {
+        // 셀 내부 문단의 컨트롤 소실 검출 (#1379) — subList 컨트롤 미출력 양상.
+        let a = doc_with_control(table_control_with_cell_controls(vec![picture_control()]));
+        let b = doc_with_control(table_control_with_cell_controls(vec![]));
+        assert_single_controls_diff(
+            &diff_documents(&a, &b),
+            "/ctrl[0]tbl.cell[0].p[0]",
+            "[pic]",
+            "[]",
+        );
+    }
+
+    #[test]
+    fn diff_documents_detects_control_type_change() {
+        // 수는 같아도 타입이 다르면 검출.
+        let a = doc_with_control(table_control_with_cell_controls(vec![picture_control()]));
+        let b = doc_with_control(table_control_with_cell_controls(vec![
+            crate::model::control::Control::Equation(Box::default()),
+        ]));
+        assert_single_controls_diff(
+            &diff_documents(&a, &b),
+            "/ctrl[0]tbl.cell[0].p[0]",
+            "[pic]",
+            "[eq]",
+        );
+    }
+
+    #[test]
+    fn diff_documents_bookmark_not_compared_as_control() {
+        // Bookmark 는 비슬롯 — serializer 가 문단 선두로 재배치하므로 비교 제외.
+        let mut a = doc_with_control(crate::model::control::Control::Bookmark(
+            crate::model::control::Bookmark {
+                name: "b".to_string(),
+            },
+        ));
+        a.sections[0].paragraphs[0].controls.push(picture_control());
+        let b = doc_with_control(picture_control());
+        assert!(diff_documents(&a, &b).is_empty());
+    }
+
+    #[test]
+    fn diff_documents_same_cell_controls_is_empty() {
+        let a = doc_with_control(table_control_with_cell_controls(vec![picture_control()]));
+        let b = doc_with_control(table_control_with_cell_controls(vec![picture_control()]));
+        assert!(diff_documents(&a, &b).is_empty());
     }
 
     #[test]

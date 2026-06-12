@@ -4003,6 +4003,7 @@ impl DocumentCore {
             text_box: if has_textbox {
                 Some(TextBox {
                     list_attr: 0x20,
+                    vertical_all: false,
                     vertical_align: crate::model::table::VerticalAlign::Top,
                     margin_left: 283,
                     margin_right: 283,
