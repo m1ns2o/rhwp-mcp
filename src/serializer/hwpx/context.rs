@@ -124,8 +124,12 @@ impl SerializeContext {
         for (idx, _) in doc.doc_info.tab_defs.iter().enumerate() {
             ctx.tab_pr_ids.register(idx as u16);
         }
+        // [#1409] numbering id 는 1-based 방출(header.rs write_numbering: id+1)이고
+        // 실물도 1-based 이므로 등록도 1-based 로 맞춘다 (#1384 borderFill 동형).
+        // numbering 은 reference 검사가 없어 현재 미표면화이나, 등록 축 일관성 +
+        // HWP5 변환·미래 검사 활성화 대비.
         for (idx, _) in doc.doc_info.numberings.iter().enumerate() {
-            ctx.numbering_ids.register(idx as u16);
+            ctx.numbering_ids.register((idx + 1) as u16);
         }
         for (idx, _) in doc.doc_info.styles.iter().enumerate() {
             ctx.style_ids.register(idx as u16);
@@ -281,6 +285,24 @@ mod tests {
         // 0 은 1-based 축에 없음(미등록) — 회귀 가드 의미 명시.
         assert!(!ctx.border_fill_ids.is_registered(&0));
         assert!(ctx.border_fill_ids.is_registered(&31));
+    }
+
+    #[test]
+    fn task1409_numbering_registered_one_based() {
+        // numbering 도 1-based(방출 id=idx+1, 실물 1-based) — borderFill 동형(#1384).
+        // N 개 적재 시 마지막 id=N 이 등록되고 0 은 미등록이어야 한다.
+        use crate::model::style::Numbering;
+        let mut doc = Document::default();
+        doc.doc_info.numberings = vec![Numbering::default(); 8];
+        let ctx = SerializeContext::collect_from_document(&doc);
+        assert!(
+            ctx.numbering_ids.is_registered(&8),
+            "1-based 등록이면 마지막 numbering id=8 등록"
+        );
+        assert!(
+            !ctx.numbering_ids.is_registered(&0),
+            "0 은 1-based 축에 없음 (회귀 가드)"
+        );
     }
 
     #[test]
