@@ -24,25 +24,10 @@ const SAMPLES_ROOT: &str = "samples/hwpx";
 ///
 /// #1379 2~3단계에서 subList(셀·글상자) 컨트롤 보존이 해소되어 25건이 baseline 으로
 /// 승격됨 (task_m100_1379_stage3.md 측정). #1382 해소로 143E433F503322BD33 승격
-/// (autoNum 폭 축 일관화 — task_m100_1382_stage2.md). 잔존 4건은 #1384 귀속.
-const XFAIL: &[(&str, &str)] = &[
-    (
-        "exam_kor.hwpx",
-        "serializer: 미등록 borderFillIDRef 31 — parser→serializer ID 매핑 경계 문제, #1384",
-    ),
-    (
-        "exam_social.hwpx",
-        "serializer: 미등록 borderFillIDRef 31 — parser→serializer ID 매핑 경계 문제, #1384",
-    ),
-    (
-        "exam_social-p1.hwpx",
-        "serializer: 미등록 borderFillIDRef 27 — parser→serializer ID 매핑 경계 문제, #1384",
-    ),
-    (
-        "issue_1133.hwpx",
-        "serializer: 미등록 borderFillIDRef 17 — parser→serializer ID 매핑 경계 문제, #1384",
-    ),
-];
+/// (autoNum 폭 축 일관화 — task_m100_1382_stage2.md). #1384 해소(borderFill 등록
+/// 1-based 정정 — task_m100_1384_stage2.md)로 잔존 4건(exam_kor/exam_social/
+/// exam_social-p1/issue_1133) 승격 → **xfail 0**.
+const XFAIL: &[(&str, &str)] = &[];
 
 /// 검사 제외 — 샘플 자체가 HWPX 패키지가 아님.
 const EXCLUDED: &[(&str, &str)] = &[(

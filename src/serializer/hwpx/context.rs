@@ -113,8 +113,13 @@ impl SerializeContext {
         for (idx, _) in doc.doc_info.para_shapes.iter().enumerate() {
             ctx.para_shape_ids.register(idx as u16);
         }
+        // [#1384] borderFill id 는 1-based 방출(header.rs write_border_fill: idx+1)
+        // 이고 borderFillIDRef 도 1-based 참조이므로, 등록도 1-based 로 맞춘다.
+        // 종전 `idx`(0-based) 등록이라 마지막 id(예: exam_social 31)가 등록 범위
+        // (0~30) 밖으로 빠져 SERIALIZE_FAIL(미등록 borderFillIDRef)을 유발했다.
+        // 인라인 등록(표/셀, 아래)은 IR 값(1-based) 그대로라 본래 정합 — 이로써 통일.
         for (idx, _) in doc.doc_info.border_fills.iter().enumerate() {
-            ctx.border_fill_ids.register(idx as u16);
+            ctx.border_fill_ids.register((idx + 1) as u16);
         }
         for (idx, _) in doc.doc_info.tab_defs.iter().enumerate() {
             ctx.tab_pr_ids.register(idx as u16);
@@ -258,6 +263,24 @@ mod tests {
         let doc = Document::default();
         let ctx = SerializeContext::collect_from_document(&doc);
         ctx.assert_all_refs_resolved().expect("empty doc must pass");
+    }
+
+    #[test]
+    fn task1384_border_fill_registered_one_based() {
+        // borderFill 은 1-based(방출 id=idx+1, borderFillIDRef 1-based)이므로
+        // N 개 적재 시 마지막 참조 N 이 resolved 되어야 한다 (#1384 — 종전 0-based
+        // 등록이라 N 이 미등록으로 SERIALIZE_FAIL 했다).
+        use crate::model::style::BorderFill;
+        let mut doc = Document::default();
+        doc.doc_info.border_fills = vec![BorderFill::default(); 31];
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        // exam_social 패턴: charPr 가 borderFillIDRef=31(마지막) 참조.
+        ctx.border_fill_ids.reference(31);
+        ctx.assert_all_refs_resolved()
+            .expect("1-based 등록이면 borderFillIDRef=31 resolved");
+        // 0 은 1-based 축에 없음(미등록) — 회귀 가드 의미 명시.
+        assert!(!ctx.border_fill_ids.is_registered(&0));
+        assert!(ctx.border_fill_ids.is_registered(&31));
     }
 
     #[test]
