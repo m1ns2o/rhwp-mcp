@@ -303,6 +303,12 @@ fn para_has_visible_text(para: &Paragraph) -> bool {
     para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
 }
 
+fn para_has_non_whitespace_text(para: &Paragraph) -> bool {
+    para.text
+        .chars()
+        .any(|c| c > '\u{001F}' && c != '\u{FFFC}' && !c.is_whitespace())
+}
+
 fn para_is_empty_topbottom_table_anchor(para: &Paragraph) -> bool {
     !para_has_visible_text(para)
         && para
@@ -10060,11 +10066,17 @@ impl TypesetEngine {
                 matches!(item, PageItem::PartialParagraph { para_index, start_line, .. }
                 if *para_index == para_idx && *start_line == 0)
             });
-        let should_add_post_text = is_last_table
-            && tac_table_count <= 1
+        let has_substantive_text = para_has_non_whitespace_text(para);
+        let whitespace_only_single_tac_host_line = !has_substantive_text
             && !para.text.is_empty()
+            && table.common.treat_as_char
+            && pre_table_end_line == 0
+            && total_lines <= 1;
+        let has_post_text = !para.text.is_empty()
             && total_lines > post_table_start
-            && !pre_text_exists;
+            && !whitespace_only_single_tac_host_line;
+        let should_add_post_text =
+            is_last_table && tac_table_count <= 1 && has_post_text && !pre_text_exists;
         if should_add_post_text {
             let post_height: f64 = fmt.line_advances_sum(post_table_start..total_lines);
             if self.tac_table_line_index(para, table, fmt) == Some(0)
@@ -10084,7 +10096,6 @@ impl TypesetEngine {
         // TAC 표: trailing line_spacing 복원 (Paginator place_table_fits:777-783 동일)
         // has_post_text는 tac_table_count와 무관하게 텍스트 줄 존재 여부만 확인
         let is_tac = self.is_effective_tac_table(para, table, fmt);
-        let has_post_text = !para.text.is_empty() && total_lines > post_table_start;
         if is_tac && fmt.total_height > fmt.height_for_fit && !has_post_text {
             st.current_height += fmt.total_height - fmt.height_for_fit;
         }
