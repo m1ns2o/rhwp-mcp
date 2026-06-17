@@ -1005,9 +1005,30 @@ impl LayoutEngine {
                                     };
                                     let pic_w = hwpunit_to_px(pic.common.width as i32, self.dpi);
                                     let pic_h = hwpunit_to_px(pic.common.height as i32, self.dpi);
+                                    let unrestricted_take_place_cell_float =
+                                        !pic.common.flow_with_text
+                                            && matches!(
+                                                pic.common.text_wrap,
+                                                crate::model::shape::TextWrap::TopAndBottom
+                                            )
+                                            && matches!(
+                                                pic.common.vert_rel_to,
+                                                crate::model::shape::VertRelTo::Para
+                                            );
+                                    let picture_anchor_y = if unrestricted_take_place_cell_float {
+                                        anchor_y
+                                            - pic_h
+                                            - hwpunit_to_px(
+                                                pic.common.vertical_offset as i32,
+                                                self.dpi,
+                                            )
+                                    } else {
+                                        anchor_y
+                                    };
                                     let cell_area = LayoutRect {
-                                        y: anchor_y,
-                                        height: (inner_area.height - (anchor_y - inner_area.y))
+                                        y: picture_anchor_y,
+                                        height: (inner_area.height
+                                            - (picture_anchor_y - inner_area.y))
                                             .max(0.0),
                                         ..inner_area
                                     };
@@ -1019,7 +1040,7 @@ impl LayoutEngine {
                                         &inner_area,
                                         &inner_area,
                                         &inner_area,
-                                        anchor_y,
+                                        picture_anchor_y,
                                         para_alignment,
                                     );
                                     let pic_area = LayoutRect {
@@ -1036,18 +1057,33 @@ impl LayoutEngine {
                                     pic_for_layout.common.vert_align =
                                         crate::model::shape::VertAlign::Top;
                                     // [Task #1151 v4] 셀 안 non-inline picture (partial 표 path).
-                                    self.layout_picture(
-                                        tree,
-                                        &mut cell_node,
-                                        &pic_for_layout,
-                                        &pic_area,
-                                        bin_data_content,
-                                        Alignment::Left,
-                                        Some(section_index),
-                                        Some(cell_context.parent_para_index),
-                                        Some(ctrl_idx),
-                                        Some(&cell_context),
-                                    );
+                                    if unrestricted_take_place_cell_float {
+                                        self.layout_picture(
+                                            tree,
+                                            &mut table_node,
+                                            &pic_for_layout,
+                                            &pic_area,
+                                            bin_data_content,
+                                            Alignment::Left,
+                                            Some(section_index),
+                                            Some(cell_context.parent_para_index),
+                                            Some(ctrl_idx),
+                                            Some(&cell_context),
+                                        );
+                                    } else {
+                                        self.layout_picture(
+                                            tree,
+                                            &mut cell_node,
+                                            &pic_for_layout,
+                                            &pic_area,
+                                            bin_data_content,
+                                            Alignment::Left,
+                                            Some(section_index),
+                                            Some(cell_context.parent_para_index),
+                                            Some(ctrl_idx),
+                                            Some(&cell_context),
+                                        );
+                                    }
                                     para_y += self.non_inline_control_flow_height(&pic.common);
                                 }
                                 has_preceding_text = true;

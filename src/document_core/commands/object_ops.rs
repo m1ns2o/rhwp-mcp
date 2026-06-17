@@ -916,6 +916,33 @@ impl DocumentCore {
             .saturating_add(padding_bottom.max(0) as u32)
     }
 
+    fn take_place_picture_flow_offset(pic: &crate::model::image::Picture) -> Option<u32> {
+        if pic.common.treat_as_char
+            || !matches!(
+                pic.common.text_wrap,
+                crate::model::shape::TextWrap::TopAndBottom
+            )
+            || !matches!(pic.common.vert_rel_to, crate::model::shape::VertRelTo::Para)
+        {
+            return None;
+        }
+
+        let visual_height = if pic.shape_attr.rotation_angle.rem_euclid(360) != 0
+            && pic.shape_attr.current_width > 0
+            && pic.shape_attr.current_height > 0
+        {
+            pic.common.height
+        } else {
+            let (_, height) = Self::picture_rotated_bounds(
+                pic.common.width,
+                pic.common.height,
+                pic.shape_attr.rotation_angle,
+            );
+            height
+        };
+        Some((pic.common.vertical_offset as i32).max(0) as u32 + visual_height)
+    }
+
     fn sync_direct_owner_cell_for_picture(
         section: &mut crate::model::document::Section,
         parent_para_idx: usize,
@@ -930,10 +957,17 @@ impl DocumentCore {
         let para = section.paragraphs.get_mut(parent_para_idx).ok_or_else(|| {
             HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", parent_para_idx))
         })?;
+        let existing_line_height = para
+            .line_segs
+            .first()
+            .map(|seg| seg.line_height)
+            .unwrap_or(0);
         let table = match para.controls.get_mut(table_ctrl_idx) {
             Some(Control::Table(table)) => table,
             _ => return Ok(()),
         };
+        let line_height_extra = (existing_line_height - table.common.height as i32).max(0);
+        let mut line_seg_update: Option<(i32, i32)> = None;
 
         let required_height = {
             let cell = table.cells.get(cell_idx).ok_or_else(|| {
@@ -946,16 +980,100 @@ impl DocumentCore {
                 Some(Control::Picture(pic)) => pic,
                 _ => return Ok(()),
             };
-            Self::required_cell_height_for_picture(cell, pic)
+            let take_place_flow_offset = Self::take_place_picture_flow_offset(pic);
+            if table.common.treat_as_char {
+                if let Some(flow_offset) = take_place_flow_offset {
+                    let vertical_pos = if pic.common.flow_with_text {
+                        0
+                    } else {
+                        flow_offset.min(i32::MAX as u32) as i32
+                    };
+                    line_seg_update = Some((vertical_pos, line_height_extra));
+                }
+            }
+            if pic.common.flow_with_text {
+                Some(Self::required_cell_height_for_picture(cell, pic))
+            } else {
+                None
+            }
         };
 
-        if let Some(cell) = table.cells.get_mut(cell_idx) {
+        if let (Some(required_height), Some(cell)) =
+            (required_height, table.cells.get_mut(cell_idx))
+        {
             let synced_height = required_height.max(MIN_SHAPE_SIZE);
             if cell.height != synced_height {
                 cell.height = synced_height;
-                table.update_ctrl_dimensions();
-                table.dirty = true;
             }
+        }
+        table.update_ctrl_dimensions();
+        table.dirty = true;
+        let new_table_height = table.common.height as i32;
+        if let Some((vertical_pos, line_height_extra)) = line_seg_update {
+            if let Some(seg) = para.line_segs.first_mut() {
+                let line_height = new_table_height
+                    .saturating_add(line_height_extra)
+                    .max(MIN_SHAPE_SIZE as i32);
+                seg.vertical_pos = vertical_pos;
+                seg.line_height = line_height;
+                seg.text_height = line_height;
+                seg.baseline_distance =
+                    ((line_height as i64 * 17 + 10) / 20).min(i32::MAX as i64) as i32;
+            }
+        }
+        Ok(())
+    }
+
+    fn clamp_direct_owner_cell_picture_offsets(
+        section: &mut crate::model::document::Section,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        inner_control_idx: usize,
+        clamp_horz: bool,
+        clamp_vert: bool,
+    ) -> Result<(), HwpError> {
+        if path.len() != 1 || (!clamp_horz && !clamp_vert) {
+            return Ok(());
+        }
+
+        let (table_ctrl_idx, cell_idx, cell_para_idx) = path[0];
+        let para = section.paragraphs.get_mut(parent_para_idx).ok_or_else(|| {
+            HwpError::RenderError(format!("문단 인덱스 {} 범위 초과", parent_para_idx))
+        })?;
+        let table = match para.controls.get_mut(table_ctrl_idx) {
+            Some(Control::Table(table)) => table,
+            _ => return Ok(()),
+        };
+        let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+            HwpError::RenderError(format!("경로[0]: cells[{}] 범위 초과", cell_idx))
+        })?;
+
+        let inner_width = cell
+            .width
+            .saturating_sub(cell.padding.left.max(0) as u32)
+            .saturating_sub(cell.padding.right.max(0) as u32) as i64;
+        let cell_para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+            HwpError::RenderError(format!("경로[0]: paragraphs[{}] 범위 초과", cell_para_idx))
+        })?;
+        let pic = match cell_para.controls.get_mut(inner_control_idx) {
+            Some(Control::Picture(pic)) => pic,
+            _ => return Ok(()),
+        };
+
+        if !pic.common.flow_with_text {
+            return Ok(());
+        }
+
+        if clamp_horz {
+            let max_horz = (inner_width - pic.common.width as i64)
+                .max(0)
+                .min(i32::MAX as i64);
+            let horz = (pic.common.horizontal_offset as i32).clamp(0, max_horz as i32);
+            pic.common.horizontal_offset = horz as u32;
+        }
+        if clamp_vert {
+            let vert = (pic.common.vertical_offset as i32).max(0);
+            pic.common.vertical_offset = vert as u32;
         }
         Ok(())
     }
@@ -3597,7 +3715,15 @@ impl DocumentCore {
         inner_control_idx: usize,
         props_json: &str,
     ) -> Result<String, HwpError> {
+        use super::super::helpers::{json_bool, json_u32};
+
         let path = Self::parse_cell_path_json(cell_path_json)?;
+        let restrict_change = json_bool(props_json, "restrictInPage");
+        let restrict_enabled_by_this_call = restrict_change.unwrap_or(false);
+        let clamp_horz =
+            restrict_enabled_by_this_call || json_u32(props_json, "horzOffset").is_some();
+        let clamp_vert =
+            restrict_enabled_by_this_call || json_u32(props_json, "vertOffset").is_some();
         {
             let section = self.document.sections.get_mut(section_idx).ok_or_else(|| {
                 HwpError::RenderError(format!("구역 인덱스 {} 범위 초과", section_idx))
@@ -3620,6 +3746,14 @@ impl DocumentCore {
             Self::apply_picture_props_inner(pic, props_json);
         }
         let section = &mut self.document.sections[section_idx];
+        Self::clamp_direct_owner_cell_picture_offsets(
+            section,
+            parent_para_idx,
+            &path,
+            inner_control_idx,
+            clamp_horz,
+            clamp_vert,
+        )?;
         Self::sync_direct_owner_cell_for_picture(
             section,
             parent_para_idx,

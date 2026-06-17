@@ -76,6 +76,14 @@ fn required_cell_height_for_picture(cell: &Cell, pic: &Picture) -> u32 {
         .saturating_add(cell.padding.bottom as u32)
 }
 
+fn max_horz_offset_inside_cell(cell: &Cell, pic: &Picture) -> u32 {
+    let inner_width = cell
+        .width
+        .saturating_sub(cell.padding.left.max(0) as u32)
+        .saturating_sub(cell.padding.right.max(0) as u32);
+    inner_width.saturating_sub(pic.common.width)
+}
+
 #[test]
 fn issue_1282_page_area_limit_samples_drive_table_height_only_when_enabled() {
     let restricted = parse_document(&read_fixture("samples/ta-pic-001-r-쪽영역안제한.hwp"))
@@ -108,6 +116,146 @@ fn issue_1282_page_area_limit_samples_drive_table_height_only_when_enabled() {
         "쪽 영역 제한 off는 문단 기준 그림으로 행 높이를 확장하지 않아야 함: row={:.1}, saved={:.1}",
         unrestricted_rows[1],
         unrestricted_saved_row
+    );
+}
+
+#[test]
+fn issue_1282_restrict_in_page_clamps_cell_picture_move_offsets() {
+    let bytes = read_fixture("samples/ta-pic-001-r-쪽영역안제한.hwp");
+    let mut core = DocumentCore::from_bytes(&bytes).expect("load restricted sample");
+    let negative = (-5000i32) as u32;
+
+    core.set_cell_picture_properties_by_path_native(
+        0,
+        0,
+        r#"[{"controlIdx":2,"cellIdx":2,"cellParaIdx":0}]"#,
+        0,
+        &format!(r#"{{"horzOffset":{},"vertOffset":{}}}"#, negative, negative),
+    )
+    .expect("move restricted picture outside cell start");
+
+    let doc = core.document();
+    let cell = target_cell(doc);
+    let pic = target_picture(doc);
+    assert!(pic.common.flow_with_text);
+    assert_eq!(
+        pic.common.horizontal_offset as i32, 0,
+        "쪽 영역 제한 on 셀 그림은 셀 왼쪽 밖으로 이동하면 안 됨"
+    );
+    assert_eq!(
+        pic.common.vertical_offset as i32, 0,
+        "쪽 영역 제한 on 셀 그림은 셀 위쪽 밖으로 이동하면 안 됨"
+    );
+
+    let too_far_right = cell.width.saturating_mul(2);
+    core.set_cell_picture_properties_by_path_native(
+        0,
+        0,
+        r#"[{"controlIdx":2,"cellIdx":2,"cellParaIdx":0}]"#,
+        0,
+        &format!(r#"{{"horzOffset":{}}}"#, too_far_right),
+    )
+    .expect("move restricted picture outside cell end");
+
+    let doc = core.document();
+    let cell = target_cell(doc);
+    let pic = target_picture(doc);
+    assert_eq!(
+        pic.common.horizontal_offset,
+        max_horz_offset_inside_cell(cell, pic),
+        "쪽 영역 제한 on 셀 그림은 셀 오른쪽 밖으로 이동하면 안 됨"
+    );
+}
+
+#[test]
+fn issue_1282_turning_off_restrict_in_page_releases_picture_from_cell_flow() {
+    let bytes = read_fixture("samples/ta-pic-001-r-쪽영역안제한.hwp");
+    let mut core = DocumentCore::from_bytes(&bytes).expect("load restricted sample");
+    let before_cell_height = target_cell(core.document()).height;
+    let before_table_height = target_table(core.document()).common.height;
+    let no_sample = parse_document(&read_fixture("samples/ta-pic-001-r-쪽영역안제한no.hwp"))
+        .expect("parse unrestricted oracle sample");
+
+    core.set_cell_picture_properties_by_path_native(
+        0,
+        0,
+        r#"[{"controlIdx":2,"cellIdx":2,"cellParaIdx":0}]"#,
+        0,
+        r#"{"restrictInPage":false}"#,
+    )
+    .expect("turn off restrictInPage");
+
+    let doc = core.document();
+    let table = target_table(doc);
+    let cell = target_cell(doc);
+    let pic = target_picture(doc);
+    let outer_line_seg = doc.sections[0].paragraphs[0]
+        .line_segs
+        .first()
+        .expect("outer paragraph line seg");
+    let no_table = target_table(&no_sample);
+    let no_cell = target_cell(&no_sample);
+    let no_line_seg = no_sample.sections[0].paragraphs[0]
+        .line_segs
+        .first()
+        .expect("oracle outer paragraph line seg");
+
+    assert!(
+        !pic.common.flow_with_text,
+        "쪽 영역 제한 off 토글은 flow_with_text를 꺼야 함"
+    );
+    assert_eq!(
+        cell.height, before_cell_height,
+        "쪽 영역 제한 off 토글은 저장 샘플처럼 소유 셀 높이를 직접 줄이지 않아야 함"
+    );
+    assert_eq!(
+        cell.height, no_cell.height,
+        "쪽 영역 제한 off 토글 후 소유 셀 높이는 no 샘플과 같아야 함"
+    );
+    assert!(
+        table.common.height < before_table_height,
+        "쪽 영역 제한 off 토글 후 표 높이도 줄어야 함: before={}, after={}",
+        before_table_height,
+        table.common.height
+    );
+    assert_eq!(
+        table.common.height, no_table.common.height,
+        "쪽 영역 제한 off 토글 후 표 높이는 no 샘플과 같아야 함"
+    );
+    assert_eq!(
+        outer_line_seg.vertical_pos, no_line_seg.vertical_pos,
+        "쪽 영역 제한 off 토글 후 표 문단 vertical_pos는 no 샘플과 같아야 함"
+    );
+    assert_eq!(
+        outer_line_seg.line_height, no_line_seg.line_height,
+        "쪽 영역 제한 off 토글 후 표 문단 line_height는 no 샘플과 같아야 함"
+    );
+}
+
+#[test]
+fn issue_1282_unrestricted_cell_picture_move_offsets_are_not_clamped() {
+    let bytes = read_fixture("samples/ta-pic-001-r-쪽영역안제한no.hwp");
+    let mut core = DocumentCore::from_bytes(&bytes).expect("load unrestricted sample");
+    let negative = (-5000i32) as u32;
+
+    core.set_cell_picture_properties_by_path_native(
+        0,
+        0,
+        r#"[{"controlIdx":2,"cellIdx":2,"cellParaIdx":0}]"#,
+        0,
+        &format!(r#"{{"horzOffset":{},"vertOffset":{}}}"#, negative, negative),
+    )
+    .expect("move unrestricted picture outside cell start");
+
+    let pic = target_picture(core.document());
+    assert!(!pic.common.flow_with_text);
+    assert_eq!(
+        pic.common.horizontal_offset as i32, -5000,
+        "쪽 영역 제한 off 셀 그림은 기존 자유 이동 의미를 유지해야 함"
+    );
+    assert_eq!(
+        pic.common.vertical_offset as i32, -5000,
+        "쪽 영역 제한 off 셀 그림은 기존 자유 이동 의미를 유지해야 함"
     );
 }
 

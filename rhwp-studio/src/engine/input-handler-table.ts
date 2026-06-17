@@ -439,7 +439,7 @@ export function moveSelectedPicture(this: any, key: 'ArrowUp' | 'ArrowDown' | 'A
       });
       const CmdClass = r.type === 'shape' || r.type === 'line' || r.type === 'group' ? MoveShapeCommand : MovePictureCommand;
       this.executeOperation({ kind: 'record', command:
-        new CmdClass(r.sec, r.ppi, r.ci, deltaH, deltaV, props.horzOffset, props.vertOffset),
+        new CmdClass(r.sec, r.ppi, r.ci, deltaH, deltaV, props.horzOffset, props.vertOffset, r.cellPath),
       });
     }
     // 연결선 자동 추적

@@ -492,12 +492,11 @@ export class PicturePropsDialog {
     const hPosRow = this.row();
     hPosRow.classList.add('pp-pos-detail');
     hPosRow.appendChild(this.label('가로(I):'));
-    // [Task #1151 v8 결함 B] Para 옵션 추가. horz_rel_to 의 valid 값은
-    // Paper/Page/Column/Para 4 개 (스펙 pack_common_attr_bits 의 horz_rel_to_to_bits).
-    // 이전: ['Paper', '종이'], ['Page', '쪽'], ['Column', '단'] 만 → picture.common.horz_rel_to
-    // = Para 시 select 매칭 실패 → "select 없음" 표시. 사용자 한컴 native 시연 시
-    // 글자처럼 해제 후 가로 기준이 "문단" 으로 표시되어야 정합 (한컴 동작).
+    // [Task #1282] 한컴은 자리차지(TopAndBottom) 그림의 가로 기준 칸에
+    // 실제 HorzRelTo 대신 "자리 차지"를 표시한다. 저장값은 textWrap 이므로
+    // OK 시에는 HorzRelTo 로 넘기지 않는다.
     this.horzRelSelect = this.selectEl([
+      ['TakePlace', '자리 차지'],
       ['Paper', '종이'], ['Page', '쪽'], ['Column', '단'], ['Para', '문단'],
     ]);
     hPosRow.appendChild(this.horzRelSelect);
@@ -1901,10 +1900,11 @@ export class PicturePropsDialog {
     if (tac !== this.props.treatAsChar) updated['treatAsChar'] = tac;
 
     if (!tac) {
-      const tw = this.getSelectedWrap();
-      if (tw !== this.props.textWrap) updated['textWrap'] = tw;
+      let tw = this.getSelectedWrap();
       const hr = this.horzRelSelect.value;
-      if (hr !== this.props.horzRelTo) updated['horzRelTo'] = hr;
+      if (hr === 'TakePlace') tw = 'TopAndBottom';
+      if (tw !== this.props.textWrap) updated['textWrap'] = tw;
+      if (hr !== 'TakePlace' && hr !== this.props.horzRelTo) updated['horzRelTo'] = hr;
       const ha = this.horzAlignSelect.value;
       if (ha !== this.props.horzAlign) updated['horzAlign'] = ha;
       const ho = mmToHwp(parseFloat(this.horzOffsetInput.value) || 0);
@@ -2226,7 +2226,9 @@ export class PicturePropsDialog {
     this.heightInput.value = hwpToMm(this.props.height).toFixed(2);
     this.treatAsCharCheck.checked = this.props.treatAsChar;
     this.selectWrap(this.wrapValues.indexOf(this.props.textWrap));
-    this.horzRelSelect.value = this.props.horzRelTo;
+    this.horzRelSelect.value = this.props.textWrap === 'TopAndBottom'
+      ? 'TakePlace'
+      : this.props.horzRelTo;
     this.horzAlignSelect.value = this.props.horzAlign;
     this.horzOffsetInput.value = hwpToMm(this.props.horzOffset).toFixed(2);
     this.vertRelSelect.value = this.props.vertRelTo;
@@ -2475,6 +2477,12 @@ export class PicturePropsDialog {
 
   private selectWrap(idx: number): void {
     this.wrapBtns.forEach((b, i) => b.classList.toggle('active', i === idx));
+    if (!this.horzRelSelect) return;
+    if (this.wrapValues[idx] === 'TopAndBottom') {
+      this.horzRelSelect.value = 'TakePlace';
+    } else if (this.horzRelSelect.value === 'TakePlace') {
+      this.horzRelSelect.value = this.props?.horzRelTo ?? 'Column';
+    }
   }
 
   private getSelectedWrap(): string {

@@ -8,7 +8,7 @@
  */
 import { runTest, loadHwpFile, assert } from './helpers.mjs';
 
-runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async ({ page }) => {
+await runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async ({ page }) => {
   await loadHwpFile(page, 'ta-pic-001-r.hwp');
 
   const result = await page.evaluate(async () => {
@@ -270,6 +270,7 @@ runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async
       vertOffset: mmToHwp(36.82),
       horzOffset: 0,
       rotationAngle: 0,
+      textWrap: 'TopAndBottom',
     };
     wasm.setCellPicturePropertiesByPath(0, 0, cellPath, 0, hancomExpected);
     window.__canvasView?.loadDocument?.();
@@ -279,6 +280,46 @@ runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async
     const hancomBbox = getBbox();
     const hancomCellBbox = getOwnerCellBbox();
     const hancomRightLeak = sampleRenderedRightLeak(hancomCellBbox, hancomBbox);
+    const negativeMove = (-mmToHwp(20)) >>> 0;
+    const clampMaxHorz = Math.max(
+      0,
+      hancomCell.width - hancomCell.paddingLeft - hancomCell.paddingRight - hancomProps.width,
+    );
+
+    wasm.setCellPicturePropertiesByPath(0, 0, cellPath, 0, {
+      horzOffset: negativeMove,
+      vertOffset: negativeMove,
+    });
+    window.__canvasView?.loadDocument?.();
+    await nextFrame();
+    const clampStartProps = getProps();
+
+    wasm.setCellPicturePropertiesByPath(0, 0, cellPath, 0, {
+      horzOffset: hancomCell.width * 2,
+    });
+    window.__canvasView?.loadDocument?.();
+    await nextFrame();
+    const clampEndProps = getProps();
+
+    select();
+    if (typeof ih.moveSelectedPicture !== 'function') {
+      return { error: 'InputHandler.moveSelectedPicture 함수를 찾지 못함' };
+    }
+    ih.moveSelectedPicture('ArrowLeft');
+    window.__canvasView?.loadDocument?.();
+    await nextFrame();
+    const keyboardClampProps = getProps();
+
+    wasm.setCellPicturePropertiesByPath(0, 0, cellPath, 0, {
+      ...hancomExpected,
+      restrictInPage: false,
+    });
+    window.__canvasView?.loadDocument?.();
+    await nextFrame();
+    const unrestrictedToggleProps = getProps();
+    const unrestrictedToggleCell = getCellProps();
+    const unrestrictedToggleBbox = getBbox();
+    const unrestrictedToggleCellBbox = getOwnerCellBbox();
 
     return {
       stateCellPath: drag.stateCellPath,
@@ -290,6 +331,14 @@ runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async
       shrinkProps,
       hancomExpected,
       hancomProps,
+      clampStartProps,
+      clampEndProps,
+      keyboardClampProps,
+      clampMaxHorz,
+      unrestrictedToggleProps,
+      unrestrictedToggleCell,
+      unrestrictedToggleBbox,
+      unrestrictedToggleCellBbox,
       beforeCell,
       afterCell,
       undoCell,
@@ -410,6 +459,99 @@ runTest('회전 표 셀 picture 리사이즈 드래그 안정성 (#1282)', async
     `한컴 비교 상태 렌더 픽셀 샘플 실패: ${JSON.stringify(result.hancomRightLeak)}`);
   assert(result.hancomRightLeak.nonWhiteRatio < 0.002 && result.hancomRightLeak.dark <= 2,
     `한컴 비교 상태에서 오른쪽 셀로 렌더 픽셀이 침범: ${JSON.stringify(result.hancomRightLeak)}`);
+  assert(result.clampStartProps && result.clampStartProps.horzOffset === 0,
+    `쪽 영역 제한 on 그림의 왼쪽 이동 클램프 실패: ${JSON.stringify(result.clampStartProps)}`);
+  assert(result.clampStartProps && result.clampStartProps.vertOffset === 0,
+    `쪽 영역 제한 on 그림의 위쪽 이동 클램프 실패: ${JSON.stringify(result.clampStartProps)}`);
+  assert(result.clampEndProps && result.clampEndProps.horzOffset === result.clampMaxHorz,
+    `쪽 영역 제한 on 그림의 오른쪽 이동 클램프 실패: max=${result.clampMaxHorz}, props=${JSON.stringify(result.clampEndProps)}`);
+  assert(result.keyboardClampProps && result.keyboardClampProps.horzOffset === result.clampMaxHorz,
+    `쪽 영역 제한 on 그림의 방향키 이동 클램프 실패: max=${result.clampMaxHorz}, props=${JSON.stringify(result.keyboardClampProps)}`);
+  assert(result.unrestrictedToggleProps && result.unrestrictedToggleProps.restrictInPage === false,
+    `쪽 영역 제한 off 토글 반영 실패: ${JSON.stringify(result.unrestrictedToggleProps)}`);
+  assert(result.unrestrictedToggleCell && result.unrestrictedToggleCell.height < result.hancomCell.height,
+    `쪽 영역 제한 off 토글 후 셀 높이 감소 실패: before=${result.hancomCell?.height}, after=${result.unrestrictedToggleCell?.height}`);
+  assert(result.unrestrictedToggleBbox && result.unrestrictedToggleCellBbox
+    && result.unrestrictedToggleBbox.y < result.unrestrictedToggleCellBbox.y,
+    `쪽 영역 제한 off 토글 후 그림이 표 셀 흐름에서 분리되지 않음: picture=${JSON.stringify(result.unrestrictedToggleBbox)}, cell=${JSON.stringify(result.unrestrictedToggleCellBbox)}`);
+  assert(result.unrestrictedToggleBbox && result.unrestrictedToggleCellBbox
+    && result.unrestrictedToggleBbox.y + result.unrestrictedToggleBbox.h <= result.unrestrictedToggleCellBbox.y + 18,
+    `쪽 영역 제한 off 토글 후 그림이 소유 셀 내부에 남아 있음: picture=${JSON.stringify(result.unrestrictedToggleBbox)}, cell=${JSON.stringify(result.unrestrictedToggleCellBbox)}`);
 
   console.log('✅ #1282 회전 표 셀 picture: 드래그 리사이즈/셀폭 유지/렌더 클립 안정성 통과');
+});
+
+await runTest('쪽 영역 제한 off 전환은 no 샘플 렌더와 일치 (#1282)', async ({ page }) => {
+  const nextFrame = () => page.evaluate(
+    () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
+  );
+  const captureTarget = async () => page.evaluate(() => {
+    const wasm = window.__wasm;
+    let target = null;
+    for (let pageIndex = 0; pageIndex < wasm.pageCount; pageIndex += 1) {
+      const layout = wasm.getPageControlLayout(pageIndex);
+      for (const ctrl of layout.controls || []) {
+        const first = Array.isArray(ctrl.cellPath) ? ctrl.cellPath[0] : null;
+        if (
+          ctrl.type === 'image'
+          && first
+          && (first.controlIndex ?? first.controlIdx) === 2
+          && (first.cellIndex ?? first.cellIdx) === 2
+          && (first.cellParaIndex ?? first.cellParaIdx) === 0
+        ) {
+          target = { pageIndex, ctrl };
+          break;
+        }
+      }
+      if (target) break;
+    }
+    if (!target) return { error: 'target picture not found' };
+    const layout = wasm.getPageControlLayout(target.pageIndex);
+    const table = layout.controls.find((ctrl) => ctrl.type === 'table');
+    const cells = wasm.getTableCellBboxes(0, 0, 2, target.pageIndex);
+    const ownerCell = (cells || []).find((cell) => cell.cellIdx === target.ctrl.cellIdx) ?? null;
+    return {
+      pageIndex: target.pageIndex,
+      picture: target.ctrl,
+      table,
+      ownerCell,
+      props: wasm.getCellPicturePropertiesByPath(0, 0, target.ctrl.cellPath, 0),
+      cell: wasm.getCellProperties(0, 0, 2, 2),
+    };
+  });
+  const nearlySame = (a, b, tolerance = 0.25) => Math.abs(a - b) <= tolerance;
+
+  await loadHwpFile(page, 'ta-pic-001-r-쪽영역안제한.hwp');
+  await page.evaluate(() => {
+    const wasm = window.__wasm;
+    const layout = wasm.getPageControlLayout(0);
+    const target = layout.controls.find((ctrl) => (
+      ctrl.type === 'image'
+      && ctrl.cellPath?.[0]?.controlIndex === 2
+      && ctrl.cellPath?.[0]?.cellIndex === 2
+    ));
+    if (!target) throw new Error('target picture not found');
+    wasm.setCellPicturePropertiesByPath(0, 0, target.cellPath, 0, { restrictInPage: false });
+    window.__canvasView?.loadDocument?.();
+  });
+  await nextFrame();
+  const toggled = await captureTarget();
+
+  await loadHwpFile(page, 'ta-pic-001-r-쪽영역안제한no.hwp');
+  const oracle = await captureTarget();
+
+  assert(!toggled.error && !oracle.error,
+    `쪽 영역 제한 off 비교 대상 조회 실패: toggled=${JSON.stringify(toggled)}, oracle=${JSON.stringify(oracle)}`);
+  assert(toggled.props.restrictInPage === false,
+    `쪽 영역 제한 off 토글 반영 실패: ${JSON.stringify(toggled.props)}`);
+  assert(toggled.cell.height === oracle.cell.height,
+    `쪽 영역 제한 off 토글 후 셀 높이가 no 샘플과 다름: toggled=${toggled.cell.height}, oracle=${oracle.cell.height}`);
+  assert(nearlySame(toggled.picture.y, oracle.picture.y)
+    && nearlySame(toggled.picture.h, oracle.picture.h)
+    && nearlySame(toggled.table.y, oracle.table.y)
+    && nearlySame(toggled.table.h, oracle.table.h)
+    && nearlySame(toggled.ownerCell.y, oracle.ownerCell.y),
+    `쪽 영역 제한 off 토글 렌더가 no 샘플과 다름: toggled=${JSON.stringify(toggled)}, oracle=${JSON.stringify(oracle)}`);
+
+  console.log('✅ #1282 쪽 영역 제한 off 전환: 저장 no 샘플 렌더와 일치');
 });

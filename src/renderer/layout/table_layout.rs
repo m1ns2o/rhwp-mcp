@@ -2348,13 +2348,27 @@ impl LayoutEngine {
                                     } else {
                                         para_y
                                     };
-                                    let detached_from_inline_table_flow = inline_table_flow_y_shift
-                                        > 0.0
-                                        && !pic.common.flow_with_text
+                                    let unrestricted_take_place_cell_float = !pic
+                                        .common
+                                        .flow_with_text
                                         && matches!(pic.common.text_wrap, TextWrap::TopAndBottom)
                                         && matches!(pic.common.vert_rel_to, VertRelTo::Para);
+                                    let detached_from_inline_table_flow = inline_table_flow_y_shift
+                                        > 0.0
+                                        && unrestricted_take_place_cell_float;
                                     let picture_anchor_y = if detached_from_inline_table_flow {
                                         anchor_y - inline_table_flow_y_shift - row_y[r].max(0.0)
+                                    } else if unrestricted_take_place_cell_float {
+                                        // 한컴의 셀 내부 자리차지 그림은 제한이 꺼지면
+                                        // offset 지점에 그림 하단이 걸리도록 위로 빠진다.
+                                        // compute_object_position 이 아래에서 vOffset 을
+                                        // 다시 더하므로 여기서는 미리 vOffset+높이를 뺀다.
+                                        anchor_y
+                                            - pic_h
+                                            - hwpunit_to_px(
+                                                pic.common.vertical_offset as i32,
+                                                self.dpi,
+                                            )
                                     } else {
                                         anchor_y
                                     };
@@ -2392,7 +2406,9 @@ impl LayoutEngine {
                                     // [Task #1151 v4] 셀 안 non-inline picture (tac=false 자리차지 등):
                                     // outer paragraph idx + inner picture ctrl idx +
                                     // cell_ctx 전달.
-                                    if detached_from_inline_table_flow {
+                                    if detached_from_inline_table_flow
+                                        || unrestricted_take_place_cell_float
+                                    {
                                         self.layout_picture(
                                             tree,
                                             table_node,
