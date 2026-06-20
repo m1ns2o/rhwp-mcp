@@ -597,8 +597,9 @@ export class InputHandler {
     edge: BorderEdge,
     pageX: number, pageY: number,
     pageBboxes: CellBbox[],
+    shiftResize = false,
   ): void {
-    _table.startResizeDrag.call(this, edge, pageX, pageY, pageBboxes);
+    _table.startResizeDrag.call(this, edge, pageX, pageY, pageBboxes, shiftResize);
   }
 
   /** 리사이즈 드래그 중 마커 위치를 갱신한다 */

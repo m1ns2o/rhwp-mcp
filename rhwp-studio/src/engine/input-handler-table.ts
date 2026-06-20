@@ -34,10 +34,60 @@ function selectTableObjectFromResize(this: any, tableRef: { sec: number; ppi: nu
   this.textarea.focus();
 }
 
-export function startResizeDrag(this: any, 
+function findSingleCellResizeTarget(
+  edge: BorderEdge,
+  pageX: number,
+  pageY: number,
+  bboxes: CellBbox[],
+  borderOriginalPos: number,
+): { cellIdx: number; side: 'start' | 'end' } | null {
+  const tolerance = 1.0;
+  const rounded = (v: number) => Math.round(v * 10) / 10;
+  const border = rounded(borderOriginalPos);
+  const candidates: Array<{ cellIdx: number; side: 'start' | 'end'; score: number }> = [];
+
+  for (const b of bboxes) {
+    if (edge.type === 'col') {
+      if (pageY < b.y - tolerance || pageY > b.y + b.h + tolerance) continue;
+      const startDistance = Math.abs(rounded(b.x) - border);
+      const endDistance = Math.abs(rounded(b.x + b.w) - border);
+      if (startDistance <= tolerance) {
+        candidates.push({ cellIdx: b.cellIdx, side: 'start', score: Math.abs(pageY - (b.y + b.h / 2)) });
+      }
+      if (endDistance <= tolerance) {
+        candidates.push({ cellIdx: b.cellIdx, side: 'end', score: Math.abs(pageY - (b.y + b.h / 2)) });
+      }
+    } else {
+      if (pageX < b.x - tolerance || pageX > b.x + b.w + tolerance) continue;
+      const startDistance = Math.abs(rounded(b.y) - border);
+      const endDistance = Math.abs(rounded(b.y + b.h) - border);
+      if (startDistance <= tolerance) {
+        candidates.push({ cellIdx: b.cellIdx, side: 'start', score: Math.abs(pageX - (b.x + b.w / 2)) });
+      }
+      if (endDistance <= tolerance) {
+        candidates.push({ cellIdx: b.cellIdx, side: 'end', score: Math.abs(pageX - (b.x + b.w / 2)) });
+      }
+    }
+  }
+
+  if (candidates.length === 0) return null;
+
+  const preferredSide: 'start' | 'end' =
+    (edge.type === 'col' ? pageX : pageY) <= borderOriginalPos ? 'end' : 'start';
+  const preferred = candidates
+    .filter(c => c.side === preferredSide)
+    .sort((a, b) => a.score - b.score)[0];
+  if (preferred) return { cellIdx: preferred.cellIdx, side: preferred.side };
+
+  const fallback = candidates.sort((a, b) => a.score - b.score)[0];
+  return { cellIdx: fallback.cellIdx, side: fallback.side };
+}
+
+export function startResizeDrag(this: any,
   edge: BorderEdge,
   pageX: number, pageY: number,
   pageBboxes: CellBbox[],
+  shiftResize = false,
 ): void {
   if (!this.cachedTableRef || !this.cachedCellBboxes || !this.tableResizeRenderer) return;
 
@@ -71,7 +121,10 @@ export function startResizeDrag(this: any,
     }
   }
 
-  if (affectedCellIndices.length === 0) return;
+  const singleCellTarget = shiftResize
+    ? findSingleCellResizeTarget(edge, pageX, pageY, this.cachedCellBboxes, borderOriginalPos)
+    : null;
+  if (affectedCellIndices.length === 0 && !singleCellTarget) return;
 
   this.isResizeDragging = true;
   this.resizeDragState = {
@@ -81,6 +134,7 @@ export function startResizeDrag(this: any,
     pageBboxes,
     affectedCellIndices,
     borderOriginalPos,
+    singleCellTarget,
   };
 
   // mouseup 리스너 등록 (document 레벨)
@@ -150,7 +204,7 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
     const shouldSelectTable = isOuterResizeEdge(this, state.edge, state.pageBboxes);
     const tableRef = { ...state.tableRef };
     this.cleanupResizeDrag();
-    if (shouldSelectTable) {
+    if (shouldSelectTable && !state.singleCellTarget) {
       selectTableObjectFromResize.call(this, tableRef);
     }
     return;
@@ -162,7 +216,12 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
   const inCellSel = this.cursor.isInCellSelectionMode();
   const range = inCellSel ? this.cursor.getSelectedCellRange() : null;
 
-  if (inCellSel && range) {
+  if (state.singleCellTarget) {
+    const delta = state.singleCellTarget.side === 'end' ? deltaHwpUnit : -deltaHwpUnit;
+    updates = state.edge.type === 'col'
+      ? [{ cellIdx: state.singleCellTarget.cellIdx, widthDelta: delta }]
+      : [{ cellIdx: state.singleCellTarget.cellIdx, heightDelta: delta }];
+  } else if (inCellSel && range) {
     // 선택 셀만 추출
     const selectedBboxes = state.affectedCellIndices
       .map((cellIdx: any) => state.bboxes.find((b: any) => b.cellIdx === cellIdx))

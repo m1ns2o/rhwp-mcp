@@ -671,7 +671,7 @@ export function onClick(this: any, e: MouseEvent): void {
             const edge = this.tableResizeRenderer.hitTestBorder(pageX, pageY, pageBboxes);
             if (edge) {
               e.preventDefault();
-              this.startResizeDrag(edge, pageX, pageY, pageBboxes);
+              this.startResizeDrag(edge, pageX, pageY, pageBboxes, e.shiftKey);
               this.textarea.focus();
               return;
             }
@@ -728,7 +728,7 @@ export function onClick(this: any, e: MouseEvent): void {
     const edge = this.tableResizeRenderer.hitTestBorder(pageX, pageY, pageBboxes);
     if (edge) {
       e.preventDefault();
-      this.startResizeDrag(edge, pageX, pageY, pageBboxes);
+      this.startResizeDrag(edge, pageX, pageY, pageBboxes, e.shiftKey);
       this.textarea.focus();
       return;
     }
