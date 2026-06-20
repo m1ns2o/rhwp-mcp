@@ -94,6 +94,12 @@ pub(crate) fn build_row_col_x(
     }
 
     let fallback_w = hwpunit_to_px(1800, dpi);
+    let target_total = if table.common.width > 0 {
+        hwpunit_to_px(table.common.width as i32, dpi)
+            + cell_spacing * col_count.saturating_sub(1) as f64
+    } else {
+        base_rx.last().copied().unwrap_or(0.0)
+    };
     let mut row_col_x = vec![vec![0.0f64; col_count + 1]; row_count];
     for r in 0..row_count {
         for c in 0..col_count {
@@ -102,6 +108,12 @@ pub(crate) fn build_row_col_x(
                 .unwrap_or(fallback_w);
             row_col_x[r][c + 1] =
                 row_col_x[r][c] + w + if c + 1 < col_count { cell_spacing } else { 0.0 };
+        }
+        // 저장 파일의 cell.width는 병합 제약을 풀기 전 보조값일 수 있다.
+        // 행별 누적 폭이 표 외곽 폭과 맞지 않으면 독립 segment가 아니라 전역 grid를 따른다.
+        // Stage 12의 로컬 segment 리사이즈는 보상 리사이즈로 행 전체 폭을 유지하므로 이 조건을 통과한다.
+        if (row_col_x[r][col_count] - target_total).abs() > 0.5 {
+            row_col_x[r].clone_from_slice(&base_rx);
         }
     }
     row_col_x

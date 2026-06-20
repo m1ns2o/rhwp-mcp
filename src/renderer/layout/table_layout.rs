@@ -51,6 +51,7 @@ use crate::model::shape::{CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertRel
 fn build_col_row_y_from_cell_heights(
     table: &crate::model::table::Table,
     row_heights: &[f64],
+    row_y: &[f64],
     col_count: usize,
     row_count: usize,
     cell_spacing: f64,
@@ -70,6 +71,12 @@ fn build_col_row_y_from_cell_heights(
     }
 
     let fallback_h = hwpunit_to_px(400, dpi);
+    let target_total = if table.common.height > 0 {
+        hwpunit_to_px(table.common.height as i32, dpi)
+            + cell_spacing * row_count.saturating_sub(1) as f64
+    } else {
+        row_y.last().copied().unwrap_or(0.0)
+    };
     let mut col_row_y = vec![vec![0.0f64; row_count + 1]; col_count];
     for c in 0..col_count {
         for r in 0..row_count {
@@ -78,6 +85,11 @@ fn build_col_row_y_from_cell_heights(
                 .unwrap_or(fallback_h);
             col_row_y[c][r + 1] =
                 col_row_y[c][r] + h + if r + 1 < row_count { cell_spacing } else { 0.0 };
+        }
+        // 저장 파일의 cell.height는 표 전체 높이와 맞지 않는 보조값일 수 있다.
+        // 열별 누적 높이가 표 외곽과 맞을 때만 독립 horizontal segment로 해석한다.
+        if (col_row_y[c][row_count] - target_total).abs() > 0.5 && row_y.len() == row_count + 1 {
+            col_row_y[c].clone_from_slice(row_y);
         }
     }
     col_row_y
@@ -533,6 +545,7 @@ impl LayoutEngine {
             let col_row_y = build_col_row_y_from_cell_heights(
                 table,
                 &row_heights,
+                &row_y,
                 col_count,
                 row_count,
                 cell_spacing,
@@ -1036,12 +1049,39 @@ impl LayoutEngine {
                     }
                 }
             }
+
+            // 병합 셀 제약이 이미 값이 있는 열들로만 구성되어도 총합이 더 클 수 있다.
+            // 한컴은 이 경우 뒤쪽 열을 확장해 병합 셀 폭을 만족시킨다.
+            for &(c, span, total_w) in &constraints {
+                let known_sum: f64 = (c..c + span).map(|i| col_widths[i]).sum();
+                let deficit = total_w - known_sum;
+                if deficit > 0.5 {
+                    let target_col = c + span - 1;
+                    if target_col < col_widths.len() {
+                        col_widths[target_col] += deficit;
+                    }
+                }
+            }
         }
 
         // 3단계: 여전히 폭이 0인 열에 기본값 할당
         for c in 0..col_count {
             if col_widths[c] <= 0.0 {
                 col_widths[c] = hwpunit_to_px(1800, self.dpi);
+            }
+        }
+        let target_width = if table.common.width > 0 {
+            hwpunit_to_px(table.common.width as i32, self.dpi)
+        } else {
+            0.0
+        };
+        if target_width > 0.0 {
+            let current: f64 = col_widths.iter().sum();
+            let residual = target_width - current;
+            if residual > 0.5 {
+                if let Some(last) = col_widths.last_mut() {
+                    *last += residual;
+                }
             }
         }
         col_widths
@@ -1059,6 +1099,7 @@ impl LayoutEngine {
         if let Some(mt) = measured_table {
             let mut rh = mt.row_heights.clone();
             rh.resize(row_count, hwpunit_to_px(400, self.dpi));
+            self.fit_row_heights_to_common_height(table, &mut rh);
             return rh;
         }
 
@@ -1178,7 +1219,43 @@ impl LayoutEngine {
                 row_heights[r] = hwpunit_to_px(400, self.dpi);
             }
         }
+        self.fit_row_heights_to_common_height(table, &mut row_heights);
         row_heights
+    }
+
+    fn fit_row_heights_to_common_height(
+        &self,
+        table: &crate::model::table::Table,
+        row_heights: &mut [f64],
+    ) {
+        if row_heights.is_empty() {
+            return;
+        }
+        let target_height = if table.common.height > 0 {
+            hwpunit_to_px(table.common.height as i32, self.dpi)
+        } else {
+            0.0
+        };
+        if target_height > 0.0 {
+            let current: f64 = row_heights.iter().sum();
+            let residual = target_height - current;
+            if residual > 0.5 {
+                if let Some(last) = row_heights.last_mut() {
+                    *last += residual;
+                }
+            } else if residual < -0.5 {
+                let mut remaining = -residual;
+                for height in row_heights.iter_mut().rev() {
+                    let reducible = (*height - 1.0).max(0.0);
+                    let shrink = remaining.min(reducible);
+                    *height -= shrink;
+                    remaining -= shrink;
+                    if remaining <= 0.5 {
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// 셀 문단들의 콘텐츠 높이 합산 (spacing + line_height + line_spacing)
@@ -1575,12 +1652,15 @@ impl LayoutEngine {
             let horz_rel_to = table.common.horz_rel_to;
             let horz_align = table.common.horz_align;
             let h_offset = hwpunit_to_px(table.common.horizontal_offset as i32, self.dpi);
+            let om_left = hwpunit_to_px(table.outer_margin_left as i32, self.dpi);
+            let om_right = hwpunit_to_px(table.outer_margin_right as i32, self.dpi);
+            let outer_width = table_width + om_left + om_right;
             let (ref_x, ref_w) = match horz_rel_to {
                 HorzRelTo::Paper => {
                     let paper_w = paper_width.unwrap_or({
                         // fallback: col_area 기반 추정 (paper_width 미전달 시)
-                        if table_width > col_area.width {
-                            col_area.x * 2.0 + table_width
+                        if outer_width > col_area.width {
+                            col_area.x * 2.0 + outer_width
                         } else {
                             col_area.x * 2.0 + col_area.width
                         }
@@ -1603,11 +1683,13 @@ impl LayoutEngine {
                 _ => (col_area.x, col_area.width),
             };
             match horz_align {
-                HorzAlign::Left | HorzAlign::Inside => ref_x + h_offset,
-                HorzAlign::Center => ref_x + (ref_w - table_width).max(0.0) / 2.0 + h_offset,
+                HorzAlign::Left | HorzAlign::Inside => ref_x + h_offset + om_left,
+                HorzAlign::Center => {
+                    ref_x + (ref_w - outer_width).max(0.0) / 2.0 + h_offset + om_left
+                }
                 // Task #347: picture_footnote.rs:185와 동일하게 - h_offset (오른쪽 끝에서 안쪽으로 오프셋).
                 HorzAlign::Right | HorzAlign::Outside => {
-                    ref_x + (ref_w - table_width).max(0.0) - h_offset
+                    ref_x + (ref_w - outer_width).max(0.0) - h_offset + om_left
                 }
             }
         } else {
@@ -1697,28 +1779,21 @@ impl LayoutEngine {
                 0.0
             };
             let vert_align = table.common.vert_align;
-            // [Task #898] Paper-relative 표는 v_offset 이 외곽 박스 (outer_margin 포함) 기준이므로
-            // 가시 표 상단 = v_offset + outer_margin_top. 한컴 PDF (exam_math.hwp 바탕쪽 쪽번호 박스) 정합.
-            let om_top_px = if matches!(vert_rel_to, crate::model::shape::VertRelTo::Paper) {
-                hwpunit_to_px(table.outer_margin_top as i32, self.dpi)
-            } else {
-                0.0
-            };
-            let om_bottom_px = if matches!(vert_rel_to, crate::model::shape::VertRelTo::Paper) {
-                hwpunit_to_px(table.outer_margin_bottom as i32, self.dpi)
-            } else {
-                0.0
-            };
+            // 표 위치 값은 바깥 여백을 포함한 외곽 박스 기준이고, 실제 표 border는
+            // outer_margin_top만큼 안쪽에서 시작한다.
+            let om_top_px = hwpunit_to_px(table.outer_margin_top as i32, self.dpi);
+            let om_bottom_px = hwpunit_to_px(table.outer_margin_bottom as i32, self.dpi);
+            let outer_height = table_height + om_top_px + om_bottom_px;
             let raw_y = match vert_align {
                 crate::model::shape::VertAlign::Top | crate::model::shape::VertAlign::Inside => {
                     ref_y + v_offset + caption_top_offset + om_top_px
                 }
                 crate::model::shape::VertAlign::Center => {
-                    ref_y + (ref_h - table_height) / 2.0 + v_offset + caption_top_offset
+                    ref_y + (ref_h - outer_height) / 2.0 + v_offset + caption_top_offset + om_top_px
                 }
                 crate::model::shape::VertAlign::Bottom
                 | crate::model::shape::VertAlign::Outside => {
-                    ref_y + ref_h - table_height - v_offset + caption_top_offset - om_bottom_px
+                    ref_y + ref_h - outer_height - v_offset + caption_top_offset + om_top_px
                 }
             };
             // Para 기준 + bit 13: 본문 영역으로 제한
@@ -1744,15 +1819,20 @@ impl LayoutEngine {
             } else {
                 0.0
             };
+            let om_top = if table_treat_as_char {
+                0.0
+            } else {
+                hwpunit_to_px(table.outer_margin_top as i32, self.dpi)
+            };
             if let Some(ref caption) = table.caption {
                 use crate::model::shape::CaptionDirection;
                 if matches!(caption.direction, CaptionDirection::Top) {
-                    y_start + caption_height + caption_spacing + v_offset
+                    y_start + caption_height + caption_spacing + v_offset + om_top
                 } else {
-                    y_start + v_offset
+                    y_start + v_offset + om_top
                 }
             } else {
-                y_start + v_offset
+                y_start + v_offset + om_top
             }
         } else {
             // 중첩 표: outer_margin_top 적용
