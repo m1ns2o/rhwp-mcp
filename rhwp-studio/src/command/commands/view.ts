@@ -1,6 +1,6 @@
 import type { CommandDef } from '../types';
 import { setThemeMode, syncThemeMenu, type EffectiveTheme } from '../../core/theme';
-import type { ThemeMode } from '../../core/user-settings';
+import { userSettings, type ThemeMode } from '../../core/user-settings';
 import { GridSettingsDialog } from '../../ui/grid-settings-dialog';
 import {
   type GridOffsetMm,
@@ -35,6 +35,21 @@ function themeModeCommand(mode: ThemeMode, label: string): CommandDef {
       services.eventBus.emit('document-view-changed');
     },
   };
+}
+
+export function syncTextMarkMenu(showControlCodes: boolean, showParagraphMarks: boolean): void {
+  document.querySelectorAll('[data-cmd="view:ctrl-mark"]').forEach(el => {
+    el.classList.toggle('active', showControlCodes);
+  });
+  document.querySelectorAll('[data-cmd="view:para-mark"]').forEach(el => {
+    el.classList.toggle('active', showParagraphMarks);
+  });
+}
+
+function refreshCaretAfterViewChange(services: Parameters<CommandDef['execute']>[0]): void {
+  const inputHandler = services.getInputHandler() as any;
+  inputHandler?.updateCaret?.(true);
+  requestAnimationFrame(() => inputHandler?.updateCaret?.(true));
 }
 
 interface GridOriginMetrics {
@@ -187,33 +202,28 @@ export const viewCommands: CommandDef[] = [
       // 조판부호 ON → 문단부호도 ON (한컴 기준: 조판부호는 문단부호를 포함)
       services.wasm.setShowControlCodes(next);
       services.wasm.setShowParagraphMarks(next);
-      document.querySelectorAll('[data-cmd="view:ctrl-mark"]').forEach(el => {
-        el.classList.toggle('active', next);
-      });
-      // 문단부호 버튼도 연동
-      document.querySelectorAll('[data-cmd="view:para-mark"]').forEach(el => {
-        el.classList.toggle('active', next);
-      });
+      userSettings.setShowControlCodes(next);
+      userSettings.setShowParagraphMarks(next);
+      syncTextMarkMenu(next, next);
+      refreshCaretAfterViewChange(services);
       services.eventBus.emit('document-view-changed');
     },
   },
-  (() => {
-    let showParaMarks = false;
-    return {
-      id: 'view:para-mark',
-      label: '문단 부호',
-      icon: 'icon-para-mark',
-      canExecute: (ctx) => ctx.hasDocument,
-      execute(services) {
-        showParaMarks = !showParaMarks;
-        services.wasm.setShowParagraphMarks(showParaMarks);
-        document.querySelectorAll('[data-cmd="view:para-mark"]').forEach(el => {
-          el.classList.toggle('active', showParaMarks);
-        });
-        services.eventBus.emit('document-view-changed');
-      },
-    } satisfies CommandDef;
-  })(),
+  {
+    id: 'view:para-mark',
+    label: '문단 부호',
+    icon: 'icon-para-mark',
+    canExecute: (ctx) => ctx.hasDocument,
+    execute(services) {
+      const ctx = services.getContext();
+      const next = !ctx.showParagraphMarks;
+      services.wasm.setShowParagraphMarks(next);
+      userSettings.setShowParagraphMarks(next);
+      syncTextMarkMenu(ctx.showControlCodes, next);
+      refreshCaretAfterViewChange(services);
+      services.eventBus.emit('document-view-changed');
+    },
+  },
   {
     id: 'view:border-transparent',
     label: '투명 선',

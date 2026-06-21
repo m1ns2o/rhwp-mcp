@@ -1600,6 +1600,12 @@ export class WasmBridge {
     this.doc.setShowParagraphMarks(enabled);
   }
 
+  /** 문단부호 표시 여부 반환 */
+  getShowParagraphMarks(): boolean {
+    if (!this.doc) return false;
+    return (this.doc as any).getShowParagraphMarks();
+  }
+
   /** 조판부호 표시 여부 반환 */
   getShowControlCodes(): boolean {
     if (!this.doc) return false;

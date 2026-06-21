@@ -42,12 +42,21 @@ export interface DialogSettings {
   picturePropsKeepRatio: boolean;
 }
 
+/** 보기 표시 설정 */
+export interface ViewSettings {
+  /** 문단부호 표시 여부 */
+  showParagraphMarks: boolean;
+  /** 조판부호 표시 여부 */
+  showControlCodes: boolean;
+}
+
 /** 전체 설정 구조 */
 export interface AppSettings {
   version: number;
   font: FontSettings;
   theme: ThemeSettings;
   dialog: DialogSettings;
+  view: ViewSettings;
 }
 
 /** 언어 인덱스 상수 (HWP 7개 언어) */
@@ -109,6 +118,10 @@ function defaultSettings(): AppSettings {
     dialog: {
       picturePropsKeepRatio: true,
     },
+    view: {
+      showParagraphMarks: false,
+      showControlCodes: false,
+    },
   };
 }
 
@@ -136,6 +149,7 @@ class UserSettingsService {
       // 기본값 병합
       const defaults = defaultSettings();
       const dialog: Partial<DialogSettings> = parsed.dialog ?? {};
+      const view: Partial<ViewSettings> = parsed.view ?? {};
       return {
         version: parsed.version ?? defaults.version,
         font: {
@@ -153,6 +167,18 @@ class UserSettingsService {
           picturePropsKeepRatio: normalizeBoolean(
             dialog.picturePropsKeepRatio,
             defaults.dialog.picturePropsKeepRatio,
+          ),
+        },
+        view: {
+          ...defaults.view,
+          ...view,
+          showParagraphMarks: normalizeBoolean(
+            view.showParagraphMarks,
+            defaults.view.showParagraphMarks,
+          ),
+          showControlCodes: normalizeBoolean(
+            view.showControlCodes,
+            defaults.view.showControlCodes,
           ),
         },
       };
@@ -205,6 +231,23 @@ class UserSettingsService {
   /** 개체 속성 기본 탭 비율 유지 설정 */
   setPicturePropsKeepRatio(value: boolean): void {
     this.data.dialog.picturePropsKeepRatio = value;
+    this.save();
+  }
+
+  /** 보기 표시 설정 반환 */
+  getViewSettings(): ViewSettings {
+    return this.data.view;
+  }
+
+  /** 문단부호 표시 설정 */
+  setShowParagraphMarks(value: boolean): void {
+    this.data.view.showParagraphMarks = value;
+    this.save();
+  }
+
+  /** 조판부호 표시 설정 */
+  setShowControlCodes(value: boolean): void {
+    this.data.view.showControlCodes = value;
     this.save();
   }
 

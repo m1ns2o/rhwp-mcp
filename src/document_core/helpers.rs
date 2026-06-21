@@ -145,6 +145,20 @@ pub(crate) fn find_control_text_positions(para: &Paragraph) -> Vec<usize> {
 /// 반면 커서 이동은 `SectionDef`, `ColumnDef` 같은 구조 컨트롤을 건너뛰고,
 /// Shape/Table/Picture/Equation/Footnote/Endnote 같은 인라인 개체만 한 글자 폭으로 센다.
 pub(crate) fn find_logical_control_positions(para: &Paragraph) -> Vec<usize> {
+    if para.text.is_empty() && para.char_offsets.is_empty() {
+        let mut inline_seen = 0usize;
+        let mut positions = Vec::with_capacity(para.controls.len());
+
+        for ctrl in &para.controls {
+            positions.push(inline_seen);
+            if is_logical_inline_control(ctrl) {
+                inline_seen += 1;
+            }
+        }
+
+        return positions;
+    }
+
     let text_positions = find_control_text_positions(para);
     let text_len = para.text.chars().count();
     let mut inline_seen = 0usize;
@@ -1442,5 +1456,25 @@ mod tests {
         assert_eq!(find_logical_control_positions(&para), vec![0, 0, 0, 3]);
         assert_eq!(logical_paragraph_length(&para), 4);
         assert_eq!(navigable_text_len(&para), 4);
+    }
+
+    #[test]
+    fn logical_positions_do_not_double_count_control_only_fallback() {
+        let para = Paragraph {
+            text: String::new(),
+            char_offsets: vec![],
+            controls: vec![
+                Control::SectionDef(Box::<SectionDef>::default()),
+                Control::ColumnDef(ColumnDef::default()),
+                Control::Picture(Box::default()),
+                Control::Picture(Box::default()),
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(find_control_text_positions(&para), vec![0, 0, 0, 1]);
+        assert_eq!(find_logical_control_positions(&para), vec![0, 0, 0, 1]);
+        assert_eq!(logical_paragraph_length(&para), 2);
+        assert_eq!(navigable_text_len(&para), 2);
     }
 }

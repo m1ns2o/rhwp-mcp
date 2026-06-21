@@ -290,6 +290,12 @@ impl HwpDocument {
         self.invalidate_page_tree_cache();
     }
 
+    /// 문단부호(¶) 표시 여부를 반환한다.
+    #[wasm_bindgen(js_name = getShowParagraphMarks)]
+    pub fn get_show_paragraph_marks(&self) -> bool {
+        self.show_paragraph_marks
+    }
+
     /// 조판부호 표시 여부를 반환한다.
     #[wasm_bindgen(js_name = getShowControlCodes)]
     pub fn get_show_control_codes(&self) -> bool {

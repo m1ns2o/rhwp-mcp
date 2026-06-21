@@ -10,6 +10,34 @@ use crate::model::control::Control;
 use crate::model::paragraph::Paragraph;
 use crate::renderer::render_tree::PageRenderTree;
 
+fn is_caret_logical_inline_control(ctrl: &Control) -> bool {
+    matches!(
+        ctrl,
+        Control::Shape(_)
+            | Control::Table(_)
+            | Control::Picture(_)
+            | Control::Equation(_)
+            | Control::Footnote(_)
+            | Control::Endnote(_)
+    )
+}
+
+fn control_only_caret_utf16_to_char_idx(para: &Paragraph, caret_utf16: u32) -> usize {
+    if caret_utf16 == 0 || !para.char_offsets.is_empty() {
+        return 0;
+    }
+
+    // HWP 원본 위치는 컨트롤 하나를 UTF-16 8 code unit으로 센다.
+    // Studio 커서는 SectionDef/ColumnDef 같은 구조 컨트롤을 건너뛰고,
+    // 본문 흐름을 차지하는 인라인 개체만 한 글자처럼 센다.
+    let raw_control_count = (caret_utf16 / 8) as usize;
+    para.controls
+        .iter()
+        .take(raw_control_count)
+        .filter(|ctrl| is_caret_logical_inline_control(ctrl))
+        .count()
+}
+
 impl DocumentCore {
     pub(crate) fn get_line_info_native(
         &self,
@@ -221,6 +249,8 @@ impl DocumentCore {
         // UTF-16 → char index 변환
         let char_offset = if caret_utf16 == 0 {
             0
+        } else if para.char_offsets.is_empty() {
+            control_only_caret_utf16_to_char_idx(para, caret_utf16)
         } else {
             utf16_pos_to_char_idx(&para.char_offsets, caret_utf16)
         };

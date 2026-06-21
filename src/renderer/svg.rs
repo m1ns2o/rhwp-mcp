@@ -44,6 +44,8 @@ use crate::model::control::FormType;
 use crate::model::style::{ImageFillMode, UnderlineType};
 use base64::Engine;
 
+const TEXT_MARK_CLIP_RIGHT_PAD: f64 = 48.0;
+
 /// SVG 폰트 임베딩 모드
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub enum FontEmbedMode {
@@ -530,9 +532,18 @@ impl SvgRenderer {
                 clip_rect: Some(cr),
             } => {
                 let clip_id = format!("body-clip-{}", node.id);
+                let right_pad = if self.show_paragraph_marks || self.show_control_codes {
+                    TEXT_MARK_CLIP_RIGHT_PAD
+                } else {
+                    0.0
+                };
                 self.defs.push(format!(
                     "<clipPath id=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\"/></clipPath>\n",
-                    clip_id, cr.x, cr.y, cr.width, cr.height,
+                    clip_id,
+                    cr.x,
+                    cr.y,
+                    cr.width + right_pad,
+                    cr.height,
                 ));
                 self.output
                     .push_str(&format!("<g clip-path=\"url(#{})\">", clip_id));

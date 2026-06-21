@@ -581,6 +581,11 @@ export class InputHandler {
       }
     });
 
+    eventBus.on('document-view-changed', () => {
+      if (!this.active) return;
+      requestAnimationFrame(() => this.updateCaret(true));
+    });
+
     // 표 객체 선택 변경 시 렌더링
     eventBus.on('table-object-selection-changed', (selected) => {
       if (selected) {

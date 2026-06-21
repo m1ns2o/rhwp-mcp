@@ -34,6 +34,8 @@ use crate::paint::{
     PaintOp, PaintReplayPlane,
 };
 
+const TEXT_MARK_CLIP_RIGHT_PAD: f64 = 48.0;
+
 /// Hanyang-PUA 옛한글 코드포인트를 KS X 1026-1:2007 자모 시퀀스로 확장 (Task #528).
 fn expand_pua_old_hangul_canvas(text: &str) -> String {
     if !text.chars().any(|ch| map_pua_old_hangul(ch).is_some()) {
@@ -389,8 +391,12 @@ impl WebCanvasRenderer {
             } => {
                 self.ctx.save();
                 self.ctx.begin_path();
-                // 우측 여유: 레이아웃 메트릭과 브라우저 글리프 폭 차이 흡수
-                self.ctx.rect(cr.x, cr.y, cr.width + 4.0, cr.height);
+                let right_pad = if self.show_paragraph_marks || self.show_control_codes {
+                    TEXT_MARK_CLIP_RIGHT_PAD
+                } else {
+                    4.0
+                };
+                self.ctx.rect(cr.x, cr.y, cr.width + right_pad, cr.height);
                 self.ctx.clip();
             }
             RenderNodeType::TableCell(ref tc) if tc.clip => {
@@ -1048,7 +1054,13 @@ impl WebCanvasRenderer {
                 ClipKind::Body => {
                     self.ctx.save();
                     self.ctx.begin_path();
-                    self.ctx.rect(clip.x, clip.y, clip.width + 4.0, clip.height);
+                    let right_pad = if self.show_paragraph_marks || self.show_control_codes {
+                        TEXT_MARK_CLIP_RIGHT_PAD
+                    } else {
+                        4.0
+                    };
+                    self.ctx
+                        .rect(clip.x, clip.y, clip.width + right_pad, clip.height);
                     self.ctx.clip();
                     self.render_layer_node(child, active_layer);
                     self.ctx.restore();
