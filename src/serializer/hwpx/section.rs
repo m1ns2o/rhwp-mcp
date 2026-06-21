@@ -1177,6 +1177,13 @@ fn render_common_shape_xml(
             Err(e) => eprintln!("[hwpx] Shape({tag}) 캡션 직렬화 실패: {e}"),
         }
     }
+    // 설명 (#1451) — caption 직후 (OWPML AbstractShapeObjectType: outMargin→caption→shapeComment).
+    // picture.rs:104 선례와 동일 순서. legacy 경로(ellipse/arc/polygon/curve/chart/ole) 보존.
+    // 빈 description 미방출은 write_shape_comment 내부 가드로 보장된다.
+    match writer_to_string(|w| super::shape::write_shape_comment(w, c)) {
+        Ok(xml) => out.push_str(&xml),
+        Err(e) => eprintln!("[hwpx] Shape({tag}) shapeComment 직렬화 실패: {e}"),
+    }
     out.push_str(&format!("</hp:{tag}>"));
     out
 }

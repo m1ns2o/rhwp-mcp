@@ -2153,6 +2153,29 @@ mod tests {
         assert!(diff_documents(&a, &b).is_empty());
     }
 
+    #[test]
+    fn task1451_legacy_shape_comment_serialize_roundtrip() {
+        // #1451: render_common_shape_xml 경유 도형(polygon 등)의 shapeComment 가
+        // serialize → parse 왕복에서 보존되는지 직접 가드한다.
+        // 기존 task1392 게이트는 IR diff 검출만 하므로, 여기서 "보존 성공" 방향을 가드한다.
+        let mut poly = crate::model::shape::PolygonShape::default();
+        poly.common.description = "다각형입니다.".to_string();
+        let doc = roundtrip_doc_with_control(crate::model::control::Control::Shape(Box::new(
+            crate::model::shape::ShapeObject::Polygon(poly),
+        )));
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let doc2 = parse_hwpx(&bytes).expect("parse");
+        let desc = match &doc2.sections[0].paragraphs[1].controls[0] {
+            crate::model::control::Control::Shape(s) => match s.as_ref() {
+                crate::model::shape::ShapeObject::Polygon(p) => &p.common.description,
+                other => panic!("Polygon 이어야 함: {other:?}"),
+            },
+            other => panic!("Shape 컨트롤이어야 함: {other:?}"),
+        };
+        assert_eq!(desc, "다각형입니다.", "polygon shapeComment 왕복 보존");
+    }
+
     // ---------- #1391: 필드 parameters / MEMO 본문 게이트 동승 ----------
 
     #[test]
