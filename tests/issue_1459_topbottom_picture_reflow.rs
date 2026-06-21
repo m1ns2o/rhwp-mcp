@@ -114,6 +114,108 @@ fn topbottom_second_picture_flows_before_tac_picture() {
 }
 
 #[test]
+fn turning_first_picture_off_reflows_remaining_tac_picture() {
+    let mut core = load_fixture("samples/투명도0-50.hwp");
+    let (first_ci, second_ci, first_reserved_hu, second_height_hu) = {
+        let para = &core.document().sections[0].paragraphs[0];
+        let picture_indices = para
+            .controls
+            .iter()
+            .enumerate()
+            .filter_map(|(ci, ctrl)| matches!(ctrl, Control::Picture(_)).then_some(ci))
+            .collect::<Vec<_>>();
+        assert!(
+            picture_indices.len() >= 2,
+            "투명도0-50.hwp에는 같은 문단의 그림 2개가 필요함: {picture_indices:?}"
+        );
+        let first_ci = picture_indices[0];
+        let second_ci = picture_indices[1];
+        let first = match &para.controls[first_ci] {
+            Control::Picture(pic) => pic.as_ref(),
+            _ => unreachable!(),
+        };
+        let second = match &para.controls[second_ci] {
+            Control::Picture(pic) => pic.as_ref(),
+            _ => unreachable!(),
+        };
+        assert!(first.common.treat_as_char, "원본 첫 그림은 TAC여야 함");
+        assert!(second.common.treat_as_char, "원본 둘째 그림은 TAC여야 함");
+        (
+            first_ci,
+            second_ci,
+            first.common.height as i32
+                + first.common.margin.top as i32
+                + first.common.margin.bottom as i32,
+            second.common.height as i32,
+        )
+    };
+
+    core.set_picture_properties_native(
+        0,
+        0,
+        first_ci,
+        r#"{"treatAsChar":false,"textWrap":"TopAndBottom"}"#,
+    )
+    .expect("첫 번째 그림 TAC 해제");
+
+    let para = &core.document().sections[0].paragraphs[0];
+    let first = match &para.controls[first_ci] {
+        Control::Picture(pic) => pic.as_ref(),
+        _ => unreachable!(),
+    };
+    let second = match &para.controls[second_ci] {
+        Control::Picture(pic) => pic.as_ref(),
+        _ => unreachable!(),
+    };
+    assert!(
+        !first.common.treat_as_char,
+        "첫 그림은 자리차지 그림으로 바뀌어야 함"
+    );
+    assert!(
+        matches!(first.common.text_wrap, TextWrap::TopAndBottom),
+        "첫 그림은 자리차지 방식이어야 함"
+    );
+    assert!(second.common.treat_as_char, "둘째 그림은 여전히 TAC여야 함");
+    assert_eq!(
+        para.line_segs.len(),
+        1,
+        "빈 그림 문단에서 TAC 해제된 그림은 inline 줄에서 빠지고 남은 TAC 줄만 남아야 함"
+    );
+    assert_eq!(
+        para.line_segs[0].vertical_pos, first_reserved_hu,
+        "자리차지 그림 예약 높이는 남은 TAC 줄의 vertical_pos에 반영되어야 함"
+    );
+    assert_eq!(
+        para.line_segs[0].line_height, second_height_hu,
+        "남은 TAC 줄 높이는 둘째 그림 높이를 따라야 함"
+    );
+
+    let tree = core
+        .build_page_render_tree(0)
+        .expect("속성 변경 후 render tree");
+    let mut images = Vec::new();
+    collect_images(&tree.root, &mut images);
+    let topbottom = images
+        .iter()
+        .find(|img| img.control_index == first_ci)
+        .unwrap_or_else(|| panic!("첫 자리차지 그림 ImageNode 누락: {images:?}"));
+    let tac = images
+        .iter()
+        .find(|img| img.control_index == second_ci)
+        .unwrap_or_else(|| panic!("둘째 TAC 그림 ImageNode 누락: {images:?}"));
+
+    assert!(
+        topbottom.y < tac.y,
+        "한컴처럼 첫 자리차지 그림이 먼저 렌더되고 둘째 TAC 그림이 아래에 이어져야 함: topbottom={topbottom:?}, tac={tac:?}, all={images:?}"
+    );
+    let vertical_gap = tac.y - (topbottom.y + topbottom.height);
+    assert!(
+        vertical_gap.abs() <= 2.0,
+        "속성 변경 직후에도 둘째 TAC 그림은 첫 자리차지 그림 바로 다음 줄에 이어져야 함: gap={vertical_gap:.2}, topbottom={topbottom:?}, tac={tac:?}, all={images:?}"
+    );
+}
+
+#[test]
 fn non_tac_topbottom_picture_is_not_caret_stop() {
     for path in [
         "samples/투명도0-50-2nd그림글차처럼off.hwp",
