@@ -1691,6 +1691,7 @@ export class InputHandler {
       { type: 'command', commandId: 'edit:copy' },
       { type: 'command', commandId: 'edit:paste' },
       { type: 'command', commandId: 'edit:format-copy' },
+      { type: 'command', commandId: 'edit:format-paste' },
       { type: 'separator' },
       { type: 'command', commandId: 'table:cell-props', label: '셀 속성...' },
       { type: 'separator' },
@@ -1726,6 +1727,7 @@ export class InputHandler {
       { type: 'command', commandId: 'edit:copy' },
       { type: 'command', commandId: 'edit:paste' },
       { type: 'command', commandId: 'edit:format-copy' },
+      { type: 'command', commandId: 'edit:format-paste' },
       { type: 'separator' },
       { type: 'command', commandId: 'format:char-shape', label: '글자 모양' },
       { type: 'command', commandId: 'format:para-shape', label: '문단 모양' },
@@ -3172,6 +3174,9 @@ export class InputHandler {
   /** 선택 영역이 있는가? */
   hasSelection(): boolean { return this.cursor.hasSelection(); }
 
+  /** 모양 복사 상태가 있는가? */
+  hasCopiedFormat(): boolean { return this.formatCopyState !== null; }
+
   /** 현재 커서 위치를 반환한다 */
   getCursorPosition(): DocumentPosition { return this.cursor.getPosition(); }
 
@@ -3859,6 +3864,11 @@ export class InputHandler {
   performFormatCopy(): void {
     if (this.applyCopiedFormatToCurrentTarget()) return;
     this.copyFormatAtCursor();
+  }
+
+  /** 모양 붙여넣기만 수행한다 (커맨드 시스템용) */
+  performFormatPaste(): void {
+    this.applyCopiedFormatToCurrentTarget();
   }
 
   private applyCopiedFormatToCurrentTarget(): boolean {

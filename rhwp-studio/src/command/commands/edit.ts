@@ -77,6 +77,15 @@ export const editCommands: CommandDef[] = [
     },
   },
   {
+    id: 'edit:format-paste',
+    label: '모양 붙여넣기',
+    icon: 'icon-format-copy',
+    canExecute: (ctx) => ctx.hasDocument && ctx.hasCopiedFormat && !ctx.isFormMode && (ctx.hasSelection || ctx.inCellSelectionMode),
+    execute(services) {
+      services.getInputHandler()?.performFormatPaste();
+    },
+  },
+  {
     id: 'edit:delete',
     label: '지우기',
     icon: 'icon-delete',
