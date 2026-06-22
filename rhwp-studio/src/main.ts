@@ -227,7 +227,7 @@ async function initialize(): Promise<void> {
       new TableObjectRenderer(container, canvasView.getVirtualScroll(), true),
     );
 
-    new MenuBar(document.getElementById('menu-bar')!, eventBus, dispatcher);
+    new MenuBar(document.getElementById('menu-bar')!, eventBus, dispatcher, registry);
 
     // 툴바 내 data-cmd 버튼 클릭 → 커맨드 디스패치
     document.querySelectorAll('.tb-btn[data-cmd]').forEach(btn => {

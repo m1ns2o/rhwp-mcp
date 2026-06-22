@@ -14,10 +14,11 @@ import { HWPUNIT_PER_MM } from '../../core/hwp-constants';
 const PX_TO_MM = 25.4 / 96;
 
 /** 배율 고정값 커맨드 생성 헬퍼 */
-function zoomLevel(pct: number): CommandDef {
+function zoomLevel(pct: number, shortcutLabel?: string): CommandDef {
   return {
     id: `view:zoom-${pct}`,
     label: `${pct}%`,
+    shortcutLabel,
     execute(services) {
       services.getViewportManager()?.setZoom(pct / 100);
     },
@@ -146,6 +147,7 @@ export const viewCommands: CommandDef[] = [
   {
     id: 'view:zoom-fit-page',
     label: '쪽 맞춤',
+    shortcutLabel: 'Ctrl+G,P',
     execute(services) {
       const vm = services.getViewportManager();
       if (!vm || services.wasm.pageCount === 0) return;
@@ -160,6 +162,7 @@ export const viewCommands: CommandDef[] = [
   {
     id: 'view:zoom-fit-width',
     label: '폭 맞춤',
+    shortcutLabel: 'Ctrl+G,W',
     execute(services) {
       const vm = services.getViewportManager();
       if (!vm || services.wasm.pageCount === 0) return;
@@ -172,7 +175,7 @@ export const viewCommands: CommandDef[] = [
   },
   zoomLevel(50),
   zoomLevel(75),
-  zoomLevel(100),
+  zoomLevel(100, 'Ctrl+G,Q'),
   zoomLevel(125),
   zoomLevel(150),
   zoomLevel(200),
@@ -213,6 +216,7 @@ export const viewCommands: CommandDef[] = [
     id: 'view:para-mark',
     label: '문단 부호',
     icon: 'icon-para-mark',
+    shortcutLabel: 'Ctrl+G,T',
     canExecute: (ctx) => ctx.hasDocument,
     execute(services) {
       const ctx = services.getContext();
@@ -227,6 +231,7 @@ export const viewCommands: CommandDef[] = [
   {
     id: 'view:border-transparent',
     label: '투명 선',
+    shortcutLabel: 'Alt+V,T',
     canExecute: (ctx) => ctx.hasDocument,
     execute(services) {
       // WASM 실제 상태를 읽어 토글 — 셀 진입 자동 ON 등으로 인한 초기값 불일치 방지

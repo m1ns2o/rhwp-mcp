@@ -251,10 +251,29 @@ mv mydocs/pr/pr_N_review_impl.md mydocs/pr/archives/
 다음 커밋에 포함하거나 오늘할일 커밋에 동반한다. collaborator self-merge 후보 예외 경로에서는
 처음부터 archive 경로에 두므로 이 이동 단계를 수행하지 않는다.
 
-### 7.6 로컬 브랜치 정리
+### 7.6 로컬/원격 PR 작업 브랜치 정리
 
 ```bash
 git branch -D local/prN
+```
+
+collaborator self-merge 후보처럼 원본 저장소에 PR head 브랜치를 직접 만든 경우에는 merge 후 원격
+작업 브랜치도 삭제한다. 예를 들어 PR head 가 `upstream/task_m100_1470` 형태라면 다음을 수행한다.
+
+```bash
+git checkout devel
+git merge --ff-only upstream/devel
+git push upstream --delete task_m100_1470
+git branch -D task_m100_1470
+git fetch upstream --prune
+```
+
+삭제 후에는 로컬/원격 추적 브랜치가 남지 않았는지 확인한다.
+
+```bash
+git branch --list 'task_m100_1470'
+git branch -r | rg 'task_m100_1470' || true
+git ls-remote --heads upstream task_m100_1470
 ```
 
 ### 7.7 오늘할일 갱신
