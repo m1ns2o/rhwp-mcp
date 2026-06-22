@@ -4,6 +4,12 @@
 
 ## [Unreleased]
 
+## [0.7.17] — 2026-06-23
+
+> v0.7.16 후속 patch — OOXML 차트 렌더 정합 첫 작업, legacy 도형 shapeComment 직렬화,
+> WASM options object API, rhwp-studio 표/그림/커서 편집 정합 다수, 렌더 권위 보강,
+> 의존성 일괄 업데이트. 공개 API 하위 호환 유지(positional API 유지) — PATCH. 브라우저 확장 0.2.6 동반.
+
 ### API
 - WASM public API 의 고인자(7+) 함수 26개에 options object 변형 `*Ex(options_json[, image_data])`
   를 추가했다 (#1413). 기존 positional API 는 그대로 유지되며(하위 호환), `*Ex` 는 JSON
@@ -16,8 +22,52 @@
     pasteHtmlInCell, moveLineEndpoint, mergeTableCells, insertTextInCell, insertClickHereField,
     getTextInCell, getFieldInfoAtInCell, evaluateTableFormula, deleteTextInCell.
   - 설계 관행·breaking change 표기 규약: `mydocs/manual/wasm_api_options_convention.md`.
+  - 소비자(@rhwp/core) README 에 `*Ex` 안내 + 소비자 편집 API 매뉴얼 추가 (#1445).
   - **권고**: 고인자 API 는 `*Ex` 사용을 권장한다. positional 시그니처 변경 시 CHANGELOG
     `### API` 에 인자 index 변경을 명시한다.
+
+### 렌더링 (차트)
+- OOXML 차트 27종 중 데이터가 추출되던 7종(3D막대4·3D원형1·ofPie2)을 요소명 라우팅으로 2D 근사
+  렌더 전환 — "차트 (미지원)" placeholder 제거 (#1453, C1a / #1431 Track C).
+- 막대 차트 `c:grouping`(stacked/percentStacked) 반영 — 누적/백분율 막대 6종 정합 (#1453).
+
+### HWPX 저장 계약 (serializer fidelity)
+- `render_common_shape_xml` 경유 legacy 도형(ellipse/arc/polygon/curve/chart/ole)의
+  `hp:shapeComment` 직렬화 누락 정정 — round-trip 보존 (#1451).
+- `ir-diff` tab_extended 예약 필드[3,4,5]의 거짓 차이 보고 제외 (#1473).
+
+### 렌더링
+- Text IR v2 폰트 fallback 시 권위 gap 유지, CanvasKit replay 계약 가드 확장 (#1429/#1447/#1469).
+- 표 셀 TAC 그림과 텍스트 세로 정렬 보정 (#1352). 글자처럼 해제 그림 재흐름 보정 (#1459).
+
+### rhwp-studio
+- 미저장 문서 자동 백업 + 복구 UI (#1448). 로컬 글꼴 감지 동의(opt-in) 흐름 (#1328).
+- 쪽 테두리 미리보기 버튼 토글 복구 (#1426). 그림 삽입·인라인 커서 정합 (#1452).
+- 표 줄/칸 입력·지우기 회귀 보정(생성 직후 칸/줄 추가 시 표 높이 보존) + 한컴식 통합 대화상자·단축키 (#1481).
+- 표 셀 드래그 선택·한컴 호환 표 편집 (#1443), 셀 보호 속성 보존·입력 차단 UX (#493).
+- 크기 고정 개체 조작 차단 (#1436), 온새미로 그림 어울림·문단 테두리 정합 (#1440).
+- 스타일 적용·표 캡션/모양복사 보정 (#1470), 플랫폼별 메뉴 단축키 표시 보정 (#1476).
+
+### 브라우저 확장 (0.2.6)
+- viewer 인라인 스크립트 CSP 위반 정정(theme-init.js 분리) + 다크 아이콘 자산 누락 복구 (#1444).
+- Chrome 다운로드 `onDeterminingFilename` 리스너의 전역 부작용 제거 — 다른 확장의
+  `download({filename})` 하위폴더 저장을 방해하지 않도록 `onCreated`/`onChanged` 관찰자로 전환 (#1471).
+
+### 인프라
+- `Cargo.lock` git 추적 — 재현 가능 빌드 + CI 캐시 키 안정화 (#1423, macOS FFI 영역 제외).
+- 의존성 일괄 업데이트: zip 8.6.0, serde_json 1.0.150, snafu 0.9.1, subsetter 0.2.6,
+  skia-safe 0.99.0, unicode-segmentation 1.13.3, wasm-bindgen-test 0.3.75, @types/chrome 0.2.0
+  (#1461~#1468).
+
+### 기여자
+
+이번 사이클(v0.7.16 이후)에 머지된 기여자 PR (GitHub 핸들, 가나다·알파벳순):
+
+- @jangster77 (Taesup Jang) — 표 줄/칸 입력·지우기 회귀 보정(#1481), 표 셀 드래그 선택·편집(#1443)·셀 보호(#493), TAC 그림 정렬·크기 고정·온새미로(#1352/#1436/#1440), 자동 백업 복구(#1448), 그림/커서 정합(#1452/#1459), 스타일·캡션·단축키(#1470/#1476)
+- @johndoekim — OOXML 차트 C1a 라우팅 + 막대 누적 (#1453)
+- @oksure (Hyunwoo Park) — ir-diff tab_extended 예약 필드 거짓 차이 제외 (#1473)
+- @postmelee — 로컬 글꼴 동의 흐름(#1328), 쪽 테두리 토글(#1426), Chrome 다운로드 interceptor 부작용 수정(#1471), PR 리뷰 워크플로 문서(#1425)
+- @seo-rii — Text IR v2 폰트 권위 유지(#1429), CanvasKit replay 가드 확장(#1447/#1469)
 
 ## [0.7.16] — 2026-06-19
 

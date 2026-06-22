@@ -71,6 +71,24 @@ Foundation  Typeset   Collab    Complete
 - Web editor + hwpctl-compatible API (30 Actions, Field API)
 - 1,100+ tests
 
+#### v0.7.17 Cycle (2026-06-23)
+
+> Patch after v0.7.16 — first OOXML chart render-fidelity work, legacy-shape shapeComment
+> serialization, WASM options-object APIs, rhwp-studio table/picture/cursor editing fixes,
+> and a dependency bump batch
+
+**Rendering · charts**
+- 2D-approximation routing for 7 OOXML chart types (3D-bar/3D-pie/ofPie) + bar stacking/percent (C1a)
+- Keep v2 font authority on fallback, expand CanvasKit replay contract guards
+
+**Save contract · API**
+- Fixed missing shapeComment serialization on legacy shapes (ellipse/arc/polygon/curve/chart/ole)
+- Added 26 WASM options-object APIs (`*Ex`, backward-compatible) + consumer README/manual
+
+**rhwp-studio · extension**
+- Table row/column insert-delete regression fix, autosave/recovery, local-font consent, picture/cursor fidelity, table-cell editing/protection
+- Browser extension 0.2.6: viewer CSP fix, Chrome download interceptor side-effect removal
+
 #### v0.7.16 Cycle (2026-06-19)
 
 > Patch after v0.7.15 — HWPX save-contract (serializer fidelity) refinements, ClickHere
@@ -357,7 +375,7 @@ See the [roadmap document](mydocs/eng/report/rhwp-milestone.md) for details.
 
 ## npm Packages — Use in Your Web Project
 
-Current release: `@rhwp/core` / `@rhwp/editor` v0.7.16.
+Current release: `@rhwp/core` / `@rhwp/editor` v0.7.17.
 
 ### Embed a Full Editor (3 lines)
 

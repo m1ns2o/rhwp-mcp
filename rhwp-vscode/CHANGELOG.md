@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.7.17] - 2026-06-23
+
+라이브러리 버전 동기화. v0.7.16 후속 patch 릴리즈.
+
+핵심 변경:
+
+- OOXML 차트 렌더 정합 첫 작업(C1a): 3D막대·3D원형·ofPie 7종 2D 근사 라우팅 + 막대 누적/백분율 보정.
+- legacy 도형(ellipse/arc/polygon/curve/chart/ole) shapeComment 직렬화 누락 정정.
+- WASM options object API(`*Ex`) 26종 추가(하위 호환). 소비자 README/매뉴얼 보강.
+- rhwp-studio: 표 줄/칸 입력·지우기 회귀 보정, 미저장 문서 자동 백업·복구, 로컬 글꼴 동의, 그림/커서 정합, 표 셀 편집·보호.
+- 렌더링: Text IR v2 폰트 fallback 권위 유지, CanvasKit replay 계약 가드 확장.
+- 의존성 일괄 업데이트 + Cargo.lock git 추적.
+
+자세한 내용은 저장소 루트 CHANGELOG.md 를 참조하세요.
+
 ## [0.7.16] - 2026-06-19
 
 라이브러리 버전 동기화. v0.7.15 후속 사이클 (6/6~6/19) patch 릴리즈.

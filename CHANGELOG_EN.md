@@ -4,6 +4,70 @@ This document records the major changes of the rhwp project.
 
 > 한국어 버전은 [CHANGELOG.md](CHANGELOG.md) 를 참조하세요.
 
+## [0.7.17] — 2026-06-23
+
+> Patch following v0.7.16 — first OOXML chart render-fidelity work, legacy-shape shapeComment
+> serialization, WASM options-object APIs, many rhwp-studio table/picture/cursor editing fixes,
+> render-authority hardening, and a dependency bump batch. Public APIs remain backward-compatible
+> (positional APIs kept) — PATCH. Browser extension 0.2.6 included.
+
+### API
+- Added options-object variants `*Ex(options_json[, image_data])` for 26 high-arity (7+) WASM
+  public APIs (#1413). Existing positional APIs are kept (backward-compatible); `*Ex` performs
+  the same operation via JSON options, making downstream less fragile to mid-signature changes.
+  Consumer (@rhwp/core) README guidance + consumer edit API manual added (#1445).
+  Convention: `mydocs/manual/wasm_api_options_convention.md`.
+
+### Rendering (charts)
+- Routed 7 of the 27 OOXML chart types whose data was already extracted (4 3D-bar, 1 3D-pie,
+  2 ofPie) to 2D-approximation rendering — removes the "chart (unsupported)" placeholder
+  (#1453, C1a / #1431 Track C).
+- Bar charts now honor `c:grouping` (stacked/percentStacked) — 6 stacked/percent bar types (#1453).
+
+### HWPX save contract (serializer fidelity)
+- Fixed missing `hp:shapeComment` serialization on legacy shapes (ellipse/arc/polygon/curve/
+  chart/ole) routed through `render_common_shape_xml` — round-trip preserved (#1451).
+- Excluded false `ir-diff` differences on tab_extended reserved fields [3,4,5] (#1473).
+
+### Rendering
+- Keep v2 font authority on fallback, expand CanvasKit replay contract guards (#1429/#1447/#1469).
+- TAC picture vs text vertical alignment in table cells (#1352). Reflow on un-inline picture (#1459).
+
+### rhwp-studio
+- Autosave + recovery UI for unsaved documents (#1448). Local-font detection consent (opt-in) (#1328).
+- Page-border preview toggle restore (#1426). Picture insert / inline cursor fidelity (#1452).
+- Table row/column insert/delete regression fix (preserve table height when adding rows/cols right
+  after creation) + Hancom-style unified dialog/shortcuts (#1481).
+- Table-cell drag selection + Hancom-compatible table editing (#1443), cell protection (#493).
+- Block manipulation of size-locked objects (#1436), inline-picture wrap + paragraph border (#1440).
+- Style apply / table caption / format copy (#1470), platform-specific menu shortcut display (#1476).
+
+### Browser extension (0.2.6)
+- Fixed viewer inline-script CSP violation (theme-init.js split) + dark icon asset recovery (#1444).
+- Removed the global side effect of the Chrome `onDeterminingFilename` listener — switched to
+  `onCreated`/`onChanged` observers so other extensions' `download({filename})` subfolder saves
+  are no longer disrupted (#1471).
+
+### Infra
+- Track `Cargo.lock` in git — reproducible builds + stable CI cache keys (#1423, macOS FFI excluded).
+- Dependency bump batch: zip 8.6.0, serde_json 1.0.150, snafu 0.9.1, subsetter 0.2.6,
+  skia-safe 0.99.0, unicode-segmentation 1.13.3, wasm-bindgen-test 0.3.75, @types/chrome 0.2.0
+  (#1461–#1468).
+
+### Contributors
+
+Contributor PRs merged in this cycle (since v0.7.16; GitHub handles, alphabetical):
+
+- @jangster77 (Taesup Jang) — table row/column insert-delete regression (#1481), table-cell drag
+  selection & editing (#1443) / cell protection (#493), TAC picture alignment / size-lock /
+  inline-wrap (#1352/#1436/#1440), autosave recovery (#1448), picture/cursor fidelity (#1452/#1459),
+  style/caption/shortcut (#1470/#1476)
+- @johndoekim — OOXML chart C1a routing + bar stacking (#1453)
+- @oksure (Hyunwoo Park) — exclude false ir-diff on tab_extended reserved fields (#1473)
+- @postmelee — local-font consent (#1328), page-border toggle (#1426), Chrome download
+  interceptor side-effect fix (#1471), PR review workflow docs (#1425)
+- @seo-rii — keep v2 font authority (#1429), expand CanvasKit replay guards (#1447/#1469)
+
 ## [0.7.16] — 2026-06-19
 
 > Patch following v0.7.15 — refines the HWPX save contract (serializer fidelity), fixes
