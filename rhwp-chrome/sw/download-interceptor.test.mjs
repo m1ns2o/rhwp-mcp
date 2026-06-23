@@ -224,3 +224,58 @@ test('local file HWP is opened and suppressed best-effort', async () => {
     assert.deepEqual(calls.erase, [{ id: 501 }]);
   });
 });
+
+// #1498: onChanged 단독(= onCreated 미관측, 과거 다운로드 기록)으로는 뷰어를 열지 않는다.
+test('past download (onChanged only, no onCreated) does not open the viewer', async () => {
+  const env = createChromeMock();
+
+  await withChromeMock(env, async ({ listeners, calls, searchItems }) => {
+    // service worker 재기동 후 과거 HWP 다운로드 항목에 onChanged 만 발화하는 상황.
+    searchItems.set(900, {
+      id: 900,
+      url: 'https://example.com/old.hwp',
+      filename: 'old.hwp',
+      mime: 'application/x-hwp',
+    });
+    await listeners.onChanged[0]({
+      id: 900,
+      filename: { current: '/Users/melee/Downloads/old.hwp' },
+      state: { current: 'complete' },
+    });
+    await flushAsyncWork();
+
+    // seen 에 없으므로 재조회/오픈 모두 일어나지 않아야 한다.
+    assert.deepEqual(calls.search, [], 'onChanged 단독은 downloads.search 를 호출하지 않아야 함');
+    assert.deepEqual(calls.tabsCreate, [], 'onChanged 단독은 뷰어를 열지 않아야 함');
+  });
+});
+
+// #1498: onCreated 로 관측한 새 다운로드는 onChanged 재판정으로 정상 오픈된다.
+test('new download seen via onCreated is opened on onChanged recheck', async () => {
+  const env = createChromeMock();
+
+  await withChromeMock(env, async ({ listeners, calls, searchItems }) => {
+    listeners.onCreated[0]({
+      id: 901,
+      url: 'https://example.com/download?id=901',
+      filename: 'download',
+      mime: 'application/octet-stream',
+    });
+    await flushAsyncWork();
+
+    searchItems.set(901, {
+      id: 901,
+      url: 'https://example.com/download?id=901',
+      filename: 'fresh.hwp',
+      mime: 'application/octet-stream',
+    });
+    await listeners.onChanged[0]({
+      id: 901,
+      filename: { current: '/Users/melee/Downloads/fresh.hwp' },
+    });
+    await flushAsyncWork();
+
+    assert.deepEqual(calls.search, [{ id: 901 }]);
+    assert.equal(calls.tabsCreate.length, 1, '새 다운로드는 정상 오픈되어야 함');
+  });
+});

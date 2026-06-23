@@ -11,10 +11,15 @@ import { openViewer } from './viewer-launcher.js';
 import { shouldInterceptDownload } from './download-interceptor-common.js';
 
 const handled = new Set();     // 이미 처리된 downloadId
+// #1498: onCreated 로 관측한 다운로드 id (= service worker 기동 이후 새로 시작된 다운로드).
+// onChanged 는 과거 다운로드 기록에도 발화할 수 있으므로, seen 에 있는 id 에 한해서만 재판정한다.
+// SW 재기동 후 과거 항목이 뷰어로 다발 열리던 회귀를 막는다 (#1471/#1480 회귀 정정).
+const seen = new Set();
 
 export function setupDownloadInterceptor() {
   // 1차: 다운로드 시작 시 url/mime/referrer 로 즉시 판정
   browser.downloads.onCreated.addListener((item) => {
+    if (item) seen.add(item.id);
     if (handled.has(item.id)) return;
 
     if (shouldInterceptDownload(item)) {
@@ -26,8 +31,9 @@ export function setupDownloadInterceptor() {
 
   // 2차: filename 확정 시 재판정
   browser.downloads.onChanged.addListener(async (delta) => {
-    // 아직 미처리 + filename 확정 → 최신 DownloadItem 으로 재판정
-    if (!handled.has(delta.id) && delta.filename?.current) {
+    // #1498: onCreated 로 관측한(= 새로 시작된) 다운로드만 재판정한다. onChanged 단독으로
+    // 들어온 과거 기록 항목은 seen 에 없으므로 뷰어를 열지 않는다.
+    if (seen.has(delta.id) && !handled.has(delta.id) && delta.filename?.current) {
       try {
         const [item] = await browser.downloads.search({ id: delta.id });
         if (item && shouldInterceptDownload(item)) {
@@ -39,10 +45,12 @@ export function setupDownloadInterceptor() {
       }
     }
 
-    // 완료/에러 시 handled 정리 (메모리 누수 방지)
-    // onCreated/onChanged 양쪽 경로에서 들어간 id 모두에 대해 cleanup 보장
-    if (handled.has(delta.id) && (delta.state?.current === 'complete' || delta.error)) {
-      setTimeout(() => handled.delete(delta.id), 30000);
+    // 완료/에러 시 handled/seen 정리 (메모리 누수 방지)
+    if (delta.state?.current === 'complete' || delta.error) {
+      setTimeout(() => {
+        handled.delete(delta.id);
+        seen.delete(delta.id);
+      }, 30000);
     }
   });
 }

@@ -14,6 +14,10 @@ import { openViewer } from './viewer-launcher.js';
 import { shouldInterceptDownload } from './download-interceptor-common.js';
 
 const handled = new Set();
+// #1498: onCreated 로 관측한 다운로드 id (= service worker 기동 이후 새로 시작된 다운로드).
+// onChanged 는 과거 다운로드 기록에도 발화할 수 있으므로, seen 에 있는 id 에 한해서만 재판정한다.
+// SW 재기동 후 과거 항목이 뷰어로 다발 열리던 회귀를 막는다 (#1471/#1480 회귀 정정).
+const seen = new Set();
 
 /** 다운로드 항목이 로컬 file:// 인지 판별. */
 function isLocalFileDownload(item) {
@@ -37,11 +41,14 @@ function shouldRecheckDownload(delta) {
  */
 export function setupDownloadInterceptor() {
   chrome.downloads.onCreated.addListener((item) => {
+    if (item) seen.add(item.id);
     processDownloadItem(item);
   });
 
   chrome.downloads.onChanged.addListener(async (delta) => {
-    if (!handled.has(delta.id) && shouldRecheckDownload(delta)) {
+    // #1498: onCreated 로 관측한(= 새로 시작된) 다운로드만 재판정한다. onChanged 단독으로
+    // 들어온 과거 기록 항목은 seen 에 없으므로 뷰어를 열지 않는다.
+    if (seen.has(delta.id) && !handled.has(delta.id) && shouldRecheckDownload(delta)) {
       try {
         const [item] = await chrome.downloads.search({ id: delta.id });
         processDownloadItem(item);
@@ -50,8 +57,11 @@ export function setupDownloadInterceptor() {
       }
     }
 
-    if (handled.has(delta.id) && isTerminalDelta(delta)) {
-      setTimeout(() => handled.delete(delta.id), 30000);
+    if (isTerminalDelta(delta)) {
+      setTimeout(() => {
+        handled.delete(delta.id);
+        seen.delete(delta.id);
+      }, 30000);
     }
   });
 }
