@@ -20,11 +20,6 @@
 </p>
 
 <p align="center">
-  <a href="https://oosmetrics.com/repo/edwardkim/rhwp"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/921c34bc-4dd3-4409-ba2e-2d99c8b4a9b6.svg" alt="Top 2 in WebAssembly by originality - 2026-04-21" /></a>
-  <a href="https://oosmetrics.com/repo/edwardkim/rhwp"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/fd1e3217-b99a-4ec2-8cba-98429f3d91c7.svg" alt="Top 2 in Editors by originality - 2026-04-21" /></a>
-</p>
-
-<p align="center">
   <a href="README.md">한국어</a> | <strong>English</strong>
 </p>
 
