@@ -848,6 +848,13 @@ export function finishResizeDrag(this: any, e: MouseEvent): void {
         if (neighborIdx !== null && box.cellIdx === neighborIdx) continue;
         pushLocalResizeWidthHint(updates, box.cellIdx, getCellDisplaySize(box, state.edge));
       }
+    } else {
+      for (const box of state.bboxes) {
+        if (box.col !== targetBox.col) continue;
+        if (box.cellIdx === state.singleCellTarget.cellIdx) continue;
+        if (neighborIdx !== null && box.cellIdx === neighborIdx) continue;
+        pushLocalResizeHeightHint(updates, box.cellIdx, getCellDisplaySize(box, state.edge));
+      }
     }
     updates = updates.filter(update => {
       const d = state.edge.type === 'col' ? update.widthDelta : update.heightDelta;

@@ -57,16 +57,23 @@ fn build_col_row_y_from_cell_heights(
     cell_spacing: f64,
     dpi: f64,
 ) -> Vec<Vec<f64>> {
+    let inferred_local_resize_cols = table.inferred_local_resize_cols();
     let mut cell_height_grid = vec![vec![None::<f64>; row_count]; col_count];
-    for cell in &table.cells {
+    for (cell_idx, cell) in table.cells.iter().enumerate() {
         if cell.row_span == 1
             && cell.col_span == 1
             && cell.height < 0x8000_0000
             && (cell.col as usize) < col_count
             && (cell.row as usize) < row_count
         {
+            let render_height = table
+                .local_resize_cell_heights
+                .iter()
+                .find(|(idx, _)| *idx == cell_idx)
+                .map(|(_, height)| *height)
+                .unwrap_or(cell.height);
             cell_height_grid[cell.col as usize][cell.row as usize] =
-                Some(hwpunit_to_px(cell.height as i32, dpi));
+                Some(hwpunit_to_px(render_height as i32, dpi));
         }
     }
 
@@ -79,6 +86,13 @@ fn build_col_row_y_from_cell_heights(
     };
     let mut col_row_y = vec![vec![0.0f64; row_count + 1]; col_count];
     for c in 0..col_count {
+        let col_idx = c as u16;
+        if !table.local_resize_cols.contains(&col_idx)
+            && !inferred_local_resize_cols.contains(&col_idx)
+        {
+            col_row_y[c].clone_from_slice(row_y);
+            continue;
+        }
         for r in 0..row_count {
             let h = cell_height_grid[c][r]
                 .or_else(|| row_heights.get(r).copied())
@@ -1159,9 +1173,12 @@ impl LayoutEngine {
         }
 
         // 1단계: row_span==1인 셀에서 개별 행 높이 추출
+        let inferred_local_resize_cols = table.inferred_local_resize_cols();
         let mut row_heights = vec![0.0f64; row_count];
         for cell in &table.cells {
-            if table.local_resize_cols.contains(&cell.col) {
+            if table.local_resize_cols.contains(&cell.col)
+                || inferred_local_resize_cols.contains(&cell.col)
+            {
                 continue;
             }
             if cell.row_span == 1 && (cell.row as usize) < row_count {
@@ -1203,7 +1220,9 @@ impl LayoutEngine {
         {
             let mut constraints: Vec<(usize, usize, f64)> = Vec::new();
             for cell in &table.cells {
-                if table.local_resize_cols.contains(&cell.col) {
+                if table.local_resize_cols.contains(&cell.col)
+                    || inferred_local_resize_cols.contains(&cell.col)
+                {
                     continue;
                 }
                 let r = cell.row as usize;

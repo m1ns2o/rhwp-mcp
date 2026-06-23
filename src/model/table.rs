@@ -355,6 +355,109 @@ impl Table {
         inferred.into_iter().collect()
     }
 
+    /// 저장/복구 후 Studio 런타임 힌트가 사라진 열 단위 세로 resize를 보수적으로 추론한다.
+    ///
+    /// 같은 세로 셀 배치 패턴을 공유하는 열들 중 다수의 높이 벡터와 다른 소수 열만
+    /// 로컬 세로 resize 결과로 간주한다.
+    pub fn inferred_local_resize_cols(&self) -> Vec<u16> {
+        let row_count = self.row_count as usize;
+        let col_count = self.col_count as usize;
+        if row_count == 0 || col_count == 0 {
+            return Vec::new();
+        }
+
+        let explicit_cols = self
+            .local_resize_cols
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut grouped_cols =
+            std::collections::BTreeMap::<Vec<(u16, u16, u16)>, Vec<(u16, Vec<u32>)>>::new();
+
+        for col in 0..self.col_count {
+            if explicit_cols.contains(&col) {
+                continue;
+            }
+
+            let mut row = 0usize;
+            let mut pattern = Vec::new();
+            let mut heights = Vec::new();
+            let mut valid = true;
+
+            while row < row_count {
+                let grid_idx = row * col_count + col as usize;
+                let Some(Some(cell_idx)) = self.cell_grid.get(grid_idx) else {
+                    valid = false;
+                    break;
+                };
+                let Some(cell) = self.cells.get(*cell_idx) else {
+                    valid = false;
+                    break;
+                };
+                let span = cell.row_span.max(1);
+                if cell.row as usize != row
+                    || cell.col > col
+                    || col >= cell.col.saturating_add(cell.col_span.max(1))
+                    || row + span as usize > row_count
+                {
+                    valid = false;
+                    break;
+                }
+
+                pattern.push((cell.row, span, cell.col_span.max(1)));
+                heights.push(cell.height);
+                row += span as usize;
+            }
+
+            if !valid || row != row_count {
+                continue;
+            }
+
+            grouped_cols
+                .entry(pattern)
+                .or_default()
+                .push((col, heights));
+        }
+
+        let mut inferred = std::collections::BTreeSet::new();
+        for cols in grouped_cols.values() {
+            if cols.len() < 2 {
+                continue;
+            }
+
+            let mut height_counts = std::collections::BTreeMap::<Vec<u32>, usize>::new();
+            for (_, heights) in cols {
+                *height_counts.entry(heights.clone()).or_default() += 1;
+            }
+
+            let Some((dominant_heights, dominant_count)) =
+                height_counts.iter().max_by_key(|(_, count)| **count)
+            else {
+                continue;
+            };
+            if *dominant_count < 2 {
+                continue;
+            }
+
+            let dominant_is_tied = height_counts
+                .values()
+                .filter(|count| **count == *dominant_count)
+                .count()
+                > 1;
+            if dominant_is_tied {
+                continue;
+            }
+
+            for (col, heights) in cols {
+                if heights != dominant_heights {
+                    inferred.insert(*col);
+                }
+            }
+        }
+
+        inferred.into_iter().collect()
+    }
+
     /// 2D 그리드 인덱스를 재구축한다.
     /// 구조 변경(파싱, 행/열 추가/삭제, 병합/분할) 후 호출해야 한다.
     pub fn rebuild_grid(&mut self) {
