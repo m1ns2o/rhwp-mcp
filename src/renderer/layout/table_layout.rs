@@ -4376,6 +4376,7 @@ impl LayoutEngine {
         let mut hit_hard_break = false;
         let mut fully_consumed = true;
         let mut consumed_height = 0.0f64;
+        let rewind_internal_hard_break_orphan = Self::row_has_prior_rowspan_cover(table, row);
         for (i, cell) in row_cells.iter().enumerate() {
             let units = self.cell_units(cell, table, styles);
             let start = start_cut.get(i).copied().unwrap_or(0).min(units.len());
@@ -4385,6 +4386,11 @@ impl LayoutEngine {
                 let u = &units[j];
                 // 시작 유닛(j==start)은 항상 소비 — 진행 보장.
                 if j > start && u.hard_break_before {
+                    if rewind_internal_hard_break_orphan {
+                        Self::rewind_rowbreak_orphan_before_hard_break(
+                            table, &units, start, &mut j, &mut h,
+                        );
+                    }
                     hit_hard_break = true;
                     break;
                 }
@@ -4565,6 +4571,14 @@ impl LayoutEngine {
             *h -= prev.height;
             *j -= 1;
         }
+    }
+
+    fn row_has_prior_rowspan_cover(table: &crate::model::table::Table, row: usize) -> bool {
+        table.cells.iter().any(|cell| {
+            let start = cell.row as usize;
+            let end = start + (cell.row_span as usize).max(1);
+            cell.row_span > 1 && start < row && row < end
+        })
     }
 
     /// RowBreak 표의 rowspan 블록 중 셀 내부 HWP page reset 이 처음 나타나는 셀의
@@ -5102,6 +5116,13 @@ mod row_cut_tests {
         }
     }
 
+    fn rowbreak_table(cells: Vec<Cell>) -> Table {
+        Table {
+            page_break: crate::model::table::TablePageBreak::RowBreak,
+            ..table(cells)
+        }
+    }
+
     fn composed_text(text: &str) -> ComposedParagraph {
         ComposedParagraph {
             lines: vec![ComposedLine {
@@ -5213,6 +5234,43 @@ mod row_cut_tests {
         let r2 = eng.advance_row_cut(&t, 0, &r.end_cut, 1000.0, &styles);
         assert_eq!(r2.end_cut, vec![5]);
         assert!(r2.fully_consumed);
+    }
+
+    #[test]
+    fn test_advance_row_cut_rowbreak_rewinds_internal_hard_break_orphan() {
+        let eng = LayoutEngine::new(96.0);
+        let styles = ResolvedStyleSet::default();
+        let internal_reset = Paragraph {
+            line_segs: vec![
+                LineSeg {
+                    vertical_pos: 0,
+                    line_height: 1200,
+                    line_spacing: 0,
+                    ..Default::default()
+                },
+                LineSeg {
+                    vertical_pos: 0,
+                    line_height: 1200,
+                    line_spacing: 0,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let t = rowbreak_table(vec![
+            rscell(0, 0, 2, vec![text_para(1, 0)]),
+            cell(
+                1,
+                1,
+                vec![text_para(1, 0), text_para(1, 1200), internal_reset],
+            ),
+        ]);
+
+        let r = eng.advance_row_cut(&t, 1, &[], 1000.0, &styles);
+
+        assert_eq!(r.end_cut, vec![2]);
+        assert!(r.hit_hard_break);
+        assert!(!r.fully_consumed);
     }
 
     #[test]
