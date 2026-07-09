@@ -36,12 +36,19 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
 
+      - name: Install wasm-pack
+        shell: bash
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-0 libnss3 libxss1 libatk-bridge2.0-0 libdrm2 libgbm1
           sudo apt-get install -y libasound2t64 || sudo apt-get install -y libasound2
+
+      - name: Build wasm package
+        run: wasm-pack build --target web --release
 
       - name: Build studio
         working-directory: rhwp-studio
