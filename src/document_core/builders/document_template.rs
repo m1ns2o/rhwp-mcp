@@ -1350,7 +1350,6 @@ fn apply_template_shape_families(
                 auto_spacing_easian_num: shape.auto_spacing_easian_num,
                 head_type: head_type_from_name(&shape.head_type),
                 para_level: shape.para_level,
-                ..ParaShape::default()
             };
         }
         core.document.doc_info.para_shapes = restored;
@@ -2306,9 +2305,11 @@ fn extract_blocks_from_paragraphs(
                 char_format: include_formats
                     .then(|| char_format_json(core, para))
                     .flatten(),
-                char_shape_runs: include_formats
-                    .then(|| template_char_shape_runs(para))
-                    .unwrap_or_default(),
+                char_shape_runs: if include_formats {
+                    template_char_shape_runs(para)
+                } else {
+                    Default::default()
+                },
                 para_format: include_formats
                     .then(|| para_format_json(core, para))
                     .flatten(),

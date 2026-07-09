@@ -44,10 +44,7 @@ pub fn handle_json_value(runtime: &mut ToolRuntime, message: Value) -> Option<Va
         return id.map(|id| error_response(id, -32600, "missing method"));
     };
 
-    if id.is_none() {
-        return None;
-    }
-    let id = id.unwrap();
+    let id = id?;
 
     match method {
         "initialize" => Some(success_response(id, initialize_result(&message))),

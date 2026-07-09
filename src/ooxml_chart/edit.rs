@@ -6310,18 +6310,17 @@ fn write_missing_line_series_children_until<W: Write>(
         )?;
         error_bar_seen_series.insert(series_index);
     }
-    if limit >= 2
-        && update.line_smooth.is_some()
-        && !line_smooth_seen_series.contains(&series_index)
-    {
-        write_chart_empty_with_val(
-            writer,
-            prefix_source_name,
-            "smooth",
-            bool_xml_value(update.line_smooth.unwrap()),
-        )?;
-        line_smooth_seen_series.insert(series_index);
-        *line_smooth_updated = true;
+    if limit >= 2 && !line_smooth_seen_series.contains(&series_index) {
+        if let Some(line_smooth) = update.line_smooth {
+            write_chart_empty_with_val(
+                writer,
+                prefix_source_name,
+                "smooth",
+                bool_xml_value(line_smooth),
+            )?;
+            line_smooth_seen_series.insert(series_index);
+            *line_smooth_updated = true;
+        }
     }
     Ok(())
 }
@@ -6498,9 +6497,8 @@ fn pie_of_pie_type_update_value<'a>(
     if local != b"ofPieType" || !path_contains(path, b"ofPieChart") {
         return None;
     }
-    match update.pie_of_pie_type? {
-        value => Some(of_pie_type_xml_value(value)),
-    }
+    let value = update.pie_of_pie_type?;
+    Some(of_pie_type_xml_value(value))
 }
 
 fn of_pie_type_xml_value(value: OfPieType) -> &'static str {
@@ -7083,18 +7081,17 @@ fn write_missing_scatter_series_children_until<W: Write>(
         )?;
         error_bar_seen_series.insert(series_index);
     }
-    if limit >= 2
-        && update.scatter_smooth.is_some()
-        && !scatter_smooth_seen_series.contains(&series_index)
-    {
-        write_chart_empty_with_val(
-            writer,
-            prefix_source_name,
-            "smooth",
-            bool_xml_value(update.scatter_smooth.unwrap()),
-        )?;
-        scatter_smooth_seen_series.insert(series_index);
-        *scatter_smooth_updated = true;
+    if limit >= 2 && !scatter_smooth_seen_series.contains(&series_index) {
+        if let Some(scatter_smooth) = update.scatter_smooth {
+            write_chart_empty_with_val(
+                writer,
+                prefix_source_name,
+                "smooth",
+                bool_xml_value(scatter_smooth),
+            )?;
+            scatter_smooth_seen_series.insert(series_index);
+            *scatter_smooth_updated = true;
+        }
     }
     Ok(())
 }
@@ -10629,15 +10626,15 @@ fn write_chart_title_with_text<R: BufRead, W: Write>(
             }
             Ok(Event::Empty(e)) => {
                 if skip_depth.is_none() && !(depth == 0 && local_name(e.name().as_ref()) == b"tx") {
-                    if depth == 0
-                        && local_name(e.name().as_ref()) == b"overlay"
-                        && title_overlay.is_some()
-                    {
-                        let edited = start_with_replaced_attr(
-                            &e,
-                            b"val",
-                            bool_xml_value(title_overlay.unwrap()),
-                        )?;
+                    if depth == 0 && local_name(e.name().as_ref()) == b"overlay" {
+                        let Some(title_overlay) = title_overlay else {
+                            writer
+                                .write_event(Event::Empty(e.into_owned()))
+                                .map_err(|e| e.to_string())?;
+                            continue;
+                        };
+                        let edited =
+                            start_with_replaced_attr(&e, b"val", bool_xml_value(title_overlay))?;
                         writer
                             .write_event(Event::Empty(edited))
                             .map_err(|e| e.to_string())?;

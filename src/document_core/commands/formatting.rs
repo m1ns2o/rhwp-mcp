@@ -794,10 +794,10 @@ impl DocumentCore {
                 let single_line = (a2 & 0x03) != 0;
                 let auto_space_kr_en = raw_ps
                     .and_then(|r| r.auto_spacing_easian_eng)
-                    .unwrap_or_else(|| ((a2 >> 4) & 1 != 0) || ((a1 >> 20) & 1 != 0));
+                    .unwrap_or(((a2 >> 4) & 1 != 0) || ((a1 >> 20) & 1 != 0));
                 let auto_space_kr_num = raw_ps
                     .and_then(|r| r.auto_spacing_easian_num)
-                    .unwrap_or_else(|| ((a2 >> 5) & 1 != 0) || ((a1 >> 21) & 1 != 0));
+                    .unwrap_or(((a2 >> 5) & 1 != 0) || ((a1 >> 21) & 1 != 0));
                 // verticalAlign: attr1 bits 20-21 (autoSpacing과 충돌 시 0)
                 let vertical_align = if !auto_space_kr_en && !auto_space_kr_num {
                     (a1 >> 20) & 0x03

@@ -937,7 +937,7 @@ pub fn apply_rhwp_chart_data_semantic(chart: &mut ChartShape) -> bool {
         .get("title")
         .and_then(|raw| raw.as_str())
         .map(|title| title.to_string());
-    chart.legend = value.get("legend").and_then(|raw| {
+    chart.legend = value.get("legend").map(|raw| {
         let position = raw
             .get("position")
             .and_then(|value| value.as_str())
@@ -947,7 +947,7 @@ pub fn apply_rhwp_chart_data_semantic(chart: &mut ChartShape) -> bool {
             .get("visible")
             .and_then(|value| value.as_bool())
             .unwrap_or(true);
-        Some(Legend { position, visible })
+        Legend { position, visible }
     });
     chart.x_axis = value
         .get("xAxis")

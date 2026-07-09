@@ -386,7 +386,7 @@ impl ToolRuntime {
                 let page = opt_u32(&args, "page").unwrap_or(0);
                 #[cfg(not(target_arch = "wasm32"))]
                 {
-                    return session
+                    session
                         .core
                         .render_page_png_from_svg_native_with_overflows(page)
                         .map(|(png, width, height, overflows)| {
@@ -407,7 +407,7 @@ impl ToolRuntime {
                                 "document_layout_overflow_count": overflows.len(),
                             })
                         })
-                        .map_err(|e| e.to_string());
+                        .map_err(|e| e.to_string())
                 }
                 #[cfg(target_arch = "wasm32")]
                 {
