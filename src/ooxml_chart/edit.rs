@@ -1766,7 +1766,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         limit,
-                        &line_marker_seen_series,
+                        &mut line_marker_seen_series,
                         &mut line_marker_symbol_seen_series,
                         &mut line_marker_size_seen_series,
                         &mut line_marker_style_seen_series,
@@ -2008,7 +2008,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         limit,
-                        &scatter_marker_seen_series,
+                        &mut scatter_marker_seen_series,
                         &mut scatter_marker_symbol_seen_series,
                         &mut scatter_marker_size_seen_series,
                         &mut scatter_marker_style_seen_series,
@@ -3146,7 +3146,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         limit,
-                        &line_marker_seen_series,
+                        &mut line_marker_seen_series,
                         &mut line_marker_symbol_seen_series,
                         &mut line_marker_size_seen_series,
                         &mut line_marker_style_seen_series,
@@ -3238,7 +3238,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         limit,
-                        &scatter_marker_seen_series,
+                        &mut scatter_marker_seen_series,
                         &mut scatter_marker_symbol_seen_series,
                         &mut scatter_marker_size_seen_series,
                         &mut scatter_marker_style_seen_series,
@@ -4617,7 +4617,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         2,
-                        &line_marker_seen_series,
+                        &mut line_marker_seen_series,
                         &mut line_marker_symbol_seen_series,
                         &mut line_marker_size_seen_series,
                         &mut line_marker_style_seen_series,
@@ -4666,7 +4666,7 @@ pub fn update_chart_xml(xml: &[u8], update: &ChartXmlUpdate) -> Result<Vec<u8>, 
                         update,
                         current_ser,
                         2,
-                        &scatter_marker_seen_series,
+                        &mut scatter_marker_seen_series,
                         &mut scatter_marker_symbol_seen_series,
                         &mut scatter_marker_size_seen_series,
                         &mut scatter_marker_style_seen_series,
@@ -6251,7 +6251,7 @@ fn write_missing_line_series_children_until<W: Write>(
     update: &ChartXmlUpdate,
     current_ser: Option<usize>,
     limit: u8,
-    line_marker_seen_series: &BTreeSet<usize>,
+    line_marker_seen_series: &mut BTreeSet<usize>,
     line_marker_symbol_seen_series: &mut BTreeSet<usize>,
     line_marker_size_seen_series: &mut BTreeSet<usize>,
     line_marker_style_seen_series: &mut BTreeSet<usize>,
@@ -6288,6 +6288,7 @@ fn write_missing_line_series_children_until<W: Write>(
         if has_line_marker_style_update(update) {
             line_marker_style_seen_series.insert(series_index);
         }
+        line_marker_seen_series.insert(series_index);
     }
     if limit >= 1 && has_trendline_update(update) && !trendline_seen_series.contains(&series_index)
     {
@@ -7023,7 +7024,7 @@ fn write_missing_scatter_series_children_until<W: Write>(
     update: &ChartXmlUpdate,
     current_ser: Option<usize>,
     limit: u8,
-    scatter_marker_seen_series: &BTreeSet<usize>,
+    scatter_marker_seen_series: &mut BTreeSet<usize>,
     scatter_marker_symbol_seen_series: &mut BTreeSet<usize>,
     scatter_marker_size_seen_series: &mut BTreeSet<usize>,
     scatter_marker_style_seen_series: &mut BTreeSet<usize>,
@@ -7060,6 +7061,7 @@ fn write_missing_scatter_series_children_until<W: Write>(
         if has_scatter_marker_style_update(update) {
             scatter_marker_style_seen_series.insert(series_index);
         }
+        scatter_marker_seen_series.insert(series_index);
     }
     if limit >= 1 && has_trendline_update(update) && !trendline_seen_series.contains(&series_index)
     {

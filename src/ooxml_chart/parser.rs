@@ -1855,7 +1855,7 @@ mod tests {
         assert_eq!(c.series[0].format_code.as_deref(), Some("#,##0"));
         assert_eq!(c.series[1].name, "건수");
         assert_eq!(c.series[1].series_type, OoxmlChartType::Line);
-        assert_eq!(c.series[1].color, Some(0x4472C4));
+        assert_eq!(c.series[1].line_color, Some(0x4472C4));
         assert_eq!(c.series[1].axis_group, 1);
         assert!(c.has_secondary_axis);
         assert!(c.is_combo());

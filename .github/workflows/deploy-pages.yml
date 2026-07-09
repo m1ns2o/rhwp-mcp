@@ -63,11 +63,13 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 24
+          cache: npm
+          cache-dependency-path: rhwp-studio/package-lock.json
 
       - name: Install dependencies
         working-directory: rhwp-studio
-        run: npm install
+        run: npm ci
 
       - name: Copy WASM to public
         run: |
@@ -79,7 +81,7 @@ jobs:
 
       - name: Build rhwp-studio
         working-directory: rhwp-studio
-        run: npx vite build --base=/rhwp/
+        run: npx vite build --base=/rhwp-mcp/
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
