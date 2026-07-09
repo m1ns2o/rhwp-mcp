@@ -12,6 +12,29 @@ fn json_number(json: &str, key: &str) -> f64 {
     rest[..end].parse::<f64>().expect("json number parse")
 }
 
+fn marker_hit_point(
+    doc: &HwpDocument,
+    section: usize,
+    para: usize,
+    left_offset: usize,
+    right_offset: usize,
+) -> (f64, f64, String, String) {
+    let marker_left = doc
+        .get_cursor_rect_native(section, para, left_offset)
+        .expect("marker left rect");
+    let marker_right = doc
+        .get_cursor_rect_native(section, para, right_offset)
+        .expect("marker right rect");
+    let left_x = json_number(&marker_left, "x");
+    let right_x = json_number(&marker_right, "x");
+    assert!(
+        right_x > left_x,
+        "marker right caret should be after left caret: left={marker_left}, right={marker_right}"
+    );
+    let y = json_number(&marker_left, "y") + json_number(&marker_left, "height") / 2.0;
+    ((left_x + right_x) / 2.0, y, marker_left, marker_right)
+}
+
 #[test]
 fn issue_598_body_footnote_marker_has_hit_and_cursor_unit() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("samples/footnote-01.hwp");
@@ -20,27 +43,15 @@ fn issue_598_body_footnote_marker_has_hit_and_cursor_unit() {
 
     assert_eq!(doc.get_control_text_positions(0, 3), "[7]");
 
+    let (marker_x, marker_y, _marker_left, _marker_right) = marker_hit_point(&doc, 0, 3, 7, 8);
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 264.0, 392.0)
+        .hit_test_body_footnote_marker_native(0, marker_x, marker_y)
         .expect("hit body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"sectionIndex\":0"), "hit json: {hit}");
     assert!(hit.contains("\"paragraphIndex\":3"), "hit json: {hit}");
     assert!(hit.contains("\"controlIndex\":0"), "hit json: {hit}");
     assert!(hit.contains("\"footnoteIndex\":0"), "hit json: {hit}");
-
-    let marker_left = doc
-        .get_cursor_rect_native(0, 3, 7)
-        .expect("marker left rect");
-    let marker_right = doc
-        .get_cursor_rect_native(0, 3, 8)
-        .expect("marker right rect");
-    let left_x = json_number(&marker_left, "x");
-    let right_x = json_number(&marker_right, "x");
-    assert!(
-        right_x > left_x,
-        "marker right caret should be after left caret: left={marker_left}, right={marker_right}"
-    );
 
     let next = doc.navigate_next_editable_wasm(0, 3, 7, 1, "[]");
     assert!(next.contains("\"charOffset\":8"), "next json: {next}");
@@ -56,8 +67,9 @@ fn issue_598_second_body_footnote_marker_has_same_cursor_unit() {
 
     assert_eq!(doc.get_control_text_positions(0, 7), "[6]");
 
+    let (marker_x, marker_y, marker_left, marker_right) = marker_hit_point(&doc, 0, 7, 6, 7);
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 214.0, 684.0)
+        .hit_test_body_footnote_marker_native(0, marker_x, marker_y)
         .expect("hit second body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"paragraphIndex\":7"), "hit json: {hit}");
@@ -69,17 +81,13 @@ fn issue_598_second_body_footnote_marker_has_same_cursor_unit() {
     let prev = doc.navigate_next_editable_wasm(0, 7, 7, -1, "[]");
     assert!(prev.contains("\"charOffset\":6"), "prev json: {prev}");
 
-    let marker_left = doc
-        .get_cursor_rect_native(0, 7, 6)
-        .expect("second marker left rect");
-    let marker_right = doc
-        .get_cursor_rect_native(0, 7, 7)
-        .expect("second marker right rect");
-    let left_x = json_number(&marker_left, "x");
-    let right_x = json_number(&marker_right, "x");
     assert!(
-        right_x > left_x,
-        "second marker right caret should be after left caret: left={marker_left}, right={marker_right}"
+        marker_left.contains("\"pageIndex\":0"),
+        "left rect: {marker_left}"
+    );
+    assert!(
+        marker_right.contains("\"pageIndex\":0"),
+        "right rect: {marker_right}"
     );
 }
 
