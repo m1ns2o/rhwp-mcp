@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "description": "Representative HWPX package-drift policy for the rhwp-mcp external surface comparison. This policy classifies known semantic-equivalent drift separately from visual/text/profile regressions.",
+  "cases": [
+    {
+      "name": "government_same_edit_hwpx",
+      "label": "Government HWPX same-edit output",
+      "summary_key": "same_edit_hwpx",
+      "semantic_requirements": ["text_equal", "profile_equal", "style_signature_equal"],
+      "require_equal_page_count": true,
+      "visual_diff_field": "visual_diff_changed_percent",
+      "max_visual_diff_changed_percent": 0.0001,
+      "allowed_package_drift_statuses": ["semantic_equal_lexical_package_drift"],
+      "allowed_package_compare_drift_statuses": ["structural_equal_package_drift"],
+      "allowed_structural_drift_keys": [],
+      "exact_structural_drift_keys": true,
+      "intent": "The government same-edit outputs should be visually and semantically equal; raw package differences may only be lexical/XML serialization drift."
+    },
+    {
+      "name": "business_same_edit_hwpx",
+      "label": "Business overview HWPX same-edit output",
+      "summary_key": "business_same_edit_hwpx",
+      "semantic_requirements": ["text_equal", "profile_equal", "style_signature_equal"],
+      "require_equal_page_count": true,
+      "visual_diff_field": "visual_diff_changed_percent",
+      "max_visual_diff_changed_percent": 0.0001,
+      "allowed_package_drift_statuses": ["semantic_equal_line_segment_package_drift"],
+      "allowed_package_compare_drift_statuses": ["line_segment_only_package_drift"],
+      "allowed_structural_drift_keys": ["line_segment_count"],
+      "exact_structural_drift_keys": true,
+      "intent": "The compact business same-edit outputs should be visually and semantically equal; raw package drift is limited to line-segment preservation."
+    },
+    {
+      "name": "foreign_investment_same_edit_hwpx",
+      "label": "Foreign-investment HWPX same-edit output",
+      "summary_key": "foreign_investment_same_edit_hwpx",
+      "semantic_requirements": ["text_equal", "profile_equal", "style_signature_equal"],
+      "required_local_layout_policy": "preserve_source_line_segments",
+      "require_equal_page_count": true,
+      "visual_diff_field": "target_visual_diff_changed_percent",
+      "max_visual_diff_changed_percent": 0.0001,
+      "render_geometry_field": "target_render_geometry_max_disp",
+      "max_render_geometry_disp": 0.001,
+      "allowed_package_drift_statuses": ["structural_package_difference"],
+      "allowed_package_compare_drift_statuses": ["structural_package_difference"],
+      "allowed_structural_drift_keys": ["run_count"],
+      "exact_structural_drift_keys": true,
+      "intent": "The long-form foreign-investment same-edit outputs should preserve pages, target-page pixels, geometry, text/profile/style signatures, and only expose run-count package drift."
+    }
+  ]
+}

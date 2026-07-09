@@ -1,7 +1,7 @@
 //! OOXML 차트 → SVG 네이티브 렌더러
 //!
 //! `OoxmlChart` 데이터 모델을 지정된 bbox 안에 SVG 문자열로 그린다.
-//! - 세로/가로 막대, 꺾은선, 원형
+//! - 세로/가로 막대, 꺾은선, 원형, 분산형(라인 근사), 주식형(HLC/OHLC glyph와 up/down bar 스타일)
 //! - **콤보 차트** (bar + line) 및 **이중 Y축** 지원
 
 use super::{BarGrouping, OoxmlChart, OoxmlChartType, OoxmlSeries};
@@ -126,7 +126,10 @@ pub fn render_chart_svg(chart: &OoxmlChart, x: f64, y: f64, w: f64, h: f64) -> S
             OoxmlChartType::Bar => {
                 render_bars(&mut svg, chart, plot_x, plot_y, plot_w, plot_h, true)
             }
-            OoxmlChartType::Line => render_line(&mut svg, chart, plot_x, plot_y, plot_w, plot_h),
+            OoxmlChartType::Line | OoxmlChartType::Scatter => {
+                render_line(&mut svg, chart, plot_x, plot_y, plot_w, plot_h)
+            }
+            OoxmlChartType::Stock => render_stock(&mut svg, chart, plot_x, plot_y, plot_w, plot_h),
             _ => {}
         }
     }
@@ -155,6 +158,10 @@ fn render_fallback(chart: &OoxmlChart, x: f64, y: f64, w: f64, h: f64) -> String
 
 fn series_color(s: &OoxmlSeries, idx: usize) -> String {
     color_hex(s.color.unwrap_or_else(|| palette(idx)))
+}
+
+fn series_line_color(s: &OoxmlSeries, idx: usize) -> String {
+    color_hex(s.line_color.or(s.color).unwrap_or_else(|| palette(idx)))
 }
 
 /// 지정한 axis_group의 최대 라벨 길이(문자 수) 기반으로 여백 추정
@@ -393,13 +400,9 @@ fn category_positive_sum(chart: &OoxmlChart, ci: usize) -> f64 {
 // ---------------- Line (단일 축) ----------------
 
 fn render_line(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, ph: f64) {
-    let (vmin, vmax) = value_range(chart);
-    let max_len = chart
-        .series
-        .iter()
-        .map(|s| s.values.len())
-        .max()
-        .unwrap_or(0);
+    let (line_values, percent) = line_values_for_render(chart);
+    let (vmin, vmax) = line_value_range(&line_values, percent);
+    let max_len = line_values.iter().map(Vec::len).max().unwrap_or(0);
     if max_len < 2 {
         return;
     }
@@ -419,14 +422,15 @@ fn render_line(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, 
         chart.series.first().and_then(|s| s.format_code.as_deref()),
         false,
         false,
-        false,
+        percent,
     );
 
     let step = pw / (max_len - 1).max(1) as f64;
-    for (si, ser) in chart.series.iter().enumerate() {
-        let color = series_color(ser, si);
+    for (si, (ser, values)) in chart.series.iter().zip(line_values.iter()).enumerate() {
+        let color = series_line_color(ser, si);
+        let line_width = line_width_from_emu(ser.line_width).max(2.0);
         let mut d = String::new();
-        for (i, &v) in ser.values.iter().enumerate() {
+        for (i, &v) in values.iter().enumerate() {
             let t = if vmax > vmin {
                 (v - vmin) / (vmax - vmin)
             } else {
@@ -442,13 +446,260 @@ fn render_line(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, 
             ));
         }
         svg.push_str(&format!(
-            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2\"/>\n",
+            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\"/>\n",
             d.trim(),
-            color
+            color,
+            line_width
         ));
     }
 
     render_category_labels(svg, chart, px, py, pw, ph, max_len, false);
+}
+
+fn line_values_for_render(chart: &OoxmlChart) -> (Vec<Vec<f64>>, bool) {
+    if chart.grouping == BarGrouping::Clustered {
+        return (
+            chart
+                .series
+                .iter()
+                .map(|series| series.values.clone())
+                .collect(),
+            false,
+        );
+    }
+
+    let max_len = chart
+        .series
+        .iter()
+        .map(|series| series.values.len())
+        .max()
+        .unwrap_or(0);
+    let percent = chart.grouping == BarGrouping::PercentStacked;
+    let totals: Vec<f64> = (0..max_len)
+        .map(|i| {
+            chart
+                .series
+                .iter()
+                .map(|series| series.values.get(i).copied().unwrap_or(0.0))
+                .sum()
+        })
+        .collect();
+    let mut cumulative = vec![0.0; max_len];
+    let mut rendered = Vec::with_capacity(chart.series.len());
+    for series in &chart.series {
+        let mut values = Vec::with_capacity(max_len);
+        for i in 0..max_len {
+            cumulative[i] += series.values.get(i).copied().unwrap_or(0.0);
+            let value = if percent {
+                let total = totals[i];
+                if total.abs() > f64::EPSILON {
+                    cumulative[i] / total * 100.0
+                } else {
+                    0.0
+                }
+            } else {
+                cumulative[i]
+            };
+            values.push(value);
+        }
+        rendered.push(values);
+    }
+    (rendered, percent)
+}
+
+fn line_value_range(values: &[Vec<f64>], percent: bool) -> (f64, f64) {
+    if percent {
+        return (0.0, 100.0);
+    }
+
+    let mut min = 0.0_f64;
+    let mut max = 0.0_f64;
+    for value in values.iter().flat_map(|series| series.iter().copied()) {
+        min = min.min(value);
+        max = max.max(value);
+    }
+    if max == min {
+        max = min + 1.0;
+    }
+    nice_range(min, max, 5)
+}
+
+// ---------------- Stock (HLC/OHLC, 단일 축) ----------------
+
+fn render_stock(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64, ph: f64) {
+    let (open, high, low, close) = match chart.series.as_slice() {
+        [high, low, close, ..] if chart.series.len() == 3 => (None, high, low, close),
+        [open, high, low, close, ..] => (Some(open), high, low, close),
+        _ => {
+            render_line(svg, chart, px, py, pw, ph);
+            return;
+        }
+    };
+
+    let max_len = chart
+        .categories
+        .len()
+        .max(high.values.len())
+        .max(low.values.len())
+        .max(close.values.len())
+        .max(open.map(|series| series.values.len()).unwrap_or(0));
+    if max_len == 0 {
+        return;
+    }
+
+    let (vmin, vmax) = value_range(chart);
+    let y_for = |v: f64| -> f64 {
+        let t = if vmax > vmin {
+            (v - vmin) / (vmax - vmin)
+        } else {
+            0.0
+        };
+        py + ph - ph * t
+    };
+    let stroke_for = |open_v: Option<f64>, close_v: f64| -> String {
+        match open_v {
+            Some(open_v) if close_v < open_v => color_hex(
+                chart
+                    .stock_down_bar_line_color
+                    .or(chart.stock_down_bar_fill_color)
+                    .unwrap_or(0xc62828),
+            ),
+            Some(open_v) if close_v > open_v => color_hex(
+                chart
+                    .stock_up_bar_line_color
+                    .or(chart.stock_up_bar_fill_color)
+                    .unwrap_or(0x2e7d32),
+            ),
+            _ => "#444444".to_string(),
+        }
+    };
+    let body_style_for = |open_v: f64, close_v: f64| -> (String, String, f64, &'static str) {
+        if close_v < open_v {
+            let fill = chart.stock_down_bar_fill_color.unwrap_or(0xc62828);
+            let stroke = chart
+                .stock_down_bar_line_color
+                .or(chart.stock_down_bar_fill_color)
+                .unwrap_or(0xc62828);
+            (
+                color_hex(fill),
+                color_hex(stroke),
+                line_width_from_emu(chart.stock_down_bar_line_width),
+                "hwp-ooxml-stock-down-bar",
+            )
+        } else if close_v > open_v {
+            let fill = chart.stock_up_bar_fill_color.unwrap_or(0x2e7d32);
+            let stroke = chart
+                .stock_up_bar_line_color
+                .or(chart.stock_up_bar_fill_color)
+                .unwrap_or(0x2e7d32);
+            (
+                color_hex(fill),
+                color_hex(stroke),
+                line_width_from_emu(chart.stock_up_bar_line_width),
+                "hwp-ooxml-stock-up-bar",
+            )
+        } else {
+            (
+                "#444444".to_string(),
+                "#444444".to_string(),
+                1.0,
+                "hwp-ooxml-stock-flat-bar",
+            )
+        }
+    };
+
+    svg.push_str(&format!(
+        "<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"#ffffff\" stroke=\"#cccccc\" stroke-width=\"0.5\"/>\n",
+        px, py, pw, ph
+    ));
+    render_value_grid(
+        svg,
+        px,
+        py,
+        pw,
+        ph,
+        vmin,
+        vmax,
+        chart.series.first().and_then(|s| s.format_code.as_deref()),
+        false,
+        false,
+        false,
+    );
+
+    let cat_span = pw / max_len.max(1) as f64;
+    let tick = (cat_span * 0.28).clamp(3.0, 12.0);
+    let gap = chart.stock_up_down_bar_gap_width.unwrap_or(150).min(500) as f64;
+    let body_ratio = (100.0 / (100.0 + gap)).clamp(0.12, 0.75);
+    let body_w = (cat_span * body_ratio)
+        .max(4.0)
+        .min((cat_span * 0.8).max(4.0));
+    for i in 0..max_len {
+        let Some(high_v) = high.values.get(i).copied() else {
+            continue;
+        };
+        let Some(low_v) = low.values.get(i).copied() else {
+            continue;
+        };
+        let Some(close_v) = close.values.get(i).copied() else {
+            continue;
+        };
+        let open_v = open.and_then(|series| series.values.get(i).copied());
+        let hi = high_v.max(low_v);
+        let lo = high_v.min(low_v);
+        let x = px + cat_span * i as f64 + cat_span / 2.0;
+        let y_hi = y_for(hi);
+        let y_lo = y_for(lo);
+        let y_close = y_for(close_v);
+        let stroke = stroke_for(open_v, close_v);
+
+        svg.push_str(&format!(
+            "<line class=\"hwp-ooxml-stock-high-low\" x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n",
+            x, y_hi, x, y_lo, stroke
+        ));
+
+        if let Some(open_v) = open_v {
+            let y_open = y_for(open_v);
+            let y_body = y_open.min(y_close);
+            let body_h = (y_open - y_close).abs().max(1.0);
+            let (fill, body_stroke, body_stroke_width, bar_class) = body_style_for(open_v, close_v);
+            svg.push_str(&format!(
+                "<rect class=\"hwp-ooxml-stock-body {}\" x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"{}\" fill-opacity=\"0.45\" stroke=\"{}\" stroke-width=\"{:.2}\"/>\n",
+                bar_class,
+                x - body_w / 2.0,
+                y_body,
+                body_w,
+                body_h,
+                fill,
+                body_stroke,
+                body_stroke_width
+            ));
+            svg.push_str(&format!(
+                "<line class=\"hwp-ooxml-stock-open\" x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n",
+                x - tick,
+                y_open,
+                x,
+                y_open,
+                stroke
+            ));
+        }
+
+        svg.push_str(&format!(
+            "<line class=\"hwp-ooxml-stock-close\" x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1.5\" stroke-linecap=\"round\"/>\n",
+            x,
+            y_close,
+            x + tick,
+            y_close,
+            stroke
+        ));
+    }
+
+    render_category_labels(svg, chart, px, py, pw, ph, max_len, false);
+}
+
+fn line_width_from_emu(width: Option<u32>) -> f64 {
+    width
+        .map(|w| (w as f64 / 12700.0).clamp(0.5, 4.0))
+        .unwrap_or(1.0)
 }
 
 // ---------------- Pie ----------------
@@ -542,7 +793,12 @@ fn render_combo(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64,
         .series
         .iter()
         .enumerate()
-        .filter(|(_, s)| s.series_type == OoxmlChartType::Line)
+        .filter(|(_, s)| {
+            matches!(
+                s.series_type,
+                OoxmlChartType::Line | OoxmlChartType::Scatter | OoxmlChartType::Stock
+            )
+        })
         .collect();
 
     let cat_span = pw / cat_count as f64;
@@ -596,7 +852,8 @@ fn render_combo(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64,
         } else {
             (pri_min, pri_max)
         };
-        let color = series_color(ser, *si);
+        let color = series_line_color(ser, *si);
+        let line_width = line_width_from_emu(ser.line_width).max(2.5);
         let mut d = String::new();
         let mut points: Vec<(f64, f64)> = Vec::new();
         for (i, &v) in ser.values.iter().enumerate() {
@@ -625,8 +882,8 @@ fn render_combo(svg: &mut String, chart: &OoxmlChart, px: f64, py: f64, pw: f64,
             d.trim()
         ));
         svg.push_str(&format!(
-            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"2.5\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>\n",
-            d.trim(), color
+            "<path d=\"{}\" fill=\"none\" stroke=\"{}\" stroke-width=\"{:.2}\" stroke-linejoin=\"round\" stroke-linecap=\"round\"/>\n",
+            d.trim(), color, line_width
         ));
         // 데이터 포인트 마커
         for (xp, yp) in &points {
@@ -789,7 +1046,10 @@ fn render_legend(svg: &mut String, chart: &OoxmlChart, x: f64, y: f64, w: f64, _
         let ix = start_x + item_w * i as f64;
         let cy = y + 11.0;
         // 라인 시리즈는 작은 선 + 점, 막대/파이는 사각형
-        if *stype == OoxmlChartType::Line {
+        if matches!(
+            *stype,
+            OoxmlChartType::Line | OoxmlChartType::Scatter | OoxmlChartType::Stock
+        ) {
             svg.push_str(&format!(
                 "<line x1=\"{:.2}\" y1=\"{:.2}\" x2=\"{:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"2\"/>\n",
                 ix, cy, ix + 14.0, cy, color_hex(*color)
@@ -873,6 +1133,131 @@ mod tests {
     }
 
     #[test]
+    fn test_render_stock_hlc_glyphs() {
+        let chart = OoxmlChart {
+            chart_type: OoxmlChartType::Stock,
+            series: vec![
+                OoxmlSeries {
+                    name: "고가".into(),
+                    values: vec![55.0, 57.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "저가".into(),
+                    values: vec![11.0, 12.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "종가".into(),
+                    values: vec![32.0, 35.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+            ],
+            categories: vec!["1 월".into(), "2 월".into()],
+            ..Default::default()
+        };
+        let svg = render_chart_svg(&chart, 0.0, 0.0, 400.0, 300.0);
+        assert!(svg.contains("hwp-ooxml-stock-high-low"));
+        assert!(svg.contains("hwp-ooxml-stock-close"));
+        assert!(!svg.contains("hwp-ooxml-stock-open"));
+        assert!(!svg.contains("<path"));
+    }
+
+    #[test]
+    fn test_render_stock_ohlc_glyphs() {
+        let chart = OoxmlChart {
+            chart_type: OoxmlChartType::Stock,
+            series: vec![
+                OoxmlSeries {
+                    name: "시가".into(),
+                    values: vec![44.0, 22.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "고가".into(),
+                    values: vec![55.0, 57.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "저가".into(),
+                    values: vec![11.0, 12.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "종가".into(),
+                    values: vec![32.0, 35.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+            ],
+            categories: vec!["1 월".into(), "2 월".into()],
+            ..Default::default()
+        };
+        let svg = render_chart_svg(&chart, 0.0, 0.0, 400.0, 300.0);
+        assert!(svg.contains("hwp-ooxml-stock-high-low"));
+        assert!(svg.contains("hwp-ooxml-stock-open"));
+        assert!(svg.contains("hwp-ooxml-stock-close"));
+        assert!(svg.contains("hwp-ooxml-stock-body"));
+    }
+
+    #[test]
+    fn test_render_stock_up_down_bar_styles() {
+        let chart = OoxmlChart {
+            chart_type: OoxmlChartType::Stock,
+            series: vec![
+                OoxmlSeries {
+                    name: "시가".into(),
+                    values: vec![40.0, 45.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "고가".into(),
+                    values: vec![55.0, 60.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "저가".into(),
+                    values: vec![30.0, 35.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    name: "종가".into(),
+                    values: vec![50.0, 38.0],
+                    series_type: OoxmlChartType::Stock,
+                    ..Default::default()
+                },
+            ],
+            categories: vec!["1 월".into(), "2 월".into()],
+            stock_up_down_bar_gap_width: Some(75),
+            stock_up_bar_fill_color: Some(0x00B050),
+            stock_down_bar_fill_color: Some(0xC00000),
+            stock_up_bar_line_color: Some(0x006100),
+            stock_down_bar_line_color: Some(0x660000),
+            stock_up_bar_line_width: Some(19050),
+            stock_down_bar_line_width: Some(25400),
+            ..Default::default()
+        };
+        let svg = render_chart_svg(&chart, 0.0, 0.0, 400.0, 300.0);
+        assert!(svg.contains("hwp-ooxml-stock-up-bar"));
+        assert!(svg.contains("hwp-ooxml-stock-down-bar"));
+        assert!(svg.contains("fill=\"#00b050\""));
+        assert!(svg.contains("fill=\"#c00000\""));
+        assert!(svg.contains("stroke=\"#006100\""));
+        assert!(svg.contains("stroke=\"#660000\""));
+        assert!(svg.contains("stroke-width=\"1.50\""));
+        assert!(svg.contains("stroke-width=\"2.00\""));
+    }
+
+    #[test]
     fn test_format_num() {
         assert_eq!(format_num(1234.0, Some("#,##0")), "1,234");
         assert_eq!(format_num(-1234567.0, Some("#,##0")), "-1,234,567");
@@ -943,6 +1328,36 @@ mod tests {
         }
     }
 
+    fn line_chart(grouping: BarGrouping) -> OoxmlChart {
+        OoxmlChart {
+            chart_type: OoxmlChartType::Line,
+            grouping,
+            series: vec![
+                OoxmlSeries {
+                    values: vec![4.0, 3.0],
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    values: vec![2.0, 1.0],
+                    ..Default::default()
+                },
+                OoxmlSeries {
+                    values: vec![2.0, 4.0],
+                    ..Default::default()
+                },
+            ],
+            categories: vec!["a".into(), "b".into()],
+            ..Default::default()
+        }
+    }
+
+    fn line_path_ds(svg: &str) -> Vec<String> {
+        svg.split("<path d=\"")
+            .skip(1)
+            .filter_map(|chunk| chunk.find('"').map(|end| chunk[..end].to_string()))
+            .collect()
+    }
+
     #[test]
     fn test_stacked_bars_share_x_per_category() {
         // 누적: 카테고리(2)당 단일 컬럼 → 서로 다른 x = 2개 (시리즈가 같은 x 공유)
@@ -981,6 +1396,46 @@ mod tests {
             distinct(data_bar_xs(&svg)),
             2,
             "percent도 카테고리당 단일 x"
+        );
+    }
+
+    #[test]
+    fn test_stacked_line_uses_cumulative_values() {
+        let mut svg = String::new();
+        render_line(
+            &mut svg,
+            &line_chart(BarGrouping::Stacked),
+            0.0,
+            0.0,
+            100.0,
+            80.0,
+        );
+        let paths = line_path_ds(&svg);
+        assert_eq!(paths.len(), 3);
+        assert!(
+            paths[2].starts_with("M0.00,0.00 "),
+            "third stacked series should start at the cumulative top: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn test_percent_stacked_line_uses_percent_axis() {
+        let mut svg = String::new();
+        render_line(
+            &mut svg,
+            &line_chart(BarGrouping::PercentStacked),
+            0.0,
+            0.0,
+            100.0,
+            80.0,
+        );
+        assert!(svg.contains("100%"), "percentStacked line uses % axis");
+        assert!(svg.contains("0%"));
+        let paths = line_path_ds(&svg);
+        assert_eq!(paths.len(), 3);
+        assert!(
+            paths[2].starts_with("M0.00,0.00 "),
+            "third percent-stacked series should reach 100%: {paths:?}"
         );
     }
 }

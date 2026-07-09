@@ -15,7 +15,7 @@
 //! 자신: imgClip, effects, inMargin, imgDim, img
 //!
 //! 한컴 관찰 샘플에서 실제 출력은: offset → orgSz → curSz → flip → rotationInfo →
-//! renderingInfo → imgRect → imgClip → inMargin → imgDim → img → effects → sz → pos → outMargin
+//! renderingInfo → lineShape → imgRect → imgClip → inMargin → imgDim → img → effects → sz → pos → outMargin
 //! (부모 요소들이 자신보다 뒤에 출력됨 — XMLSerializer 구현 특성)
 //!
 //! ## 3-way 단언
@@ -28,11 +28,13 @@ use std::io::Write;
 use quick_xml::Writer;
 
 use crate::model::image::{
-    EffectColor, EffectPoint, EffectRgb, ImageEffect, Picture, PictureShadow,
+    EffectColor, EffectPoint, EffectRange, EffectRgb, ImageEffect, Picture, PictureBlur,
+    PictureEffectChild, PictureFillOverlay, PictureGlow, PictureReflection, PictureShadow,
+    PictureSoftEdge, PictureSolidFill, PictureThreeD,
 };
 use crate::model::shape::{
-    CommonObjAttr, HorzAlign, HorzRelTo, ShapeComponentAttr, TextFlow, TextWrap, VertAlign,
-    VertRelTo,
+    CommonObjAttr, HorzAlign, HorzRelTo, ObjectNumberingType, ShapeComponentAttr, SizeCriterion,
+    TextFlow, TextWrap, VertAlign, VertRelTo,
 };
 
 use super::context::SerializeContext;
@@ -55,10 +57,16 @@ pub fn write_picture<W: Write>(
     // href, groupLevel, instid, reverse
     let id_str = pic.common.instance_id.to_string();
     let z_order = pic.common.z_order.to_string();
+    let numbering_type = picture_numbering_type_str(
+        pic.common.numbering_type,
+        pic.common.numbering_type_explicit,
+    );
     let tw = text_wrap_str(pic.common.text_wrap);
     let tf = text_flow_str(pic.common.text_flow);
+    let dropcap_style = pic.common.dropcap_style.as_deref().unwrap_or("None");
     let instid = pic.instance_id.to_string();
     let href = pic.href.as_deref().unwrap_or("");
+    let group_level = pic.shape_attr.group_level.to_string();
 
     start_tag_attrs(
         w,
@@ -66,21 +74,21 @@ pub fn write_picture<W: Write>(
         &[
             ("id", &id_str),
             ("zOrder", &z_order),
-            ("numberingType", "PICTURE"),
+            ("numberingType", numbering_type),
             ("textWrap", tw),
             ("textFlow", tf),
-            ("lock", "0"),
-            ("dropcapstyle", "None"),
+            ("lock", bool01(pic.common.lock)),
+            ("dropcapstyle", dropcap_style),
             ("href", href),
-            ("groupLevel", "0"),
+            ("groupLevel", &group_level),
             ("instid", &instid),
             ("reverse", "0"),
         ],
     )?;
 
     // --- 자식 순서 (한컴 관찰 샘플 기준) ---
-    // offset, orgSz, curSz, flip, rotationInfo, renderingInfo, imgRect, imgClip,
-    // inMargin, imgDim, img, effects, sz, pos, outMargin
+    // offset, orgSz, curSz, flip, rotationInfo, renderingInfo, lineShape, imgRect,
+    // imgClip, inMargin, imgDim, img, effects, sz, pos, outMargin
     write_offset(w, &pic.common)?;
     write_org_sz(w, &pic.shape_attr)?;
     write_cur_sz(w, pic)?;
@@ -89,6 +97,7 @@ pub fn write_picture<W: Write>(
     // [#1501] 그룹 자식 pic 의 transMatrix(render_tx/sx) 보존 — 종전 identity 고정 출력은
     // 그룹 내 자식을 원점·고유크기로 붕괴시켰다. shape.rs 의 raw_rendering 디코더 공유.
     super::shape::write_rendering_info(w, &pic.shape_attr)?;
+    write_line_shape(w, pic)?;
     write_img_rect(w, pic)?;
     write_img_clip(w, pic)?;
     write_in_margin(w, pic)?;
@@ -110,6 +119,20 @@ pub fn write_picture<W: Write>(
 }
 
 // ---------- 자식 요소 ----------
+
+fn write_line_shape<W: Write>(w: &mut Writer<W>, pic: &Picture) -> Result<(), SerializeError> {
+    let mut line = pic.border_attr;
+    if pic.border_color != 0 || pic.border_width != 0 {
+        line.color = pic.border_color;
+        line.width = pic.border_width;
+    }
+
+    if line.color == 0 && line.width == 0 && line.attr == 0 && line.outline_style == 0 {
+        return Ok(());
+    }
+
+    super::shape::write_line_shape(w, &line)
+}
 
 fn write_offset<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let x = c.horizontal_offset.to_string();
@@ -285,8 +308,222 @@ fn write_effects<W: Write>(w: &mut Writer<W>, pic: &Picture) -> Result<(), Seria
     if let Some(shadow) = &pic.effects.shadow {
         write_shadow(w, shadow)?;
     }
+    if let Some(glow) = &pic.effects.glow {
+        write_glow(w, glow)?;
+    }
+    if let Some(soft_edge) = &pic.effects.soft_edge {
+        write_soft_edge(w, soft_edge)?;
+    }
+    if let Some(reflection) = &pic.effects.reflection {
+        write_reflection(w, reflection)?;
+    }
+    if let Some(three_d) = &pic.effects.three_d {
+        write_three_d(w, three_d)?;
+    }
+    if let Some(blur) = &pic.effects.blur {
+        write_blur(w, blur)?;
+    }
+    if let Some(fill_overlay) = &pic.effects.fill_overlay {
+        write_fill_overlay(w, fill_overlay)?;
+    }
+    for raw in &pic.effects.raw_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
     end_tag(w, "hp:effects")?;
     Ok(())
+}
+
+fn write_glow<W: Write>(w: &mut Writer<W>, glow: &PictureGlow) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "alpha", glow.alpha.as_deref());
+    push_opt_attr(&mut attrs, "radius", glow.radius.as_deref());
+    if glow.color.is_some() || !glow.raw_child_xml.is_empty() {
+        start_tag_attrs(w, "hp:glow", &attrs)?;
+        if let Some(color) = &glow.color {
+            write_effect_color(w, color)?;
+        }
+        for raw in &glow.raw_child_xml {
+            write_raw_effect_xml(w, raw)?;
+        }
+        end_tag(w, "hp:glow")?;
+    } else {
+        empty_tag(w, "hp:glow", &attrs)?;
+    }
+    Ok(())
+}
+
+fn write_soft_edge<W: Write>(
+    w: &mut Writer<W>,
+    soft_edge: &PictureSoftEdge,
+) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "radius", soft_edge.radius.as_deref());
+    if soft_edge.raw_child_xml.is_empty() {
+        empty_tag(w, "hp:softEdge", &attrs)
+    } else {
+        start_tag_attrs(w, "hp:softEdge", &attrs)?;
+        for raw in &soft_edge.raw_child_xml {
+            write_raw_effect_xml(w, raw)?;
+        }
+        end_tag(w, "hp:softEdge")
+    }
+}
+
+fn write_reflection<W: Write>(
+    w: &mut Writer<W>,
+    reflection: &PictureReflection,
+) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "alignStyle", reflection.align_style.as_deref());
+    push_opt_attr(&mut attrs, "radius", reflection.radius.as_deref());
+    push_opt_attr(&mut attrs, "direction", reflection.direction.as_deref());
+    push_opt_attr(&mut attrs, "distance", reflection.distance.as_deref());
+    push_opt_attr(
+        &mut attrs,
+        "rotationStyle",
+        reflection.rotation_style.as_deref(),
+    );
+    push_opt_attr(
+        &mut attrs,
+        "fadeDirection",
+        reflection.fade_direction.as_deref(),
+    );
+
+    if reflection.skew.is_none()
+        && reflection.scale.is_none()
+        && reflection.color.is_none()
+        && reflection.alpha.is_none()
+        && reflection.pos.is_none()
+        && reflection.raw_child_xml.is_empty()
+    {
+        empty_tag(w, "hp:reflection", &attrs)?;
+        return Ok(());
+    }
+
+    start_tag_attrs(w, "hp:reflection", &attrs)?;
+    if let Some(skew) = &reflection.skew {
+        write_effect_point(w, "hp:skew", skew)?;
+    }
+    if let Some(scale) = &reflection.scale {
+        write_effect_point(w, "hp:scale", scale)?;
+    }
+    if let Some(color) = &reflection.color {
+        write_effect_color(w, color)?;
+    }
+    if let Some(alpha) = &reflection.alpha {
+        write_effect_range(w, "hp:alpha", alpha)?;
+    }
+    if let Some(pos) = &reflection.pos {
+        write_effect_range(w, "hp:pos", pos)?;
+    }
+    for raw in &reflection.raw_child_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
+    end_tag(w, "hp:reflection")?;
+    Ok(())
+}
+
+fn write_blur<W: Write>(w: &mut Writer<W>, blur: &PictureBlur) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "radius", blur.radius.as_deref());
+    if blur.raw_child_xml.is_empty() {
+        empty_tag(w, "hp:blur", &attrs)
+    } else {
+        start_tag_attrs(w, "hp:blur", &attrs)?;
+        for raw in &blur.raw_child_xml {
+            write_raw_effect_xml(w, raw)?;
+        }
+        end_tag(w, "hp:blur")
+    }
+}
+
+fn effect_attrs(attrs: &std::collections::BTreeMap<String, String>) -> Vec<(&str, &str)> {
+    attrs
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect()
+}
+
+fn write_effect_child<W: Write>(
+    w: &mut Writer<W>,
+    name: &str,
+    child: &PictureEffectChild,
+) -> Result<(), SerializeError> {
+    empty_tag(w, name, &effect_attrs(&child.attrs))
+}
+
+fn write_three_d<W: Write>(
+    w: &mut Writer<W>,
+    three_d: &PictureThreeD,
+) -> Result<(), SerializeError> {
+    let attrs = effect_attrs(&three_d.attrs);
+    if three_d.bevel.is_none() && three_d.raw_child_xml.is_empty() {
+        empty_tag(w, "hp:threeD", &attrs)?;
+        return Ok(());
+    }
+
+    start_tag_attrs(w, "hp:threeD", &attrs)?;
+    if let Some(bevel) = &three_d.bevel {
+        write_effect_child(w, "hp:bevel", bevel)?;
+    }
+    for raw in &three_d.raw_child_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
+    end_tag(w, "hp:threeD")?;
+    Ok(())
+}
+
+fn write_fill_overlay<W: Write>(
+    w: &mut Writer<W>,
+    fill_overlay: &PictureFillOverlay,
+) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "blend", fill_overlay.blend.as_deref());
+    if fill_overlay.solid_fill.is_none() && fill_overlay.raw_child_xml.is_empty() {
+        empty_tag(w, "hp:fillOverlay", &attrs)?;
+        return Ok(());
+    }
+
+    start_tag_attrs(w, "hp:fillOverlay", &attrs)?;
+    if let Some(solid_fill) = &fill_overlay.solid_fill {
+        write_solid_fill(w, solid_fill)?;
+    }
+    for raw in &fill_overlay.raw_child_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
+    end_tag(w, "hp:fillOverlay")?;
+    Ok(())
+}
+
+fn write_solid_fill<W: Write>(
+    w: &mut Writer<W>,
+    solid_fill: &PictureSolidFill,
+) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "color", solid_fill.color.as_deref());
+    if solid_fill.effect_color.is_none() && solid_fill.raw_child_xml.is_empty() {
+        empty_tag(w, "hp:solidFill", &attrs)?;
+        return Ok(());
+    }
+
+    start_tag_attrs(w, "hp:solidFill", &attrs)?;
+    if let Some(color) = &solid_fill.effect_color {
+        write_effect_color(w, color)?;
+    }
+    for raw in &solid_fill.raw_child_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
+    end_tag(w, "hp:solidFill")?;
+    Ok(())
+}
+
+fn write_raw_effect_xml<W: Write>(w: &mut Writer<W>, raw: &str) -> Result<(), SerializeError> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    w.get_mut()
+        .write_all(raw.as_bytes())
+        .map_err(|e| SerializeError::XmlError(format!("picture raw effects XML: {e}")))
 }
 
 fn write_shadow<W: Write>(w: &mut Writer<W>, shadow: &PictureShadow) -> Result<(), SerializeError> {
@@ -313,6 +550,9 @@ fn write_shadow<W: Write>(w: &mut Writer<W>, shadow: &PictureShadow) -> Result<(
     if let Some(color) = &shadow.color {
         write_effect_color(w, color)?;
     }
+    for raw in &shadow.raw_child_xml {
+        write_raw_effect_xml(w, raw)?;
+    }
     end_tag(w, "hp:shadow")?;
     Ok(())
 }
@@ -328,6 +568,17 @@ fn write_effect_point<W: Write>(
     empty_tag(w, name, &attrs)
 }
 
+fn write_effect_range<W: Write>(
+    w: &mut Writer<W>,
+    name: &str,
+    range: &EffectRange,
+) -> Result<(), SerializeError> {
+    let mut attrs = Vec::new();
+    push_opt_attr(&mut attrs, "start", range.start.as_deref());
+    push_opt_attr(&mut attrs, "end", range.end.as_deref());
+    empty_tag(w, name, &attrs)
+}
+
 fn write_effect_color<W: Write>(
     w: &mut Writer<W>,
     color: &EffectColor,
@@ -338,9 +589,14 @@ fn write_effect_color<W: Write>(
     push_opt_attr(&mut attrs, "systemIdx", color.system_idx.as_deref());
     push_opt_attr(&mut attrs, "presetIdx", color.preset_idx.as_deref());
 
-    if let Some(rgb) = &color.rgb {
+    if color.rgb.is_some() || !color.raw_child_xml.is_empty() {
         start_tag_attrs(w, "hp:effectsColor", &attrs)?;
-        write_effect_rgb(w, rgb)?;
+        if let Some(rgb) = &color.rgb {
+            write_effect_rgb(w, rgb)?;
+        }
+        for raw in &color.raw_child_xml {
+            write_raw_effect_xml(w, raw)?;
+        }
         end_tag(w, "hp:effectsColor")?;
     } else {
         empty_tag(w, "hp:effectsColor", &attrs)?;
@@ -369,15 +625,16 @@ fn push_opt_attr<'a>(
 fn write_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let width = c.width.to_string();
     let height = c.height.to_string();
+    let protect = bool01(c.size_protect);
     empty_tag(
         w,
         "hp:sz",
         &[
             ("width", &width),
-            ("widthRelTo", "ABSOLUTE"),
+            ("widthRelTo", size_criterion_str(c.width_criterion)),
             ("height", &height),
-            ("heightRelTo", "ABSOLUTE"),
-            ("protect", "0"),
+            ("heightRelTo", size_criterion_str(c.height_criterion)),
+            ("protect", protect),
         ],
     )
 }
@@ -386,6 +643,7 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
     let treat = bool01(c.treat_as_char);
     let flow_with_text = bool01(c.flow_with_text);
     let allow_overlap = bool01(c.allow_overlap);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
     empty_tag(
@@ -396,7 +654,7 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
             ("affectLSpacing", "0"),
             ("flowWithText", flow_with_text),
             ("allowOverlap", allow_overlap),
-            ("holdAnchorAndSO", "0"),
+            ("holdAnchorAndSO", hold_anchor),
             ("vertRelTo", vert_rel_to_str(c.vert_rel_to)),
             ("horzRelTo", horz_rel_to_str(c.horz_rel_to)),
             ("vertAlign", vert_align_str(c.vert_align)),
@@ -447,6 +705,25 @@ fn text_flow_str(f: TextFlow) -> &'static str {
         TextFlow::LeftOnly => "LEFT_ONLY",
         TextFlow::RightOnly => "RIGHT_ONLY",
         TextFlow::LargestOnly => "LARGEST_ONLY",
+    }
+}
+
+fn picture_numbering_type_str(n: ObjectNumberingType, explicit: bool) -> &'static str {
+    match n {
+        ObjectNumberingType::Table => "TABLE",
+        ObjectNumberingType::Equation => "EQUATION",
+        ObjectNumberingType::None if explicit => "NONE",
+        ObjectNumberingType::None | ObjectNumberingType::Picture => "PICTURE",
+    }
+}
+
+fn size_criterion_str(value: SizeCriterion) -> &'static str {
+    match value {
+        SizeCriterion::Paper => "PAPER",
+        SizeCriterion::Page => "PAGE",
+        SizeCriterion::Column => "COLUMN",
+        SizeCriterion::Para => "PARA",
+        SizeCriterion::Absolute => "ABSOLUTE",
     }
 }
 
@@ -553,6 +830,42 @@ mod tests {
         assert!(
             xml.contains(r#"<hp:curSz width="1366" height="1268"/>"#),
             "curSz 는 shape_attr.current 사용(sz 아님): {xml}"
+        );
+    }
+
+    #[test]
+    fn picture_group_level_and_explicit_none_numbering_reflect_ir() {
+        let doc = make_doc_with_bin(1, "png");
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut pic = make_picture(1);
+        pic.common.numbering_type = ObjectNumberingType::None;
+        pic.common.numbering_type_explicit = true;
+        pic.shape_attr.group_level = 4;
+
+        let xml = serialize(&pic, &mut ctx);
+
+        assert!(
+            xml.contains(r#"numberingType="NONE""#),
+            "explicit picture numberingType NONE should be preserved: {xml}"
+        );
+        assert!(
+            xml.contains(r#"groupLevel="4""#),
+            "picture groupLevel should preserve ShapeComponentAttr: {xml}"
+        );
+    }
+
+    #[test]
+    fn picture_dropcap_style_reflects_ir() {
+        let doc = make_doc_with_bin(1, "png");
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut pic = make_picture(1);
+        pic.common.dropcap_style = Some("DoubleLine".to_string());
+
+        let xml = serialize(&pic, &mut ctx);
+
+        assert!(
+            xml.contains(r#"dropcapstyle="DoubleLine""#),
+            "picture dropcapstyle should preserve CommonObjAttr value: {xml}"
         );
     }
 
@@ -682,8 +995,8 @@ mod tests {
         let pic = make_picture(5);
         let xml = serialize(&pic, &mut ctx);
         assert!(
-            xml.contains(r#"binaryItemIDRef="image1""#),
-            "binaryItemIDRef must resolve to manifest id image1: {}",
+            xml.contains(r#"binaryItemIDRef="image5""#),
+            "binaryItemIDRef must resolve to manifest id image5: {}",
             xml
         );
     }
@@ -766,6 +1079,7 @@ mod tests {
         assert_eq!(image_effect_str(ImageEffect::RealPic), "REAL_PIC");
         assert_eq!(image_effect_str(ImageEffect::GrayScale), "GRAY_SCALE");
         assert_eq!(image_effect_str(ImageEffect::BlackWhite), "BLACK_WHITE");
+        assert_eq!(image_effect_str(ImageEffect::Pattern8x8), "PATTERN_8_8");
     }
 
     #[test]
@@ -797,8 +1111,17 @@ mod tests {
                         g: Some("0".to_string()),
                         b: Some("0".to_string()),
                     }),
+                    raw_child_xml: Vec::new(),
                 }),
+                raw_child_xml: Vec::new(),
             }),
+            glow: None,
+            soft_edge: None,
+            reflection: None,
+            three_d: None,
+            blur: None,
+            fill_overlay: None,
+            raw_xml: Vec::new(),
         };
 
         let xml = serialize(&pic, &mut ctx);

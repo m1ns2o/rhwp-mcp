@@ -49,10 +49,25 @@ pub struct Paragraph {
     /// TAB 확장 데이터 (라운드트립 보존용)
     /// 각 탭 문자의 7 code unit (탭 너비, 종류 등) — text 내 '\t' 순서와 1:1 대응
     pub tab_extended: Vec<[u16; 7]>,
+    /// HWPX `<hp:t>` 내부의 zero-width 변경추적 range marker.
+    ///
+    /// `text`에는 보이는 문자열만 유지하고, `insertBegin`/`insertEnd` 등은 저장 시
+    /// 다시 `<hp:t>` 안에 주입한다.
+    pub hwpx_text_markers: Vec<HwpxTextMarker>,
     /// 문단 번호 시작 방식 오버라이드
     /// None = 앞 번호 목록에 이어 (기본)
     /// Some(NumberingRestart) = 이전 번호 이어 / 새 번호 시작
     pub numbering_restart: Option<NumberingRestart>,
+    /// document-template 재생성 시 텍스트 없는 TAC 표 뒤에 저장돼 있던 시각 gap.
+    ///
+    /// 일반 편집 reflow에는 쓰지 않고, renderer가 원본 template의 page-local
+    /// line segment gap을 좁은 범위에서 복원할 때만 참고한다.
+    pub rhwp_saved_tac_gap_before: i32,
+    /// document-template 재생성 시 일반 텍스트 문단 사이에 저장돼 있던 시각 gap.
+    ///
+    /// 본문 line segment 전체 복원은 page count 회귀가 생길 수 있어, 렌더러가
+    /// 원본 template의 page-local inter-paragraph gap만 좁게 복원할 때 참고한다.
+    pub rhwp_saved_para_gap_before: i32,
 }
 
 /// 문단 번호 시작 방식
@@ -251,6 +266,15 @@ pub struct FieldRange {
     pub end_char_idx: usize,
     /// controls[] 배열 내 인덱스 (해당 Field 컨트롤 참조)
     pub control_idx: usize,
+}
+
+/// HWPX `<hp:t>` 내부에 들어가는 zero-width XML marker.
+#[derive(Debug, Clone, Default)]
+pub struct HwpxTextMarker {
+    /// `Paragraph.text` 기준 문자 인덱스. marker는 이 인덱스의 문자 앞에 놓인다.
+    pub char_idx: usize,
+    /// 원본 empty XML element. 예: `<hp:insertBegin Id="2" TcId="1"/>`
+    pub raw_xml: String,
 }
 
 impl Paragraph {
@@ -529,6 +553,12 @@ impl Paragraph {
             }
         }
 
+        for marker in &mut self.hwpx_text_markers {
+            if marker.char_idx >= char_offset {
+                marker.char_idx += inserted_len;
+            }
+        }
+
         // 6. char_count 갱신
         self.char_count += new_chars.len() as u32;
     }
@@ -632,6 +662,14 @@ impl Paragraph {
         // IME 조합 중 delete→insert 사이클에서 필드가 일시적으로 비워질 수 있음.
         self.field_ranges
             .retain(|fr| fr.start_char_idx <= fr.end_char_idx);
+
+        for marker in &mut self.hwpx_text_markers {
+            if marker.char_idx >= del_end {
+                marker.char_idx -= actual_count;
+            } else if marker.char_idx > char_offset {
+                marker.char_idx = char_offset;
+            }
+        }
 
         // 6. char_count 갱신
         self.char_count -= actual_count as u32;
@@ -778,6 +816,19 @@ impl Paragraph {
         // 5-1. field_ranges 분할 (필드 control은 원래 문단에 유지)
         self.field_ranges.retain(|fr| fr.end_char_idx <= split_pos);
 
+        // 5-1-1. HWPX text marker 분할
+        let mut new_hwpx_text_markers = Vec::new();
+        self.hwpx_text_markers.retain(|marker| {
+            if marker.char_idx >= split_pos {
+                let mut moved = marker.clone();
+                moved.char_idx -= split_pos;
+                new_hwpx_text_markers.push(moved);
+                false
+            } else {
+                true
+            }
+        });
+
         // 5-2. controls 분할
         //
         // TAC 그림/표/수식 등은 본문에서 한 글자처럼 취급되므로 문단 분할 시
@@ -842,7 +893,10 @@ impl Paragraph {
             raw_header_extra: self.raw_header_extra.clone(),
             has_para_text: new_has_para_text,
             tab_extended: Vec::new(),
+            hwpx_text_markers: new_hwpx_text_markers,
             numbering_restart: None,
+            rhwp_saved_tac_gap_before: 0,
+            rhwp_saved_para_gap_before: 0,
         }
     }
 
@@ -943,6 +997,12 @@ impl Paragraph {
                 end_char_idx: fr.end_char_idx + self_text_len,
                 control_idx: fr.control_idx + ctrl_offset,
             });
+        }
+
+        for marker in &other.hwpx_text_markers {
+            let mut merged = marker.clone();
+            merged.char_idx += self_text_len;
+            self.hwpx_text_markers.push(merged);
         }
 
         // 5-2. controls / ctrl_data_records / control_mask 병합 (#1323)

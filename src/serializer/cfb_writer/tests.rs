@@ -130,6 +130,7 @@ fn test_full_roundtrip_uncompressed() {
     doc_info.font_faces = vec![Vec::new(); 7];
     doc_info.font_faces[0].push(Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
         alt_name: None,

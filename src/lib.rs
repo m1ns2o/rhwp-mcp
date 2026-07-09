@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 //! rhwp — Rust HWP 뷰어/에디터
 //!
 //! 본 제품은 한글과컴퓨터의 한글 문서 파일(.hwp) 공개 문서를 참고하여 개발하였습니다.
@@ -8,6 +10,8 @@ pub mod diagnostics;
 pub mod document_core;
 pub mod emf;
 pub mod error;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod mcp;
 pub mod model;
 pub mod ole_chart;
 pub mod ooxml_chart;

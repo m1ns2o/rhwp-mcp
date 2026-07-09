@@ -4,14 +4,25 @@
 
 /* editor-area: 눈금자 + 스크롤 영역을 2×2 Grid로 배치 */
 #editor-area {
+  position: relative;
   display: grid;
   /* minmax(0, 1fr): 1fr(=minmax(auto,1fr))은 콘텐츠 기반 최소 크기가 한 방향
      래칫으로 작동해 창을 넓혔다 줄이면 트랙이 줄지 않는다(#1191). 최소를 0으로
      고정해 창 축소 시에도 트랙이 정상 축소되어 가운데 정렬이 유지된다. */
-  grid-template-columns: 20px minmax(0, 1fr);
+  grid-template-columns: 20px minmax(0, 1fr) var(--ai-panel-width, 420px);
   grid-template-rows: 20px minmax(0, 1fr);
   flex: 1;
   overflow: hidden;
+}
+
+#editor-area.ai-chat-collapsed {
+  grid-template-columns: 20px minmax(0, 1fr) 0;
+}
+
+#editor-area.ai-chat-collapsed #ai-chat-panel {
+  min-width: 0;
+  border-left: 0;
+  visibility: hidden;
 }
 
 /* 눈금자 교차 코너 (좌상단) */
@@ -38,10 +49,44 @@
 }
 
 #scroll-container {
+  grid-column: 2;
+  grid-row: 2;
   position: relative;
   overflow-y: auto;
   overflow-x: auto;
   background: var(--doc-workspace);
+}
+
+#ai-chat-panel {
+  grid-column: 3;
+  grid-row: 1 / 3;
+  width: var(--ai-panel-width, 420px);
+}
+
+#ai-sidebar-edge-toggle {
+  position: absolute;
+  right: 0;
+  top: 24px;
+  z-index: 20;
+  width: 34px;
+  height: 72px;
+  border: 1px solid var(--ui-border-strong);
+  border-right: 0;
+  border-radius: 8px 0 0 8px;
+  background: var(--ui-surface-raised);
+  color: var(--ui-text);
+  cursor: pointer;
+  font-weight: 700;
+  letter-spacing: 0;
+  box-shadow: 0 2px 8px var(--overlay-bg);
+}
+
+#ai-sidebar-edge-toggle:hover {
+  background: var(--ui-hover);
+}
+
+#ai-chat-toggle {
+  display: none;
 }
 
 #scroll-content {

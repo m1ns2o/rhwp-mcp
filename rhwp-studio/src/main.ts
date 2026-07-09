@@ -21,6 +21,7 @@ import { toolCommands } from '@/command/commands/tool';
 import { installPwaFileHandling, type FileHandlingWindowLike } from '@/command/pwa-file-handling';
 import { ContextMenu } from '@/ui/context-menu';
 import { CommandPalette } from '@/ui/command-palette';
+import { AiChatPanel } from '@/ui/ai-chat-panel';
 import { showValidationModalIfNeeded } from '@/ui/validation-modal';
 import { showLocalFontsModalIfNeeded } from '@/ui/local-fonts-modal';
 import { showToast } from '@/ui/toast';
@@ -73,10 +74,12 @@ let canvasView: CanvasView | null = null;
 let inputHandler: InputHandler | null = null;
 let toolbar: Toolbar | null = null;
 let ruler: Ruler | null = null;
+let aiChatPanel: AiChatPanel | null = null;
 let editMode: EditorEditMode = 'normal';
 let extensionViewerSettings: ExtensionViewerSettings = {
   disableExternalWebFonts: false,
 };
+let currentPageIndex = 0;
 
 
 // ─── 커맨드 시스템 ─────────────────────────────
@@ -238,6 +241,15 @@ async function initialize(): Promise<void> {
     );
 
     new MenuBar(document.getElementById('menu-bar')!, eventBus, dispatcher, registry);
+    const aiPanelRoot = document.getElementById('ai-chat-panel');
+    if (aiPanelRoot) {
+      aiChatPanel = new AiChatPanel(aiPanelRoot, {
+        wasm,
+        getInputHandler: () => inputHandler,
+        getCurrentPage: () => currentPageIndex,
+        onRequestClose: () => setAiChatPanelVisible(false),
+      });
+    }
 
     // 툴바 내 data-cmd 버튼 클릭 → 커맨드 디스패치
     document.querySelectorAll('.tb-btn[data-cmd]').forEach(btn => {
@@ -289,6 +301,7 @@ async function initialize(): Promise<void> {
 
     setupFileInput();
     setupZoomControls();
+    setupAiChatToggle();
     setupEventListeners();
     setupGlobalShortcuts();
     void loadFromUrlParam();
@@ -517,7 +530,9 @@ let totalSections = 1;
 function setupEventListeners(): void {
   eventBus.on('current-page-changed', (page, _total) => {
     const pageIdx = page as number;
+    currentPageIndex = pageIdx;
     sbPage().textContent = `${pageIdx + 1} / ${_total} 쪽`;
+    aiChatPanel?.refreshDocumentState();
 
     // 구역 정보: 현재 페이지의 sectionIndex로 갱신
     if (wasm.pageCount > 0) {
@@ -547,6 +562,7 @@ function setupEventListeners(): void {
 
   eventBus.on('document-dirty-changed', () => {
     eventBus.emit('command-state-changed');
+    aiChatPanel?.refreshDocumentState();
   });
 
   eventBus.on('local-fonts-changed', () => {
@@ -633,9 +649,18 @@ function applySavedTextMarkSettings(): void {
   syncTextMarkMenu(view.showControlCodes, view.showParagraphMarks);
 }
 
-async function initializeDocument(docInfo: DocumentInfo, displayName: string): Promise<void> {
+interface InitializeDocumentOptions {
+  interactivePrompts?: boolean;
+}
+
+async function initializeDocument(
+  docInfo: DocumentInfo,
+  displayName: string,
+  options: InitializeDocumentOptions = {},
+): Promise<void> {
   const msg = sbMessage();
   let normalizedDuringLoad = false;
+  const interactivePrompts = options.interactivePrompts !== false;
   try {
     console.log('[initDoc] 1. 폰트 로딩 시작');
     if (docInfo.fontsUsed?.length) {
@@ -666,7 +691,7 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
       if (wasm.getSourceFormat() === 'hwpx') {
         const report = wasm.getValidationWarnings();
         console.log(`[validation] ${report.count} warnings`, report.summary);
-        if (report.count > 0) {
+        if (report.count > 0 && interactivePrompts) {
           const choice = await showValidationModalIfNeeded(report);
           console.log(`[validation] user choice: ${choice}`);
           if (choice === 'auto-fix') {
@@ -685,17 +710,57 @@ async function initializeDocument(docInfo: DocumentInfo, displayName: string): P
       console.warn('[validation] 감지/보정 실패 (치명적이지 않음):', e);
     }
 
-    await promptLocalFontsIfNeeded(docInfo, displayName);
+    if (interactivePrompts) {
+      await promptLocalFontsIfNeeded(docInfo, displayName);
+    }
 
     if (normalizedDuringLoad) {
       documentState.markDirty('validation-auto-fix');
     } else {
       documentState.markClean('document-initialized');
     }
+    aiChatPanel?.refreshDocumentState();
   } catch (error) {
     console.error('[initDoc] 오류:', error);
     if (window.innerWidth < 768) alert(`초기화 오류: ${error}`);
   }
+}
+
+function setupAiChatToggle(): void {
+  const button = document.getElementById('ai-chat-toggle');
+  const editorArea = document.getElementById('editor-area');
+  if (!button || !editorArea) return;
+  let edgeButton = document.getElementById('ai-sidebar-edge-toggle') as HTMLButtonElement | null;
+  if (!edgeButton) {
+    edgeButton = document.createElement('button');
+    edgeButton.id = 'ai-sidebar-edge-toggle';
+    edgeButton.type = 'button';
+    edgeButton.textContent = 'AI';
+    edgeButton.title = 'AI 사이드바 열기';
+    edgeButton.setAttribute('aria-label', 'AI 사이드바 열기');
+    editorArea.appendChild(edgeButton);
+  }
+  button.addEventListener('mousedown', (event) => event.preventDefault());
+  button.addEventListener('click', () => {
+    setAiChatPanelVisible(editorArea.classList.contains('ai-chat-collapsed'));
+  });
+  edgeButton.addEventListener('click', () => setAiChatPanelVisible(true));
+  setAiChatPanelVisible(true);
+}
+
+function setAiChatPanelVisible(visible: boolean): boolean {
+  const button = document.getElementById('ai-chat-toggle');
+  const editorArea = document.getElementById('editor-area');
+  const edgeButton = document.getElementById('ai-sidebar-edge-toggle');
+  if (!button || !editorArea) return false;
+  editorArea.classList.toggle('ai-chat-collapsed', !visible);
+  button.classList.toggle('active', visible);
+  button.setAttribute('aria-pressed', visible ? 'true' : 'false');
+  button.title = visible ? 'AI 사이드바 닫기' : 'AI 사이드바 열기';
+  if (edgeButton) {
+    edgeButton.hidden = visible;
+  }
+  return visible;
 }
 
 async function promptLocalFontsIfNeeded(docInfo: DocumentInfo, displayName: string): Promise<void> {
@@ -755,11 +820,16 @@ async function loadFile(file: File, options: { skipUnsavedGuard?: boolean } = {}
   }
 }
 
+interface LoadBytesOptions {
+  interactivePrompts?: boolean;
+}
+
 async function loadBytes(
   data: Uint8Array,
   fileName: string,
   fileHandle: typeof wasm.currentFileHandle,
   startTime = performance.now(),
+  options: LoadBytesOptions = {},
 ): Promise<void> {
   const docInfo = wasm.loadDocument(data, fileName);
   wasm.currentFileHandle = fileHandle;
@@ -770,7 +840,11 @@ async function loadBytes(
   const elapsed = performance.now() - startTime;
   // initializeDocument 안에서 #177 validation 모달이 표시될 수 있음.
   // HWPX 토스트는 모달과의 이벤트 충돌을 피하기 위해 모달 닫힌 후 표시.
-  await initializeDocument(docInfo, `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`);
+  await initializeDocument(
+    docInfo,
+    `${fileName} — ${docInfo.pageCount}페이지 (${elapsed.toFixed(1)}ms)`,
+    { interactivePrompts: options.interactivePrompts },
+  );
   notifyHwpxSaveModeIfNeeded();
 }
 
@@ -886,7 +960,7 @@ function assertRemoteDocumentBytes(bytes: Uint8Array, contentType?: string | nul
   throw new Error('실제 HWP/HWPX 파일이 아닙니다. 파일 시그니처를 확인할 수 없습니다.');
 }
 
-async function createNewDocument(): Promise<void> {
+async function createNewDocument(options: InitializeDocumentOptions = {}): Promise<DocumentInfo> {
   const msg = sbMessage();
   try {
     msg.textContent = '새 문서 생성 중...';
@@ -895,10 +969,12 @@ async function createNewDocument(): Promise<void> {
       { fileName: wasm.fileName, sourceFormat: wasm.getSourceFormat() },
       { discardPreviousDraft: true },
     );
-    await initializeDocument(docInfo, `새 문서.hwp — ${docInfo.pageCount}페이지`);
+    await initializeDocument(docInfo, `새 문서.hwp — ${docInfo.pageCount}페이지`, options);
+    return docInfo;
   } catch (error) {
     msg.textContent = `새 문서 생성 실패: ${error}`;
     console.error('[main] 새 문서 생성 실패:', error);
+    throw error;
   }
 }
 
@@ -911,7 +987,11 @@ eventBus.on('create-new-document', (payload) => {
   void (async () => {
     const options = payload as { skipUnsavedGuard?: boolean } | undefined;
     if (!await canReplaceCurrentDocument(options?.skipUnsavedGuard)) return;
-    await createNewDocument();
+    try {
+      await createNewDocument();
+    } catch {
+      /* createNewDocument already reported the error to the UI */
+    }
   })();
 });
 eventBus.on('open-document-bytes', async (payload) => {
@@ -1087,7 +1167,9 @@ window.addEventListener('message', async (e) => {
         return;
       }
       const bytes = new Uint8Array(msg.data);
-      await loadBytes(bytes, msg.fileName || 'document.hwp', null);
+      await loadBytes(bytes, msg.fileName || 'document.hwp', null, performance.now(), {
+        interactivePrompts: false,
+      });
       e.source?.postMessage({ type: 'rhwp-response', id: msg.id, result: { pageCount: wasm.pageCount } }, { targetOrigin: '*' });
     } catch (err: any) {
       e.source?.postMessage({ type: 'rhwp-response', id: msg.id, error: err.message || String(err) }, { targetOrigin: '*' });
@@ -1109,6 +1191,16 @@ window.addEventListener('message', async (e) => {
         await initPromise;
         reply(true);
         break;
+      case 'newDocument': {
+        await initPromise;
+        if (!await canReplaceCurrentDocument(Boolean(params?.skipUnsavedGuard))) {
+          reply(undefined, '문서 생성이 취소되었습니다.');
+          break;
+        }
+        const docInfo = await createNewDocument({ interactivePrompts: false });
+        reply({ pageCount: docInfo.pageCount });
+        break;
+      }
       case 'loadFile': {
         await initPromise;
         if (!await canReplaceCurrentDocument(Boolean(params?.skipUnsavedGuard))) {
@@ -1116,7 +1208,9 @@ window.addEventListener('message', async (e) => {
           break;
         }
         const bytes = new Uint8Array(params.data);
-        await loadBytes(bytes, params.fileName || 'document.hwp', null);
+        await loadBytes(bytes, params.fileName || 'document.hwp', null, performance.now(), {
+          interactivePrompts: false,
+        });
         reply({ pageCount: wasm.pageCount });
         break;
       }
@@ -1139,6 +1233,37 @@ window.addEventListener('message', async (e) => {
       case 'exportHwpVerify':
         await initPromise;
         reply(JSON.parse(wasm.exportHwpVerify()));
+        break;
+      case 'configureAi':
+      case 'setAiSettings':
+        await initPromise;
+        if (!aiChatPanel) {
+          reply(undefined, 'AI panel is not available');
+          break;
+        }
+        setAiChatPanelVisible(true);
+        reply(aiChatPanel.configure((params?.settings ?? params ?? {}) as Record<string, unknown>));
+        break;
+      case 'getAiSettings':
+        await initPromise;
+        if (!aiChatPanel) {
+          reply(undefined, 'AI panel is not available');
+          break;
+        }
+        reply(aiChatPanel.publicSettings());
+        break;
+      case 'openAiPanel':
+        await initPromise;
+        reply({ visible: setAiChatPanelVisible(params?.open !== false) });
+        break;
+      case 'refreshAiOAuthToken':
+        await initPromise;
+        if (!aiChatPanel) {
+          reply(undefined, 'AI panel is not available');
+          break;
+        }
+        setAiChatPanelVisible(true);
+        reply(await aiChatPanel.refreshOAuthToken());
         break;
       default:
         reply(undefined, `Unknown method: ${method}`);

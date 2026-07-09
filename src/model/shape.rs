@@ -47,6 +47,12 @@ pub struct CommonObjAttr {
     pub margin: Padding,
     /// 인스턴스 ID
     pub instance_id: u32,
+    /// HWPX `instid` 속성.
+    ///
+    /// 작성 HWPX에는 `id`와 `instid`가 다른 도형이 많다. HWP 공통
+    /// CTRL_HEADER의 `instance_id`와 별도로 보존해 HWPX 저장 시 subject id를
+    /// `id` 값으로 덮지 않는다.
+    pub inst_id: u32,
     /// 쪽나눔 방지 (0=off, 1=on)
     pub prevent_page_break: i32,
     /// 글자처럼 취급
@@ -90,6 +96,17 @@ pub struct CommonObjAttr {
     /// HWP5 파서는 설정하지 않는다 (기본 None). HWPX 그리기 개체의
     /// `numberingType="PICTURE"` 등을 라운드트립 보존하기 위한 필드.
     pub numbering_type: ObjectNumberingType,
+    /// HWPX 원본에 `numberingType` 속성이 명시되어 있었는지 여부.
+    pub numbering_type_explicit: bool,
+    /// HWPX AbstractShapeObjectType `lock` 보존.
+    pub lock: bool,
+    /// HWPX AbstractShapeObjectType `dropcapstyle` 보존.
+    ///
+    /// 대부분 `None`이지만 authored HWPX에는 `DoubleLine` 같은 값이 존재한다.
+    /// 기본값은 None으로 두고 HWPX 저장 시 `None`으로 방출한다.
+    pub dropcap_style: Option<String>,
+    /// HWPX AbstractShapeObjectType `href` 보존.
+    pub href: Option<String>,
     /// 파싱된 필드 이후 추가 바이트 (라운드트립 보존용)
     pub raw_extra: Vec<u8>,
 }
@@ -292,6 +309,11 @@ pub struct DrawingObjAttr {
     pub text_box: Option<TextBox>,
     /// 캡션
     pub caption: Option<Caption>,
+    /// HWPX shape 하위의 아직 구조화하지 않은 child XML.
+    ///
+    /// 일반 도형의 3D/effect 계열처럼 아직 의미 필드가 없는 작성물 XML을
+    /// HWPX 저장과 document-template 재생성에서 삭제하지 않기 위한 보존 경로다.
+    pub raw_hwpx_child_xml: Vec<String>,
 }
 
 /// 글상자 (그리기 개체 내 텍스트)
@@ -463,6 +485,8 @@ pub struct LineShape {
     pub started_right_or_bottom: bool,
     /// 연결선 데이터 (ctrl_id='$col'일 때만 Some)
     pub connector: Option<ConnectorData>,
+    /// SHAPE_LINE 끝 패딩/추가 바이트 (라운드트립 보존, 일반 선 전용)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 연결선 타입 (9종)
@@ -551,6 +575,8 @@ pub struct RectangleShape {
     pub x_coords: [i32; 4],
     /// 꼭짓점 Y 좌표 (4개)
     pub y_coords: [i32; 4],
+    /// SHAPE_RECTANGLE 끝 패딩/추가 바이트 (라운드트립 보존)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 타원 개체 (HWPTAG_SHAPE_COMPONENT_ELLIPSE)
@@ -576,6 +602,8 @@ pub struct EllipseShape {
     pub start2: Point,
     /// 끝점2 (호일 때)
     pub end2: Point,
+    /// SHAPE_ELLIPSE 끝 패딩/추가 바이트 (라운드트립 보존)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 호 개체 (HWPTAG_SHAPE_COMPONENT_ARC)
@@ -593,6 +621,8 @@ pub struct ArcShape {
     pub axis1: Point,
     /// 제2축 좌표
     pub axis2: Point,
+    /// SHAPE_ARC 끝 패딩/추가 바이트 (라운드트립 보존)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 다각형 개체 (HWPTAG_SHAPE_COMPONENT_POLYGON)
@@ -619,6 +649,8 @@ pub struct CurveShape {
     pub points: Vec<Point>,
     /// 세그먼트 타입 목록 (0: line, 1: curve)
     pub segment_types: Vec<u8>,
+    /// SHAPE_CURVE 끝 패딩/추가 바이트 (라운드트립 보존)
+    pub raw_trailing: Vec<u8>,
 }
 
 /// 묶음 개체 (HWPTAG_SHAPE_COMPONENT_CONTAINER)
@@ -630,6 +662,8 @@ pub struct GroupShape {
     pub shape_attr: ShapeComponentAttr,
     /// 하위 개체 목록
     pub children: Vec<ShapeObject>,
+    /// SHAPE_COMPONENT 그룹 payload 중 자식 목록/instance_id 뒤의 추가 바이트 (라운드트립 보존)
+    pub raw_component_extra: Vec<u8>,
     /// 캡션
     pub caption: Option<Caption>,
 }
@@ -758,6 +792,251 @@ pub struct ChartShape {
     pub caption: Option<Caption>,
 }
 
+pub const RHWP_CHART_DATA_JSON_MAGIC: &[u8] = b"RHWP_CHART_DATA_JSON\0";
+
+pub fn chart_type_name(chart_type: ChartType) -> &'static str {
+    match chart_type {
+        ChartType::Bar => "Bar",
+        ChartType::Column => "Column",
+        ChartType::Line => "Line",
+        ChartType::Pie => "Pie",
+        ChartType::Area => "Area",
+        ChartType::Scatter => "Scatter",
+        ChartType::Unknown => "Unknown",
+    }
+}
+
+pub fn chart_type_from_name(value: &str) -> Option<ChartType> {
+    match value {
+        "Bar" | "bar" => Some(ChartType::Bar),
+        "Column" | "column" | "col" => Some(ChartType::Column),
+        "Line" | "line" => Some(ChartType::Line),
+        "Pie" | "pie" => Some(ChartType::Pie),
+        "Area" | "area" => Some(ChartType::Area),
+        "Scatter" | "scatter" => Some(ChartType::Scatter),
+        "Unknown" | "unknown" => Some(ChartType::Unknown),
+        _ => None,
+    }
+}
+
+pub fn legend_position_name(position: LegendPosition) -> &'static str {
+    match position {
+        LegendPosition::Right => "Right",
+        LegendPosition::Left => "Left",
+        LegendPosition::Top => "Top",
+        LegendPosition::Bottom => "Bottom",
+        LegendPosition::TopLeft => "TopLeft",
+        LegendPosition::TopRight => "TopRight",
+        LegendPosition::BottomLeft => "BottomLeft",
+        LegendPosition::BottomRight => "BottomRight",
+        LegendPosition::Hidden => "Hidden",
+    }
+}
+
+pub fn legend_position_from_name(value: &str) -> Option<LegendPosition> {
+    match value {
+        "Right" | "right" | "r" => Some(LegendPosition::Right),
+        "Left" | "left" | "l" => Some(LegendPosition::Left),
+        "Top" | "top" | "t" => Some(LegendPosition::Top),
+        "Bottom" | "bottom" | "b" => Some(LegendPosition::Bottom),
+        "TopLeft" | "topLeft" | "top_left" => Some(LegendPosition::TopLeft),
+        "TopRight" | "topRight" | "top_right" | "tr" => Some(LegendPosition::TopRight),
+        "BottomLeft" | "bottomLeft" | "bottom_left" => Some(LegendPosition::BottomLeft),
+        "BottomRight" | "bottomRight" | "bottom_right" => Some(LegendPosition::BottomRight),
+        "Hidden" | "hidden" | "none" => Some(LegendPosition::Hidden),
+        _ => None,
+    }
+}
+
+pub fn clear_chart_semantic(chart: &mut ChartShape) {
+    chart.chart_type = ChartType::Unknown;
+    chart.title = None;
+    chart.legend = None;
+    chart.x_axis = None;
+    chart.y_axis = None;
+    chart.series.clear();
+}
+
+pub fn chart_has_semantic(chart: &ChartShape) -> bool {
+    chart.chart_type != ChartType::Unknown
+        || chart.title.as_ref().is_some_and(|title| !title.is_empty())
+        || chart.legend.is_some()
+        || chart.x_axis.as_ref().is_some_and(axis_has_semantic)
+        || chart.y_axis.as_ref().is_some_and(axis_has_semantic)
+        || !chart.series.is_empty()
+}
+
+fn axis_has_semantic(axis: &Axis) -> bool {
+    axis.label.as_ref().is_some_and(|label| !label.is_empty())
+        || !axis.labels.is_empty()
+        || axis.min.is_some()
+        || axis.max.is_some()
+}
+
+pub fn encode_rhwp_chart_data_semantic(chart: &ChartShape) -> Vec<u8> {
+    let value = serde_json::json!({
+        "version": 1,
+        "source": "rhwp",
+        "chartType": chart_type_name(chart.chart_type),
+        "title": &chart.title,
+        "legend": chart.legend.as_ref().map(|legend| {
+            serde_json::json!({
+                "position": legend_position_name(legend.position),
+                "visible": legend.visible,
+            })
+        }),
+        "xAxis": axis_to_json(&chart.x_axis),
+        "yAxis": axis_to_json(&chart.y_axis),
+        "series": chart.series.iter().map(|series| {
+            serde_json::json!({
+                "name": &series.name,
+                "values": &series.values,
+                "categories": &series.categories,
+                "color": series.color,
+                "colorHex": series.color.map(|rgb| format!("#{rgb:06X}")),
+            })
+        }).collect::<Vec<_>>(),
+    });
+    let mut bytes = RHWP_CHART_DATA_JSON_MAGIC.to_vec();
+    bytes.extend(value.to_string().as_bytes());
+    bytes
+}
+
+fn axis_to_json(axis: &Option<Axis>) -> serde_json::Value {
+    axis.as_ref().map_or(serde_json::Value::Null, |axis| {
+        serde_json::json!({
+            "label": &axis.label,
+            "labels": &axis.labels,
+            "min": axis.min,
+            "max": axis.max,
+        })
+    })
+}
+
+pub fn apply_rhwp_chart_data_semantic(chart: &mut ChartShape) -> bool {
+    if !chart.raw_chart_data.starts_with(RHWP_CHART_DATA_JSON_MAGIC) {
+        return false;
+    }
+    let json_bytes = chart.raw_chart_data[RHWP_CHART_DATA_JSON_MAGIC.len()..].to_vec();
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&json_bytes) else {
+        return false;
+    };
+    if value.get("source").and_then(|raw| raw.as_str()) != Some("rhwp") {
+        return false;
+    }
+
+    clear_chart_semantic(chart);
+    if let Some(chart_type) = value
+        .get("chartType")
+        .and_then(|raw| raw.as_str())
+        .and_then(chart_type_from_name)
+    {
+        chart.chart_type = chart_type;
+    }
+    chart.title = value
+        .get("title")
+        .and_then(|raw| raw.as_str())
+        .map(|title| title.to_string());
+    chart.legend = value.get("legend").and_then(|raw| {
+        let position = raw
+            .get("position")
+            .and_then(|value| value.as_str())
+            .and_then(legend_position_from_name)
+            .unwrap_or_default();
+        let visible = raw
+            .get("visible")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        Some(Legend { position, visible })
+    });
+    chart.x_axis = value
+        .get("xAxis")
+        .or_else(|| value.get("x_axis"))
+        .and_then(axis_from_json);
+    chart.y_axis = value
+        .get("yAxis")
+        .or_else(|| value.get("y_axis"))
+        .and_then(axis_from_json);
+    chart.series = value
+        .get("series")
+        .and_then(|raw| raw.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let values = item
+                        .get("values")
+                        .and_then(|raw| raw.as_array())
+                        .map(|items| items.iter().filter_map(|value| value.as_f64()).collect())
+                        .unwrap_or_default();
+                    let categories = item
+                        .get("categories")
+                        .and_then(|raw| raw.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|value| value.as_str().map(|value| value.to_string()))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Some(DataSeries {
+                        name: item
+                            .get("name")
+                            .and_then(|raw| raw.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        values,
+                        categories,
+                        color: parse_series_color_json(item),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    true
+}
+
+fn parse_series_color_json(item: &serde_json::Value) -> Option<u32> {
+    item.get("color")
+        .and_then(|raw| raw.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .or_else(|| {
+            item.get("colorHex")
+                .or_else(|| item.get("color_hex"))
+                .and_then(|raw| raw.as_str())
+                .and_then(|text| {
+                    let hex = text.trim().trim_start_matches('#');
+                    (hex.len() == 6)
+                        .then(|| u32::from_str_radix(hex, 16).ok())
+                        .flatten()
+                })
+        })
+}
+
+fn axis_from_json(value: &serde_json::Value) -> Option<Axis> {
+    if value.is_null() {
+        return None;
+    }
+    Some(Axis {
+        label: value
+            .get("label")
+            .and_then(|raw| raw.as_str())
+            .map(|label| label.to_string()),
+        labels: value
+            .get("labels")
+            .and_then(|raw| raw.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|value| value.as_str().map(|value| value.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        min: value.get("min").and_then(|raw| raw.as_f64()),
+        max: value.get("max").and_then(|raw| raw.as_f64()),
+    })
+}
+
 // ============================================================
 // OLE 개체 (Task #195)
 // ============================================================
@@ -803,6 +1082,14 @@ pub struct OleShape {
     pub flags: u8,
     /// 표시 방식
     pub drawing_aspect: OleDrawingAspect,
+    /// HWPX `hp:ole@objectType` 원문 보존.
+    pub hwpx_object_type: Option<String>,
+    /// HWPX `hp:ole@drawAspect` 원문 보존.
+    pub hwpx_draw_aspect: Option<String>,
+    /// HWPX `hp:ole@eqBaseLine` 원문 보존.
+    pub hwpx_eq_base_line: Option<String>,
+    /// HWPX `hp:ole@hasMoniker` 원문 보존.
+    pub hwpx_has_moniker: Option<String>,
     /// BinData 참조 ID (`BinData/BIN000N.OLE`)
     pub bin_data_id: u32,
     /// 프리뷰 이미지 (단계 4 이후 선택적 채움)

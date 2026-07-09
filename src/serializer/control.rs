@@ -334,8 +334,11 @@ pub(crate) fn serialize_master_page(
     let data = if !master_page.raw_list_header.is_empty() {
         master_page.raw_list_header.clone()
     } else {
-        let ext_flags =
-            u16::from(master_page.overlap) | if master_page.is_extension { 0x02 } else { 0 };
+        let ext_flags = if master_page.ext_flags != 0 {
+            master_page.ext_flags
+        } else {
+            u16::from(master_page.overlap) | if master_page.is_extension { 0x02 } else { 0 }
+        };
         build_header_footer_list_header(
             master_page.paragraphs.len() as u16,
             0,
@@ -428,8 +431,10 @@ fn serialize_column_def(cd: &ColumnDef, level: u16, records: &mut Vec<Record>) {
         // bit 2-9: 단 개수
         a |= (cd.column_count as u16 & 0xFF) << 2;
         // bit 10-11: 단 방향
-        if cd.direction == ColumnDirection::RightToLeft {
-            a |= 1 << 10;
+        match cd.direction {
+            ColumnDirection::RightToLeft => a |= 1 << 10,
+            ColumnDirection::Mirror => a |= 2 << 10,
+            ColumnDirection::LeftToRight => {}
         }
         // bit 12: 단 너비 동일
         if cd.same_width {
@@ -535,8 +540,21 @@ fn serialize_table_record(table: &Table) -> Vec<u8> {
 
     w.write_u16(table.border_fill_id).unwrap();
 
-    // 원본 추가 바이트 복원 (라운드트립용)
-    if !table.raw_table_record_extra.is_empty() {
+    if !table.zones.is_empty() {
+        w.write_u16(table.zones.len() as u16).unwrap();
+        for zone in &table.zones {
+            w.write_u16(zone.start_row).unwrap();
+            w.write_u16(zone.start_col).unwrap();
+            w.write_u16(zone.end_row).unwrap();
+            w.write_u16(zone.end_col).unwrap();
+            w.write_u16(zone.border_fill_id).unwrap();
+        }
+    }
+
+    // 원본 추가 바이트 복원 (라운드트립용). 생성 표의 기본 [0, 0]
+    // nZones marker는 zones를 직접 썼을 때 중복 방출하지 않는다.
+    let raw_extra_is_empty_zone_marker = table.raw_table_record_extra.as_slice() == [0, 0];
+    if !(!table.zones.is_empty() && raw_extra_is_empty_zone_marker) {
         w.write_bytes(&table.raw_table_record_extra).unwrap();
     }
 
@@ -1041,6 +1059,35 @@ fn picture_raw_extra_with_transparency(pic: &Picture) -> Vec<u8> {
 // 도형 ('gso ' + Shape)
 // ============================================================
 
+fn shape_object_caption(shape: &ShapeObject) -> Option<&Caption> {
+    match shape {
+        ShapeObject::Line(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Rectangle(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Ellipse(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Arc(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Polygon(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Curve(shape) => shape.drawing.caption.as_ref(),
+        ShapeObject::Group(shape) => shape.caption.as_ref(),
+        ShapeObject::Picture(shape) => shape.caption.as_ref(),
+        ShapeObject::Chart(shape) => shape.caption.as_ref(),
+        ShapeObject::Ole(shape) => shape.caption.as_ref(),
+    }
+}
+
+fn serialize_shape_object_caption(shape: &ShapeObject, level: u16, records: &mut Vec<Record>) {
+    serialize_shape_object_caption_at_level(shape, level + 1, records);
+}
+
+fn serialize_shape_object_caption_at_level(
+    shape: &ShapeObject,
+    level: u16,
+    records: &mut Vec<Record>,
+) {
+    if let Some(caption) = shape_object_caption(shape) {
+        serialize_caption(caption, level, records);
+    }
+}
+
 fn synthesize_hwpx_shape_ctrl_data(shape: &ShapeObject) -> Option<Vec<u8>> {
     let ShapeObject::Rectangle(rect) = shape else {
         return None;
@@ -1113,6 +1160,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&line.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1144,6 +1192,7 @@ fn serialize_shape_control(
             } else {
                 w.write_i32(if line.started_right_or_bottom { 1 } else { 0 })
                     .unwrap();
+                w.write_bytes(&line.raw_trailing).unwrap();
             }
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_LINE,
@@ -1158,6 +1207,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&rect.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1174,6 +1224,7 @@ fn serialize_shape_control(
                 w.write_i32(rect.x_coords[i]).unwrap();
                 w.write_i32(rect.y_coords[i]).unwrap();
             }
+            w.write_bytes(&rect.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_RECTANGLE,
                 level: level + 2,
@@ -1187,6 +1238,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&ellipse.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1216,6 +1268,7 @@ fn serialize_shape_control(
             w.write_i32(ellipse.start2.y).unwrap();
             w.write_i32(ellipse.end2.x).unwrap();
             w.write_i32(ellipse.end2.y).unwrap();
+            w.write_bytes(&ellipse.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_ELLIPSE,
                 level: level + 2,
@@ -1229,6 +1282,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&poly.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1266,6 +1320,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&arc.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1283,6 +1338,7 @@ fn serialize_shape_control(
             w.write_i32(arc.axis1.y).unwrap();
             w.write_i32(arc.axis2.x).unwrap();
             w.write_i32(arc.axis2.y).unwrap();
+            w.write_bytes(&arc.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_ARC,
                 level: level + 2,
@@ -1296,6 +1352,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&curve.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1314,8 +1371,11 @@ fn serialize_shape_control(
             for &t in &curve.segment_types {
                 w.write_u8(t).unwrap();
             }
-            // hwplib: sr.skip(4) — 4바이트 패딩
-            w.write_u32(0).unwrap();
+            if curve.raw_trailing.is_empty() {
+                w.write_u32(0).unwrap();
+            } else {
+                w.write_bytes(&curve.raw_trailing).unwrap();
+            }
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_CURVE,
                 level: level + 2,
@@ -1329,6 +1389,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&group.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             emit_top_level_synthesized_ctrl_data(records);
             // 그룹 컨테이너: SHAPE_COMPONENT + 자식 수 + 자식 ctrl_id 목록 (한컴 호환)
             {
@@ -1360,6 +1421,7 @@ fn serialize_shape_control(
                 }
                 // instance_id (한컴 호환)
                 w.write_u32(group.common.instance_id).unwrap();
+                w.write_bytes(&group.raw_component_extra).unwrap();
                 data.extend_from_slice(&w.into_bytes());
                 records.push(Record {
                     tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1386,6 +1448,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&chart.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             let sc_ctrl_id = chart.drawing.shape_attr.ctrl_id;
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1408,6 +1471,7 @@ fn serialize_shape_control(
                 level,
                 &serialize_common_obj_attr(&ole.common),
             ));
+            serialize_shape_object_caption(shape, level, records);
             let drawing = ole_drawing_with_shape_component_contract(ole, true);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT,
@@ -1471,6 +1535,7 @@ fn serialize_group_child(
             } else {
                 w.write_i32(if line.started_right_or_bottom { 1 } else { 0 })
                     .unwrap();
+                w.write_bytes(&line.raw_trailing).unwrap();
             }
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_LINE,
@@ -1478,6 +1543,7 @@ fn serialize_group_child(
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Rectangle(rect) => {
             records.push(Record {
@@ -1493,12 +1559,14 @@ fn serialize_group_child(
                 w.write_i32(rect.x_coords[i]).unwrap();
                 w.write_i32(rect.y_coords[i]).unwrap();
             }
+            w.write_bytes(&rect.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_RECTANGLE,
                 level: type_level,
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Ellipse(ellipse) => {
             records.push(Record {
@@ -1528,12 +1596,14 @@ fn serialize_group_child(
             w.write_i32(ellipse.start2.y).unwrap();
             w.write_i32(ellipse.end2.x).unwrap();
             w.write_i32(ellipse.end2.y).unwrap();
+            w.write_bytes(&ellipse.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_ELLIPSE,
                 level: type_level,
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Arc(arc) => {
             records.push(Record {
@@ -1551,12 +1621,14 @@ fn serialize_group_child(
             w.write_i32(arc.axis1.y).unwrap();
             w.write_i32(arc.axis2.x).unwrap();
             w.write_i32(arc.axis2.y).unwrap();
+            w.write_bytes(&arc.raw_trailing).unwrap();
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_ARC,
                 level: type_level,
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Polygon(poly) => {
             records.push(Record {
@@ -1587,6 +1659,7 @@ fn serialize_group_child(
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Curve(curve) => {
             records.push(Record {
@@ -1609,22 +1682,31 @@ fn serialize_group_child(
             for &t in &curve.segment_types {
                 w.write_u8(t).unwrap();
             }
-            w.write_u32(0).unwrap();
+            if curve.raw_trailing.is_empty() {
+                w.write_u32(0).unwrap();
+            } else {
+                w.write_bytes(&curve.raw_trailing).unwrap();
+            }
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_CURVE,
                 level: type_level,
                 size: 0,
                 data: w.into_bytes(),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Group(group) => {
             // 중첩 그룹
+            let mut data =
+                serialize_shape_component(tags::CTRL_GEN_SHAPE, &group.shape_attr, false);
+            data.extend_from_slice(&group.raw_component_extra);
             records.push(Record {
                 tag_id: tags::HWPTAG_SHAPE_COMPONENT_CONTAINER,
                 level: comp_level,
                 size: 0,
-                data: serialize_shape_component(tags::CTRL_GEN_SHAPE, &group.shape_attr, false),
+                data,
             });
+            serialize_shape_object_caption_at_level(child, comp_level + 1, records);
             for nested_child in &group.children {
                 serialize_group_child(nested_child, comp_level + 1, comp_level + 2, records);
             }
@@ -1642,6 +1724,7 @@ fn serialize_group_child(
                 size: 0,
                 data: serialize_picture_data(pic),
             });
+            serialize_shape_object_caption_at_level(child, type_level, records);
         }
         ShapeObject::Chart(chart) => {
             // Task #195 단계 2: 그룹 내 차트는 raw_chart_data로 라운드트립

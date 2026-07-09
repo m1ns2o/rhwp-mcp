@@ -94,6 +94,9 @@ pub struct PageBorderFill {
     ///
     /// 렌더러의 외곽선 배치 계약인 `basis`와 분리한다.
     pub ui_basis: PageBorderUiBasis,
+    /// HWPX `<hp:pageBorderFill>` child XML 원본 조각.
+    /// 의미 필드는 별도로 파싱하되, 확장 child를 왕복 저장에서 잃지 않기 위해 보존한다.
+    pub raw_hwpx_children: Option<String>,
 }
 
 /// 쪽 테두리 렌더 위치 기준
@@ -119,6 +122,8 @@ pub enum PageBorderUiBasis {
 /// 단 정의 ('cold' 컨트롤)
 #[derive(Debug, Clone, Default)]
 pub struct ColumnDef {
+    /// HWPX 단 정의 ID (`hp:colPr@id`)
+    pub column_id: String,
     /// 단 종류
     pub column_type: ColumnType,
     /// 단 수
@@ -163,6 +168,7 @@ pub enum ColumnDirection {
     #[default]
     LeftToRight,
     RightToLeft,
+    Mirror,
 }
 
 /// 페이지 렌더링에 필요한 계산된 영역 정보

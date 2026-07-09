@@ -60,6 +60,7 @@ Thumbs.db
 # 환경변수 (민감 정보)
 .env
 .env.docker
+.env.api
 
 # E2E 스크린샷
 rhwp-studio/e2e/screenshots/
@@ -89,6 +90,11 @@ rhwp-chrome/*.zip
 # rhwp-firefox 빌드 산출물
 rhwp-firefox/dist/
 rhwp-firefox/*.zip
+
+# rhwp-mcp desktop 빌드 산출물
+desktop/node_modules/
+desktop/build-resources/
+desktop/release/
 
 # rhwp-safari 빌드 산출물
 rhwp-safari/dist/

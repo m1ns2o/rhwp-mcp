@@ -171,6 +171,12 @@ pub struct DocInfo {
     /// splice 해 무손실을 보장한다(content.hpf metadata 보존과 동일 전략).
     /// 원본 HWPX가 없으면(HWP5 경로 등) None → serializer가 하드코딩 폴백.
     pub hwpx_head_tail: Option<String>,
+    /// HWPX `<hh:refList>` 내부의 inline track-change 정의
+    /// (`<hh:trackChanges>`, `<hh:trackChangeAuthors>`)를 원본 XML 그대로
+    /// 보존한다. 이 데이터는 TrackChange/Revisions/History auxiliary package
+    /// entry와 별도이며, header 리소스 테이블을 재생성할 때 명시적으로
+    /// splice하지 않으면 저장 과정에서 사라진다.
+    pub hwpx_ref_list_track_change_xml: Option<String>,
     /// HWPX `<hh:head version="X.Y">` 의 HWPML 스키마 버전. 문서별로 다르므로
     /// (1.2~1.5 등) 원본 값을 보존해 직렬화 때 그대로 재방출한다.
     /// 원본 HWPX가 없으면 None → serializer가 "1.2" 폴백.
@@ -192,6 +198,8 @@ pub struct Section {
 /// 구역 정의 (HWPTAG_CTRL_HEADER - 'secd')
 #[derive(Debug, Clone, Default)]
 pub struct SectionDef {
+    /// HWPX 구역 정의 ID (`hp:secPr@id`)
+    pub section_id: String,
     /// 속성 비트 플래그
     pub flags: u32,
     /// 단 간격
@@ -200,8 +208,14 @@ pub struct SectionDef {
     pub line_grid: HwpUnit16,
     /// 가로 줄맞춤 간격 (0=off, 양수=HWPUNIT 단위)
     pub char_grid: HwpUnit16,
+    /// 원고지 격자 형식 (`hp:grid@wonggojiFormat`, HWPX 전용 보존 필드)
+    pub wonggoji_format: u8,
     /// 기본 탭 간격
     pub default_tab_spacing: HwpUnit,
+    /// 기본 탭 값 (`hp:secPr@tabStopVal`, HWPX 전용 보존 필드)
+    pub tab_stop_val: HwpUnit,
+    /// 기본 탭 단위 (`hp:secPr@tabStopUnit`, HWPX 전용 보존 필드)
+    pub tab_stop_unit: String,
     /// 쪽 번호 (0이면 앞 구역에 이어서)
     pub page_num: u16,
     /// 쪽 번호 종류 (flags bit 20-21): 0=이어서, 1=홀수, 2=짝수
@@ -229,14 +243,34 @@ pub struct SectionDef {
     pub hide_master_page: bool,
     /// 테두리 감추기
     pub hide_border: bool,
+    /// HWPX 쪽 테두리 표시 범위 (`hp:visibility@border`)
+    pub visibility_border: String,
     /// 배경 감추기
     pub hide_fill: bool,
+    /// HWPX 쪽 배경 표시 범위 (`hp:visibility@fill`)
+    pub visibility_fill: String,
+    /// 첫 쪽 번호 감추기 (`hp:visibility@hideFirstPageNum`, HWP flags bit 5)
+    pub hide_page_number: bool,
     /// 빈 줄 감추기 (bit 19): 페이지 시작 부분의 빈 줄 2개까지 높이 0 처리
     pub hide_empty_line: bool,
-    /// 텍스트 방향 (0: 가로, 1: 세로)
+    /// 줄 번호 표시 (`hp:visibility@showLineNumber`)
+    pub show_line_number: bool,
+    /// 텍스트 방향 (0: 가로, 1: 세로, 2: 세로 영문 세움)
     pub text_direction: u8,
     /// 개요 번호 ID (SectionDef 바이트 14-15, Numbering 테이블 참조, 1-based)
     pub outline_numbering_id: u16,
+    /// 메모 모양 ID 참조 (`hp:secPr@memoShapeIDRef`)
+    pub memo_shape_id_ref: u16,
+    /// 세로쓰기 머리 영역 폭 (`hp:secPr@textVerticalWidthHead`)
+    pub text_vertical_width_head: HwpUnit,
+    /// 줄 번호 다시 시작 방식 (`hp:lineNumberShape@restartType`)
+    pub line_number_restart_type: u8,
+    /// 줄 번호 간격 (`hp:lineNumberShape@countBy`)
+    pub line_number_count_by: u16,
+    /// 본문과 줄 번호 사이 거리 (`hp:lineNumberShape@distance`)
+    pub line_number_distance: HwpUnit,
+    /// 줄 번호 시작 번호 (`hp:lineNumberShape@startNumber`)
+    pub line_number_start_number: u16,
     /// CTRL_HEADER 데이터의 파싱된 필드 이후 추가 바이트 (라운드트립 보존용)
     pub raw_ctrl_extra: Vec<u8>,
     /// 추가 쪽 테두리/배경 (2번째, 3번째 등)

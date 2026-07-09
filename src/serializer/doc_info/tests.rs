@@ -57,6 +57,7 @@ fn test_serialize_id_mappings_uses_modern_count_table_size() {
 fn test_serialize_face_name_simple() {
     let font = Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
         alt_name: None,
@@ -77,6 +78,7 @@ fn test_serialize_face_name_simple() {
 fn test_serialize_face_name_with_alt() {
     let font = Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name: "맑은 고딕".to_string(),
         alt_type: 1,
         alt_name: Some("Malgun Gothic".to_string()),
@@ -101,6 +103,7 @@ fn test_serialize_face_name_with_alt() {
 fn test_serialize_face_name_with_type_info_and_default_name() {
     let font = Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name: "굴림".to_string(),
         alt_type: 1,
         alt_name: None,
@@ -236,6 +239,10 @@ fn test_serialize_para_shape_roundtrip() {
         attr2: 0,
         attr3: 0,
         line_spacing_v2: 0,
+        suppress_line_numbers: false,
+        checked: false,
+        auto_spacing_easian_eng: None,
+        auto_spacing_easian_num: None,
         head_type: crate::model::style::HeadType::None,
         para_level: 0,
     };
@@ -308,7 +315,12 @@ fn test_serialize_bin_data_embedding() {
 fn test_serialize_border_fill_solid() {
     let bf = BorderFill {
         raw_data: None,
+        raw_hwpx_children: None,
         attr: 0,
+        three_d: false,
+        shadow: false,
+        center_line: None,
+        break_cell_separate_line: false,
         borders: [
             BorderLine {
                 line_type: BorderLineType::Solid,
@@ -361,6 +373,27 @@ fn test_serialize_border_fill_solid() {
 }
 
 #[test]
+fn test_serialize_border_fill_effect_attrs() {
+    let bf = BorderFill {
+        raw_data: None,
+        raw_hwpx_children: None,
+        attr: 0,
+        three_d: true,
+        shadow: true,
+        center_line: Some("CROSS".to_string()),
+        break_cell_separate_line: true,
+        borders: [BorderLine::default(); 4],
+        diagonal: DiagonalLine::default(),
+        fill: Fill::default(),
+    };
+
+    let data = serialize_border_fill(&bf);
+    let mut r = crate::parser::byte_reader::ByteReader::new(&data);
+
+    assert_eq!(r.read_u16().unwrap() & 0x2003, 0x2003);
+}
+
+#[test]
 fn test_serialize_border_fill_image_fill_mode_uses_hwp5_values() {
     let cases = [
         (ImageFillMode::TileAll, 0),
@@ -384,7 +417,12 @@ fn test_serialize_border_fill_image_fill_mode_uses_hwp5_values() {
     for (mode, expected) in cases {
         let bf = BorderFill {
             raw_data: None,
+            raw_hwpx_children: None,
             attr: 0,
+            three_d: false,
+            shadow: false,
+            center_line: None,
+            break_cell_separate_line: false,
             borders: [BorderLine::default(); 4],
             diagonal: DiagonalLine::default(),
             fill: Fill {
@@ -417,6 +455,7 @@ fn test_serialize_border_fill_image_fill_mode_uses_hwp5_values() {
 fn test_serialize_tab_def() {
     let td = TabDef {
         raw_data: None,
+        raw_hwpx_children: None,
         attr: 0x03,
         tabs: vec![crate::model::style::TabItem {
             position: 7200,
@@ -457,6 +496,7 @@ fn test_serialize_doc_info_roundtrip() {
     doc_info.font_faces = vec![Vec::new(); 7];
     doc_info.font_faces[0].push(Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name: "함초롬바탕".to_string(),
         alt_type: 0,
         alt_name: None,
@@ -515,6 +555,10 @@ fn test_serialize_doc_info_roundtrip() {
         attr2: 0,
         attr3: 0,
         line_spacing_v2: 0,
+        suppress_line_numbers: false,
+        checked: false,
+        auto_spacing_easian_eng: None,
+        auto_spacing_easian_num: None,
         head_type: crate::model::style::HeadType::None,
         para_level: 0,
     });

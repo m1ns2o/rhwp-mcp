@@ -306,7 +306,22 @@ fn image_fill_mode_to_u8(mode: ImageFillMode) -> u8 {
 
 pub fn serialize_border_fill(bf: &BorderFill) -> Vec<u8> {
     let mut w = ByteWriter::new();
-    w.write_u16(bf.attr).unwrap();
+    let mut attr = bf.attr;
+    if bf.three_d {
+        attr |= 0x0001;
+    }
+    if bf.shadow {
+        attr |= 0x0002;
+    }
+    if bf
+        .center_line
+        .as_deref()
+        .map(|value| !value.eq_ignore_ascii_case("NONE"))
+        .unwrap_or(false)
+    {
+        attr |= 0x2000;
+    }
+    w.write_u16(attr).unwrap();
 
     // 4방향 테두리 (인터리브: 종류 + 굵기 + 색상)
     for border in &bf.borders {

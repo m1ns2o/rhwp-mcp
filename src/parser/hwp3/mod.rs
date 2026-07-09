@@ -93,6 +93,7 @@ fn hwp3_page_border_fill(
         border_fill_id,
         basis: crate::model::page::PageBorderBasis::BodyBased,
         ui_basis: crate::model::page::PageBorderUiBasis::Page,
+        raw_hwpx_children: None,
     }
 }
 
@@ -253,6 +254,7 @@ pub(crate) fn convert_para_shape(
     if !tab_items.is_empty() {
         let new_td = crate::model::style::TabDef {
             raw_data: None,
+            raw_hwpx_children: None,
             attr: 0,
             tabs: tab_items,
             auto_tab_left: false,

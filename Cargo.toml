@@ -4,7 +4,7 @@ version = "0.7.17"
 edition = "2021"
 description = "HWP file viewer and editor written in Rust, targeting WebAssembly"
 license = "MIT"
-repository = "https://github.com/edwardkim/rhwp"
+repository = "https://github.com/m1ns2o/rhwp-mcp"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -16,6 +16,10 @@ path = "src/main.rs"
 [[bin]]
 name = "font-metric-gen"
 path = "src/tools/font_metric_gen.rs"
+
+[[bin]]
+name = "rhwp-mcp"
+path = "src/bin/rhwp-mcp.rs"
 
 [dependencies]
 wasm-bindgen = "0.2"
@@ -43,13 +47,13 @@ console_error_panic_hook = { version = "0.1", optional = true }
 
 [features]
 default = ["console_error_panic_hook"]
-native-skia = ["dep:resvg", "dep:skia-safe"]
+native-skia = ["dep:skia-safe"]
 
 # PDF 내보내기 (네이티브 전용, Task #21)
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 svg2pdf = "0.13"
 usvg = "0.45"
-resvg = { version = "0.47", optional = true }
+resvg = "0.47"
 pdf-writer = "0.12"
 subsetter = "0.2"
 ttf-parser = "0.25"
@@ -160,3 +164,9 @@ strip = "debuginfo"
 inherits = "release"
 lto = false
 codegen-units = 16
+
+[profile.desktop-release]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 2

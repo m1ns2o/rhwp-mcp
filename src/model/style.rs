@@ -52,6 +52,13 @@ pub fn border_width_mm_str(index: u8) -> &'static str {
 pub struct Font {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
+    /// HWPX `<hh:font>` 의 child XML 원문.
+    ///
+    /// `substFont`/`typeInfo` 는 의미 필드로도 복원하지만, 작성 HWPX가 추가 child,
+    /// namespace별 fallback, 원래 child 순서를 담는 경우 저장 시 정규화 손실을 줄이기
+    /// 위해 원본 child를 보존한다. 새로 생성한 글꼴은 이 값을 비워 의미 필드로
+    /// 재생성한다.
+    pub raw_hwpx_children: Option<String>,
     /// 글꼴 이름
     pub name: String,
     /// 글꼴 유형 (0: 알 수 없음, 1: TTF, 2: HFT)
@@ -248,6 +255,14 @@ pub struct ParaShape {
     pub attr3: u32,
     /// 줄 간격 (5.0.2.5 이상, 이전 line_spacing 대체)
     pub line_spacing_v2: u32,
+    /// HWPX 문단 줄 번호 억제 여부 (suppressLineNumbers)
+    pub suppress_line_numbers: bool,
+    /// HWPX 문단 체크 상태 (checked)
+    pub checked: bool,
+    /// HWPX 문단 한글/영문 자동 간격 (autoSpacing@eAsianEng)
+    pub auto_spacing_easian_eng: Option<bool>,
+    /// HWPX 문단 한글/숫자 자동 간격 (autoSpacing@eAsianNum)
+    pub auto_spacing_easian_num: Option<bool>,
     /// 문단 머리 모양 종류 (attr1 bit 23~24)
     pub head_type: HeadType,
     /// 문단 수준 (0~6 → 1~7수준, attr1 bit 25~27)
@@ -273,6 +288,10 @@ impl PartialEq for ParaShape {
             && self.attr2 == other.attr2
             && self.attr3 == other.attr3
             && self.line_spacing_v2 == other.line_spacing_v2
+            && self.suppress_line_numbers == other.suppress_line_numbers
+            && self.checked == other.checked
+            && self.auto_spacing_easian_eng == other.auto_spacing_easian_eng
+            && self.auto_spacing_easian_num == other.auto_spacing_easian_num
             && self.head_type == other.head_type
             && self.para_level == other.para_level
     }
@@ -321,6 +340,10 @@ pub struct NumberingHead {
 pub struct Bullet {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
+    /// HWPX `<hh:bullet>` 의 자식 XML (`paraHead`, `image` 등) 원본 구간.
+    /// HWP5 바이너리 경로 등 원본 XML 이 없으면 `None` 이며 serializer 가
+    /// 모델 필드 기반 기본 paraHead 를 생성한다.
+    pub raw_hwpx_children: Option<String>,
     /// 속성 (정렬, 너비 따름, 자동 내어쓰기 등)
     pub attr: u32,
     /// 너비 보정값
@@ -364,6 +387,13 @@ pub enum LineSpacingType {
 pub struct TabDef {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
+    /// HWPX `<hh:tabPr>` 의 자식 XML 원본 구간.
+    ///
+    /// 작성 HWPX는 탭 위치를 `hp:switch`/`hp:case`/`hp:default`로 1x/2x 단위를
+    /// 함께 기록하는 경우가 많다. 모델의 `tabs`는 의미값만 담으므로, 원본 HWPX에서
+    /// 온 경우에는 serializer가 이 구간을 그대로 splice해 단위 fallback과 미지
+    /// child/attribute를 보존한다.
+    pub raw_hwpx_children: Option<String>,
     /// 속성 비트 플래그
     pub attr: u32,
     /// 탭 항목 리스트
@@ -432,8 +462,24 @@ pub struct Style {
 pub struct BorderFill {
     /// 원본 레코드 바이트 (라운드트립 보존용)
     pub raw_data: Option<Vec<u8>>,
+    /// HWPX `<hh:borderFill>` 의 child XML 원문.
+    ///
+    /// BorderFill 모델은 렌더/편집에 필요한 주요 의미값을 별도 필드로 갖지만,
+    /// authored HWPX 는 switch/default, namespace별 fillBrush 속성, 미지 child 등
+    /// serializer가 아직 모두 표현하지 못하는 세부 구조를 포함할 수 있다. HWPX
+    /// save/reopen fidelity를 위해 원본 child를 보존하고, 의미값을 수정한 경로는
+    /// 이 필드를 비워 재생성하도록 한다.
+    pub raw_hwpx_children: Option<String>,
     /// 속성 비트 플래그
     pub attr: u16,
+    /// HWPX `threeD` / HWP5 attr bit 0.
+    pub three_d: bool,
+    /// HWPX `shadow` / HWP5 attr bit 1.
+    pub shadow: bool,
+    /// HWPX `centerLine` (`NONE`, `VERTICAL`, `HORIZONTAL`, `CROSS`).
+    pub center_line: Option<String>,
+    /// HWPX `breakCellSeparateLine`.
+    pub break_cell_separate_line: bool,
     /// 4방향 테두리선 (좌, 우, 상, 하)
     pub borders: [BorderLine; 4],
     /// 대각선

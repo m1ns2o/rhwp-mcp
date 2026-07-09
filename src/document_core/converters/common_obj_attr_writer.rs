@@ -210,6 +210,7 @@ mod tests {
                 bottom: 400,
             },
             instance_id: 0xCAFEBABE,
+            inst_id: 0,
             prevent_page_break: 0,
             treat_as_char: false,
             flow_with_text: false,
@@ -228,6 +229,10 @@ mod tests {
             description: String::new(),
             raw_extra: Vec::new(),
             numbering_type: crate::model::shape::ObjectNumberingType::None,
+            numbering_type_explicit: false,
+            lock: false,
+            dropcap_style: None,
+            href: None,
         }
     }
 

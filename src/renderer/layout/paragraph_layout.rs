@@ -26,6 +26,7 @@ use crate::model::control::Control;
 use crate::model::paragraph::Paragraph;
 use crate::model::shape::{CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertRelTo};
 use crate::model::style::{Alignment, HeadType, LineSpacingType, Numbering, UnderlineType};
+use crate::renderer::float_placement::signed_hwpunit;
 
 /// `RHWP_LAYOUT_DEBUG=1` 로 활성화되는 layout 디버그 로깅 여부.
 /// Phase 1 (#517) — 본질 정정 (#467/#491/#496) 시 결함 측정·재현 자동화에 사용.
@@ -3572,7 +3573,16 @@ impl LayoutEngine {
                                     } else {
                                         (y + baseline - pic_h).max(y)
                                     };
-                                    let img_y = base_img_y + sibling_reserved_px;
+                                    let img_y = base_img_y
+                                        + sibling_reserved_px
+                                        + hwpunit_to_px(
+                                            signed_hwpunit(pic.common.vertical_offset),
+                                            self.dpi,
+                                        );
+                                    let img_x = x + hwpunit_to_px(
+                                        signed_hwpunit(pic.common.horizontal_offset),
+                                        self.dpi,
+                                    );
                                     let bin_data_id = pic.image_attr.bin_data_id;
                                     let image_data =
                                         find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
@@ -3612,7 +3622,7 @@ impl LayoutEngine {
                                         original_size_hu,
                                         bin_data_id,
                                         image_data,
-                                        BoundingBox::new(x, img_y, tac_w, pic_h),
+                                        BoundingBox::new(img_x, img_y, tac_w, pic_h),
                                     );
                                     line_node.children.push(img_node);
                                     // [Task #864 Stage G] inline TAC picture 의 위치 등록.
@@ -3628,7 +3638,7 @@ impl LayoutEngine {
                                         para_index,
                                         tac_ci,
                                         cell_ctx.as_ref(),
-                                        x,
+                                        img_x,
                                         img_y,
                                     );
                                 }
@@ -4012,7 +4022,15 @@ impl LayoutEngine {
                                 if raw_lh + 4.0 >= pic_h {
                                     current_line_reserved_tac_picture_height = Some(pic_h);
                                 }
-                                let img_y = (y + baseline - pic_h).max(y);
+                                let img_y = (y + baseline - pic_h).max(y)
+                                    + hwpunit_to_px(
+                                        signed_hwpunit(pic.common.vertical_offset),
+                                        self.dpi,
+                                    );
+                                let img_x = x + hwpunit_to_px(
+                                    signed_hwpunit(pic.common.horizontal_offset),
+                                    self.dpi,
+                                );
                                 let bin_data_id = pic.image_attr.bin_data_id;
                                 let image_data =
                                     find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
@@ -4052,7 +4070,7 @@ impl LayoutEngine {
                                     original_size_hu,
                                     bin_data_id,
                                     image_data,
-                                    BoundingBox::new(x, img_y, tac_w, pic_h),
+                                    BoundingBox::new(img_x, img_y, tac_w, pic_h),
                                 );
                                 line_node.children.push(img_node);
                                 x += tac_w;
@@ -4180,7 +4198,17 @@ impl LayoutEngine {
                                     } else {
                                         (y + baseline - pic_h).max(y)
                                     };
-                                    let img_y = base_img_y + sibling_reserved_px;
+                                    let img_y = base_img_y
+                                        + sibling_reserved_px
+                                        + hwpunit_to_px(
+                                            signed_hwpunit(pic.common.vertical_offset),
+                                            self.dpi,
+                                        );
+                                    let shifted_img_x = img_x
+                                        + hwpunit_to_px(
+                                            signed_hwpunit(pic.common.horizontal_offset),
+                                            self.dpi,
+                                        );
                                     let bin_data_id = pic.image_attr.bin_data_id;
                                     let image_data =
                                         find_bin_data(bdc, bin_data_id).map(|c| c.data.clone());
@@ -4220,7 +4248,7 @@ impl LayoutEngine {
                                         original_size_hu,
                                         bin_data_id,
                                         image_data,
-                                        BoundingBox::new(img_x, img_y, tac_w, pic_h),
+                                        BoundingBox::new(shifted_img_x, img_y, tac_w, pic_h),
                                     );
                                     line_node.children.push(img_node);
                                     // [Task #418/#376] layout_shape_item 의 Task #347 분기 (빈 문단 +
@@ -4231,7 +4259,7 @@ impl LayoutEngine {
                                         para_index,
                                         tac_ci,
                                         cell_ctx.as_ref(),
-                                        img_x,
+                                        shifted_img_x,
                                         img_y,
                                     );
                                     img_x += tac_w;

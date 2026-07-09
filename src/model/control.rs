@@ -81,6 +81,11 @@ pub struct Equation {
     pub version_info: String,
     /// 수식 글꼴명
     pub font_name: String,
+    /// HWPX `hp:equation@lineMode` 보존.
+    ///
+    /// 작성 HWPX 수식에는 `lineMode="CHAR"`가 흔히 포함된다. HWP5 EQEDIT
+    /// payload에는 직접 대응 필드가 없으므로 HWPX roundtrip 보존용으로 유지한다.
+    pub line_mode: String,
     /// 라운드트립용 원본 ctrl_data
     pub raw_ctrl_data: Vec<u8>,
 }
@@ -163,10 +168,22 @@ pub struct Hyperlink {
 /// 덧말 ('tdut' 컨트롤)
 #[derive(Debug, Clone, Default)]
 pub struct Ruby {
+    /// 원문 텍스트
+    pub main_text: String,
     /// 덧말 텍스트
     pub ruby_text: String,
     /// 정렬 방식
     pub alignment: u8,
+    /// HWPX posType 원문 값
+    pub pos_type: Option<String>,
+    /// HWPX align 원문 값
+    pub align: Option<String>,
+    /// HWPX szRatio 원문 값
+    pub size_ratio: Option<String>,
+    /// HWPX option 원문 값
+    pub option: Option<String>,
+    /// HWPX styleIDRef 원문 값
+    pub style_id_ref: Option<String>,
 }
 
 /// 글자 겹침 ('tcps' 컨트롤, HWP 스펙 표 152)

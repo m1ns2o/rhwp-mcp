@@ -2,10 +2,13 @@
 //!
 //! 본문, 표 셀, 글상자 등 중첩 컨트롤 내부 텍스트를 포함한 전체 검색.
 
-use crate::document_core::helpers::get_textbox_from_shape;
-use crate::document_core::DocumentCore;
+use crate::document_core::helpers::{get_textbox_from_shape, get_textbox_from_shape_mut};
+use crate::document_core::queries::field_query::rebuild_char_offsets;
+use crate::document_core::{DocumentCore, TextReplaceLayoutPolicy};
 use crate::error::HwpError;
 use crate::model::control::Control;
+use crate::model::paragraph::LineSeg;
+use crate::parser::FileFormat;
 
 /// 검색 결과 위치 정보
 #[derive(Debug, Clone)]
@@ -16,6 +19,20 @@ struct SearchHit {
     length: usize,
     /// 표 셀 등 중첩 컨텍스트: (parent_para, ctrl_idx, cell_idx, cell_para)
     cell_context: Option<(usize, usize, usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
+struct HwpxTrailingLineSegSnapshot {
+    section: usize,
+    para: usize,
+    edited_para_line_count: usize,
+    edited_line_segs: Vec<LineSeg>,
+    trailing_line_segs: Vec<Vec<LineSeg>>,
+}
+
+#[derive(Debug, Clone)]
+struct HwpxSectionLineSegSnapshot {
+    sections: Vec<Vec<Vec<LineSeg>>>,
 }
 
 /// 문단 텍스트에서 query를 검색하여 모든 매치 오프셋을 반환
@@ -52,25 +69,6 @@ fn find_in_text(text: &str, query: &str, case_sensitive: bool) -> Vec<usize> {
         }
     }
     results
-}
-
-/// 문서 본문에서 query의 첫 번째 매치만 반환 (표/글상자 내부 제외, early-exit)
-fn search_first_body(doc: &DocumentCore, query: &str, case_sensitive: bool) -> Option<SearchHit> {
-    let qlen = query.chars().count();
-    for (sec_idx, section) in doc.document.sections.iter().enumerate() {
-        for (para_idx, para) in section.paragraphs.iter().enumerate() {
-            if let Some(&offset) = find_in_text(&para.text, query, case_sensitive).first() {
-                return Some(SearchHit {
-                    sec: sec_idx,
-                    para: para_idx,
-                    char_offset: offset,
-                    length: qlen,
-                    cell_context: None,
-                });
-            }
-        }
-    }
-    None
 }
 
 /// 문서 전체를 순회하며 query와 일치하는 모든 위치를 반환
@@ -138,6 +136,228 @@ fn search_all(doc: &DocumentCore, query: &str, case_sensitive: bool) -> Vec<Sear
 }
 
 impl DocumentCore {
+    fn snapshot_hwpx_trailing_line_segs(
+        &self,
+        section_idx: usize,
+        para_idx: usize,
+    ) -> Option<HwpxTrailingLineSegSnapshot> {
+        if !matches!(self.source_format, FileFormat::Hwpx) {
+            return None;
+        }
+        let section = self.document.sections.get(section_idx)?;
+        let edited = section.paragraphs.get(para_idx)?;
+        let trailing_line_segs = section
+            .paragraphs
+            .iter()
+            .skip(para_idx + 1)
+            .map(|para| para.line_segs.clone())
+            .collect();
+        Some(HwpxTrailingLineSegSnapshot {
+            section: section_idx,
+            para: para_idx,
+            edited_para_line_count: edited.line_segs.len(),
+            edited_line_segs: edited.line_segs.clone(),
+            trailing_line_segs,
+        })
+    }
+
+    fn restore_hwpx_line_segs_after_replace(
+        &mut self,
+        snapshot: Option<HwpxTrailingLineSegSnapshot>,
+        layout_policy: TextReplaceLayoutPolicy,
+    ) {
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        let Some(section) = self.document.sections.get_mut(snapshot.section) else {
+            return;
+        };
+        match layout_policy {
+            TextReplaceLayoutPolicy::Reflow => {
+                let Some(edited) = section.paragraphs.get(snapshot.para) else {
+                    return;
+                };
+                if edited.line_segs.len() != snapshot.edited_para_line_count {
+                    return;
+                }
+            }
+            TextReplaceLayoutPolicy::PreserveSourceLineSegments => {
+                let Some(edited) = section.paragraphs.get_mut(snapshot.para) else {
+                    return;
+                };
+                edited.line_segs = snapshot.edited_line_segs;
+            }
+        }
+        for (para, original_line_segs) in section
+            .paragraphs
+            .iter_mut()
+            .skip(snapshot.para + 1)
+            .zip(snapshot.trailing_line_segs)
+        {
+            para.line_segs = original_line_segs;
+        }
+        self.recompose_section(snapshot.section);
+        self.paginate_if_needed();
+    }
+
+    fn snapshot_hwpx_section_line_segs(&self) -> Option<HwpxSectionLineSegSnapshot> {
+        if !matches!(self.source_format, FileFormat::Hwpx) {
+            return None;
+        }
+        Some(HwpxSectionLineSegSnapshot {
+            sections: self
+                .document
+                .sections
+                .iter()
+                .map(|section| {
+                    section
+                        .paragraphs
+                        .iter()
+                        .map(|para| para.line_segs.clone())
+                        .collect()
+                })
+                .collect(),
+        })
+    }
+
+    fn restore_hwpx_section_line_segs_after_replace_all(
+        &mut self,
+        snapshot: Option<HwpxSectionLineSegSnapshot>,
+        layout_policy: TextReplaceLayoutPolicy,
+        affected_sections: &[usize],
+    ) {
+        if layout_policy != TextReplaceLayoutPolicy::PreserveSourceLineSegments {
+            return;
+        }
+        let Some(snapshot) = snapshot else {
+            return;
+        };
+        for &section_idx in affected_sections {
+            let Some(section) = self.document.sections.get_mut(section_idx) else {
+                continue;
+            };
+            let Some(section_line_segs) = snapshot.sections.get(section_idx) else {
+                continue;
+            };
+            for (para, original_line_segs) in section.paragraphs.iter_mut().zip(section_line_segs) {
+                para.line_segs = original_line_segs.clone();
+            }
+            self.recompose_section(section_idx);
+        }
+        self.paginate_if_needed();
+    }
+
+    fn body_char_shape_id_at(
+        &self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+    ) -> Option<u32> {
+        self.document
+            .sections
+            .get(section_idx)?
+            .paragraphs
+            .get(para_idx)?
+            .char_shape_id_at(char_offset)
+    }
+
+    fn apply_body_replacement_char_shape(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        char_offset: usize,
+        new_len: usize,
+        char_shape_id: u32,
+    ) -> Result<(), HwpError> {
+        if new_len == 0 {
+            return Ok(());
+        }
+        let section = self
+            .document
+            .sections
+            .get_mut(section_idx)
+            .ok_or_else(|| HwpError::RenderError("구역 범위 초과".into()))?;
+        let para = section
+            .paragraphs
+            .get_mut(para_idx)
+            .ok_or_else(|| HwpError::RenderError("문단 범위 초과".into()))?;
+        para.apply_char_shape_range(char_offset, char_offset + new_len, char_shape_id);
+        self.reflow_paragraph(section_idx, para_idx);
+        crate::renderer::composer::recalculate_section_vpos(
+            &mut self.document.sections[section_idx].paragraphs,
+            para_idx,
+        );
+        self.recompose_paragraph(section_idx, para_idx);
+        self.paginate_if_needed();
+        Ok(())
+    }
+
+    fn replace_nested_hit_direct(
+        &mut self,
+        hit: &SearchHit,
+        new_text: &str,
+    ) -> Result<usize, HwpError> {
+        let Some((parent_para, ctrl_idx, cell_idx, cell_para_idx)) = hit.cell_context else {
+            return Err(HwpError::RenderError("중첩 검색 결과가 아님".into()));
+        };
+
+        let new_len = {
+            let section = self
+                .document
+                .sections
+                .get_mut(hit.sec)
+                .ok_or_else(|| HwpError::RenderError("구역 범위 초과".into()))?;
+            let para = section
+                .paragraphs
+                .get_mut(parent_para)
+                .ok_or_else(|| HwpError::RenderError("문단 범위 초과".into()))?;
+
+            let nested_para = match para.controls.get_mut(ctrl_idx) {
+                Some(Control::Table(table)) => {
+                    let cell = table
+                        .cells
+                        .get_mut(cell_idx)
+                        .ok_or_else(|| HwpError::RenderError("셀 범위 초과".into()))?;
+                    cell.paragraphs
+                        .get_mut(cell_para_idx)
+                        .ok_or_else(|| HwpError::RenderError("셀 문단 범위 초과".into()))?
+                }
+                Some(Control::Shape(shape)) => {
+                    let tb = get_textbox_from_shape_mut(shape)
+                        .ok_or_else(|| HwpError::RenderError("글상자 없음".into()))?;
+                    tb.paragraphs
+                        .get_mut(cell_para_idx)
+                        .ok_or_else(|| HwpError::RenderError("글상자 문단 범위 초과".into()))?
+                }
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "중첩 검색 결과가 표/글상자 컨트롤을 가리키지 않음".into(),
+                    ));
+                }
+            };
+
+            let replacement_char_shape_id = nested_para.char_shape_id_at(hit.char_offset);
+            nested_para.delete_text_at(hit.char_offset, hit.length);
+            nested_para.insert_text_at(hit.char_offset, new_text);
+            let new_len = new_text.chars().count();
+            if let Some(char_shape_id) = replacement_char_shape_id {
+                nested_para.apply_char_shape_range(
+                    hit.char_offset,
+                    hit.char_offset + new_len,
+                    char_shape_id,
+                );
+            }
+            if !nested_para.field_ranges.is_empty() {
+                rebuild_char_offsets(nested_para);
+            }
+            new_len
+        };
+
+        self.mark_cell_control_dirty(hit.sec, parent_para, ctrl_idx);
+        self.reflow_cell_paragraph(hit.sec, parent_para, ctrl_idx, cell_idx, cell_para_idx);
+        Ok(new_len)
+    }
+
     /// 문서 텍스트 검색
     ///
     /// from_sec/from_para/from_char: 검색 시작 위치
@@ -255,10 +475,35 @@ impl DocumentCore {
         length: usize,
         new_text: &str,
     ) -> Result<String, HwpError> {
+        self.replace_text_with_layout_policy_native(
+            sec,
+            para,
+            char_offset,
+            length,
+            new_text,
+            TextReplaceLayoutPolicy::Reflow,
+        )
+    }
+
+    pub fn replace_text_with_layout_policy_native(
+        &mut self,
+        sec: usize,
+        para: usize,
+        char_offset: usize,
+        length: usize,
+        new_text: &str,
+        layout_policy: TextReplaceLayoutPolicy,
+    ) -> Result<String, HwpError> {
+        let snapshot = self.snapshot_hwpx_trailing_line_segs(sec, para);
+        let replacement_char_shape_id = self.body_char_shape_id_at(sec, para, char_offset);
         // 삭제 후 삽입
         self.delete_text_native(sec, para, char_offset, length)?;
         self.insert_text_native(sec, para, char_offset, new_text)?;
         let new_len = new_text.chars().count();
+        if let Some(char_shape_id) = replacement_char_shape_id {
+            self.apply_body_replacement_char_shape(sec, para, char_offset, new_len, char_shape_id)?;
+        }
+        self.restore_hwpx_line_segs_after_replace(snapshot, layout_policy);
         Ok(format!(
             "{{\"ok\":true,\"charOffset\":{},\"newLength\":{}}}",
             char_offset, new_len
@@ -267,8 +512,8 @@ impl DocumentCore {
 
     /// 단일 치환 (검색어 기반)
     ///
-    /// 문서 본문에서 query의 첫 번째 매치를 new_text로 교체한다.
-    /// 표/글상자 내부는 대상에서 제외 (search_text_native와 동일 범위).
+    /// 문서 전체에서 query의 첫 번째 매치를 new_text로 교체한다.
+    /// 본문, 표 셀, 글상자 내부 텍스트를 `replace_all_native`와 동일 순서로 검색한다.
     /// 반환: JSON `{"ok":true,"sec":N,"para":N,"charOffset":N,"newLength":N}` 또는 `{"ok":false}`
     pub fn replace_one_native(
         &mut self,
@@ -276,22 +521,75 @@ impl DocumentCore {
         new_text: &str,
         case_sensitive: bool,
     ) -> Result<String, HwpError> {
+        self.replace_one_with_layout_policy_native(
+            query,
+            new_text,
+            case_sensitive,
+            TextReplaceLayoutPolicy::Reflow,
+        )
+    }
+
+    pub fn replace_one_with_layout_policy_native(
+        &mut self,
+        query: &str,
+        new_text: &str,
+        case_sensitive: bool,
+        layout_policy: TextReplaceLayoutPolicy,
+    ) -> Result<String, HwpError> {
         if query.is_empty() {
             return Ok(r#"{"ok":false}"#.to_string());
         }
 
-        let hit = match search_first_body(self, query, case_sensitive) {
+        let hit = match search_all(self, query, case_sensitive).into_iter().next() {
             Some(h) => h,
             None => return Ok(r#"{"ok":false}"#.to_string()),
         };
 
-        let new_len = new_text.chars().count();
+        if hit.cell_context.is_some() {
+            let line_seg_snapshot = self.snapshot_hwpx_section_line_segs();
+            let new_len = self.replace_nested_hit_direct(&hit, new_text)?;
+            self.document.sections[hit.sec].raw_stream = None;
+            self.recompose_section(hit.sec);
+            self.paginate_if_needed();
+            self.restore_hwpx_section_line_segs_after_replace_all(
+                line_seg_snapshot,
+                layout_policy,
+                &[hit.sec],
+            );
+            return Ok(format!(
+                "{{\"ok\":true,\"sec\":{},\"para\":{},\"charOffset\":{},\"newLength\":{}{}}}",
+                hit.sec,
+                hit.para,
+                hit.char_offset,
+                new_len,
+                format_cell_context_fragment(&hit)
+            ));
+        }
+
+        let snapshot = self.snapshot_hwpx_trailing_line_segs(hit.sec, hit.para);
+        let replacement_char_shape_id =
+            self.body_char_shape_id_at(hit.sec, hit.para, hit.char_offset);
         self.delete_text_native(hit.sec, hit.para, hit.char_offset, hit.length)?;
         self.insert_text_native(hit.sec, hit.para, hit.char_offset, new_text)?;
+        let new_len = new_text.chars().count();
+        if let Some(char_shape_id) = replacement_char_shape_id {
+            self.apply_body_replacement_char_shape(
+                hit.sec,
+                hit.para,
+                hit.char_offset,
+                new_len,
+                char_shape_id,
+            )?;
+        }
+        self.restore_hwpx_line_segs_after_replace(snapshot, layout_policy);
 
         Ok(format!(
-            "{{\"ok\":true,\"sec\":{},\"para\":{},\"charOffset\":{},\"newLength\":{}}}",
-            hit.sec, hit.para, hit.char_offset, new_len
+            "{{\"ok\":true,\"sec\":{},\"para\":{},\"charOffset\":{},\"newLength\":{}{}}}",
+            hit.sec,
+            hit.para,
+            hit.char_offset,
+            new_len,
+            format_cell_context_fragment(&hit)
         ))
     }
 
@@ -305,9 +603,26 @@ impl DocumentCore {
         new_text: &str,
         case_sensitive: bool,
     ) -> Result<String, HwpError> {
+        self.replace_all_with_layout_policy_native(
+            query,
+            new_text,
+            case_sensitive,
+            TextReplaceLayoutPolicy::Reflow,
+        )
+    }
+
+    pub fn replace_all_with_layout_policy_native(
+        &mut self,
+        query: &str,
+        new_text: &str,
+        case_sensitive: bool,
+        layout_policy: TextReplaceLayoutPolicy,
+    ) -> Result<String, HwpError> {
         if query.is_empty() {
             return Ok(r#"{"ok":true,"count":0}"#.to_string());
         }
+
+        let line_seg_snapshot = self.snapshot_hwpx_section_line_segs();
 
         // 모든 매치를 찾되, 역순으로 치환 (오프셋 변동 방지)
         let mut all_hits = search_all(self, query, case_sensitive);
@@ -317,39 +632,11 @@ impl DocumentCore {
         let count = all_hits.len();
 
         for hit in &all_hits {
-            if let Some((parent_para, ctrl_idx, cell_idx, cell_para_idx)) = hit.cell_context {
-                // 표 셀 내부 치환
-                let section = self
-                    .document
-                    .sections
-                    .get_mut(hit.sec)
-                    .ok_or_else(|| HwpError::RenderError("구역 범위 초과".into()))?;
-                let para = section
-                    .paragraphs
-                    .get_mut(parent_para)
-                    .ok_or_else(|| HwpError::RenderError("문단 범위 초과".into()))?;
-
-                let cell_para = match para.controls.get_mut(ctrl_idx) {
-                    Some(Control::Table(table)) => {
-                        let cell = table
-                            .cells
-                            .get_mut(cell_idx)
-                            .ok_or_else(|| HwpError::RenderError("셀 범위 초과".into()))?;
-                        cell.paragraphs
-                            .get_mut(cell_para_idx)
-                            .ok_or_else(|| HwpError::RenderError("셀 문단 범위 초과".into()))?
-                    }
-                    Some(Control::Shape(shape)) => {
-                        let tb = crate::document_core::helpers::get_textbox_from_shape_mut(shape)
-                            .ok_or_else(|| HwpError::RenderError("글상자 없음".into()))?;
-                        tb.paragraphs
-                            .get_mut(cell_para_idx)
-                            .ok_or_else(|| HwpError::RenderError("글상자 문단 범위 초과".into()))?
-                    }
-                    _ => continue,
-                };
-                cell_para.delete_text_at(hit.char_offset, hit.length);
-                cell_para.insert_text_at(hit.char_offset, new_text);
+            if hit.cell_context.is_some() {
+                // 표 셀/글상자 내부 치환
+                if self.replace_nested_hit_direct(hit, new_text).is_err() {
+                    continue;
+                }
             } else {
                 // 본문 문단 치환 — delete_text_native + insert_text_native는 recompose를 호출하므로
                 // 성능을 위해 직접 문단 수준 조작 후 마지막에 일괄 recompose
@@ -362,8 +649,17 @@ impl DocumentCore {
                     .paragraphs
                     .get_mut(hit.para)
                     .ok_or_else(|| HwpError::RenderError("문단 범위 초과".into()))?;
+                let replacement_char_shape_id = para.char_shape_id_at(hit.char_offset);
                 para.delete_text_at(hit.char_offset, hit.length);
                 para.insert_text_at(hit.char_offset, new_text);
+                if let Some(char_shape_id) = replacement_char_shape_id {
+                    let new_len = new_text.chars().count();
+                    para.apply_char_shape_range(
+                        hit.char_offset,
+                        hit.char_offset + new_len,
+                        char_shape_id,
+                    );
+                }
             }
         }
 
@@ -372,12 +668,17 @@ impl DocumentCore {
             let mut affected_sections: Vec<usize> = all_hits.iter().map(|h| h.sec).collect();
             affected_sections.sort();
             affected_sections.dedup();
-            for sec_idx in affected_sections {
+            for &sec_idx in &affected_sections {
                 // 편집 시 raw 스트림 무효화 (재직렬화 유도) — 캐시가 남으면 export_hwp가
                 // 원본 바이트를 그대로 반환해 치환 결과가 저장에서 유실된다 (#1385)
                 self.document.sections[sec_idx].raw_stream = None;
                 self.recompose_section(sec_idx);
             }
+            self.restore_hwpx_section_line_segs_after_replace_all(
+                line_seg_snapshot,
+                layout_policy,
+                &affected_sections,
+            );
         }
 
         Ok(format!("{{\"ok\":true,\"count\":{}}}", count))
@@ -450,17 +751,21 @@ impl DocumentCore {
 }
 
 fn format_search_hit(hit: &SearchHit, wrapped: bool) -> String {
-    let cell_ctx = match &hit.cell_context {
+    let cell_ctx = format_cell_context_fragment(hit);
+    format!(
+        "{{\"found\":true,\"wrapped\":{},\"sec\":{},\"para\":{},\"charOffset\":{},\"length\":{}{}}}",
+        wrapped, hit.sec, hit.para, hit.char_offset, hit.length, cell_ctx
+    )
+}
+
+fn format_cell_context_fragment(hit: &SearchHit) -> String {
+    match &hit.cell_context {
         Some((pp, ci, cell, cp)) => format!(
             ",\"cellContext\":{{\"parentPara\":{},\"ctrlIdx\":{},\"cellIdx\":{},\"cellPara\":{}}}",
             pp, ci, cell, cp
         ),
         None => String::new(),
-    };
-    format!(
-        "{{\"found\":true,\"wrapped\":{},\"sec\":{},\"para\":{},\"charOffset\":{},\"length\":{}{}}}",
-        wrapped, hit.sec, hit.para, hit.char_offset, hit.length, cell_ctx
-    )
+    }
 }
 
 #[cfg(test)]

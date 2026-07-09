@@ -1,0 +1,66 @@
+{
+  "name": "rhwp-mcp-desktop",
+  "version": "0.7.17",
+  "private": true,
+  "description": "Desktop wrapper for rhwp-mcp and rhwp-studio",
+  "author": "rhwp contributors",
+  "desktopName": "rhwp-mcp",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "prepare:resources": "node scripts/prepare-resources.mjs",
+    "dist": "npm run prepare:resources && electron-builder",
+    "dist:dir": "npm run prepare:resources && electron-builder --dir"
+  },
+  "devDependencies": {
+    "electron": "43.1.0",
+    "electron-builder": "26.15.3"
+  },
+  "build": {
+    "appId": "io.github.m1ns2o.rhwp-mcp",
+    "productName": "rhwp MCP",
+    "artifactName": "rhwp-mcp-${version}-${os}-${arch}.${ext}",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "build-resources/studio",
+        "to": "studio"
+      },
+      {
+        "from": "build-resources/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "target": [
+        "nsis",
+        "zip"
+      ]
+    },
+    "linux": {
+      "category": "Office",
+      "icon": "../assets/logo/logo-512.png",
+      "syncDesktopName": true,
+      "target": [
+        "AppImage"
+      ]
+    }
+  }
+}

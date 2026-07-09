@@ -134,6 +134,22 @@ pub struct Cell {
     /// 셀 필드 이름 (한컴 셀 속성 → 필드 → 필드 이름)
     /// raw_list_extra의 offset 14-15(name_len) + offset 16~(UTF-16LE)에서 추출
     pub field_name: Option<String>,
+    /// HWPX `<hp:tc dirty="...">` 셀 상태 메타데이터.
+    pub dirty: bool,
+    /// HWPX table-cell `<hp:subList lineWrap="...">`.
+    pub sub_list_line_wrap: String,
+    /// HWPX table-cell `<hp:subList linkListIDRef="...">`.
+    pub sub_list_link_list_id_ref: u32,
+    /// HWPX table-cell `<hp:subList linkListNextIDRef="...">`.
+    pub sub_list_link_list_next_id_ref: u32,
+    /// HWPX table-cell `<hp:subList textWidth="...">`.
+    pub sub_list_text_width: HwpUnit,
+    /// HWPX table-cell `<hp:subList textHeight="...">`.
+    pub sub_list_text_height: HwpUnit,
+    /// HWPX table-cell `<hp:subList hasTextRef="...">`.
+    pub sub_list_text_ref: u8,
+    /// HWPX table-cell `<hp:subList hasNumRef="...">`.
+    pub sub_list_num_ref: u8,
 }
 
 /// 세로 정렬
@@ -251,6 +267,14 @@ impl Cell {
             vertical_align: template.vertical_align,
             apply_inner_margin: template.apply_inner_margin,
             is_header: template.is_header,
+            dirty: template.dirty,
+            sub_list_line_wrap: template.sub_list_line_wrap.clone(),
+            sub_list_link_list_id_ref: template.sub_list_link_list_id_ref,
+            sub_list_link_list_next_id_ref: template.sub_list_link_list_next_id_ref,
+            sub_list_text_width: template.sub_list_text_width,
+            sub_list_text_height: template.sub_list_text_height,
+            sub_list_text_ref: template.sub_list_text_ref,
+            sub_list_num_ref: template.sub_list_num_ref,
             raw_list_extra: template.raw_list_extra.clone(),
             field_name: None,
             paragraphs: vec![para],

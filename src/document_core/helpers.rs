@@ -630,6 +630,7 @@ pub(crate) fn build_tab_def_from_json(
     let attr = (if auto_left { 1u32 } else { 0 }) | (if auto_right { 2u32 } else { 0 });
     TabDef {
         raw_data: None,
+        raw_hwpx_children: None,
         attr,
         tabs,
         auto_tab_left: auto_left,
@@ -823,11 +824,21 @@ pub(crate) fn json_usize(json: &str, key: &str) -> Result<usize, HwpError> {
 
 /// JSON 문자열 이스케이프
 pub(crate) fn json_escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// JSON 성공 응답 생성: {"ok":true}

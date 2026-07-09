@@ -33,7 +33,7 @@ use crate::model::shape::{
 use crate::model::style::{
     Alignment, BorderLine, BorderLineType, HeadType, Numbering, UnderlineType,
 };
-use crate::model::table::VerticalAlign;
+use crate::model::table::{Table, VerticalAlign};
 
 /// layout_column_item의 읽기 전용 컨텍스트 (파라미터 묶음)
 struct ColumnItemCtx<'a> {
@@ -268,6 +268,28 @@ fn para_has_visible_text(para: &Paragraph) -> bool {
     para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}')
 }
 
+fn table_is_short_form_heading_marker(table: &Table) -> bool {
+    if !table.common.treat_as_char || !matches!(table.common.text_wrap, TextWrap::TopAndBottom) {
+        return false;
+    }
+    if table.row_count != 1 || table.col_count != 1 || table.cells.len() != 1 {
+        return false;
+    }
+
+    let text: String = table.cells[0]
+        .paragraphs
+        .iter()
+        .flat_map(|para| para.text.chars())
+        .filter(|ch| *ch > '\u{001F}' && *ch != '\u{FFFC}')
+        .collect();
+    let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
+    compact.chars().count() <= 32
+        && compact.starts_with("[별지")
+        && compact.contains('제')
+        && compact.contains('호')
+        && compact.contains("서식")
+}
+
 fn para_has_visible_inline_control(para: &Paragraph) -> bool {
     para.controls.iter().any(|ctrl| match ctrl {
         Control::Picture(pic) => pic.common.treat_as_char,
@@ -349,6 +371,45 @@ fn textless_non_tac_topbottom_object_tail_advance_px(
         }
         _ => None,
     }
+}
+
+fn saved_gap_after_textless_tac_table_px(
+    previous_para: &Paragraph,
+    current_para: &Paragraph,
+    dpi: f64,
+) -> Option<f64> {
+    if para_has_visible_text(previous_para) || !para_has_visible_text(current_para) {
+        return None;
+    }
+    let has_tac_table = previous_para
+        .controls
+        .iter()
+        .any(|ctrl| matches!(ctrl, Control::Table(table) if table.common.treat_as_char));
+    if !has_tac_table {
+        return None;
+    }
+    let has_other_visible_control = previous_para.controls.iter().any(|ctrl| match ctrl {
+        Control::Table(table) => !table.common.treat_as_char,
+        Control::Picture(_) | Control::Shape(_) | Control::Equation(_) | Control::Form(_) => true,
+        _ => false,
+    });
+    if has_other_visible_control {
+        return None;
+    }
+    let prev_seg = previous_para
+        .line_segs
+        .iter()
+        .rev()
+        .find(|seg| seg.segment_width > 0)
+        .or_else(|| previous_para.line_segs.last())?;
+    let current_first_vpos = current_para.line_segs.first()?.vertical_pos;
+    let previous_end_vpos =
+        prev_seg.vertical_pos + (prev_seg.line_height + prev_seg.line_spacing).max(0);
+    let saved_gap_hu = current_first_vpos - previous_end_vpos;
+    if !(1_500..=12_000).contains(&saved_gap_hu) {
+        return None;
+    }
+    Some(hwpunit_to_px(saved_gap_hu, dpi))
 }
 
 fn compact_endnote_title_gap_after_single_equation_tail(
@@ -3495,7 +3556,48 @@ impl LayoutEngine {
                 None
             };
             hcursor.prev_item_content_bottom_y = prev_item_content_bottom_y;
-            if !shape_jumped && (!prev_tac_seg_applied || current_is_endnote_question_title) {
+            let saved_para_gap_applied =
+                if !prev_tac_seg_applied && !current_is_endnote_question_title {
+                    if let Some(delta) = paragraphs.get(item_para).and_then(|para| {
+                        (para.rhwp_saved_para_gap_before > 0)
+                            .then(|| hwpunit_to_px(para.rhwp_saved_para_gap_before, self.dpi))
+                    }) {
+                        y_offset += delta;
+                        hcursor.shift_vpos_base_for_rendered_delta(delta);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+            if prev_tac_seg_applied && !current_is_endnote_question_title {
+                let tac_saved_gap = paragraphs
+                    .get(item_para)
+                    .and_then(|para| {
+                        (para.rhwp_saved_tac_gap_before > 0)
+                            .then(|| hwpunit_to_px(para.rhwp_saved_tac_gap_before, self.dpi))
+                    })
+                    .or_else(|| {
+                        hcursor.prev_layout_para.and_then(|prev_pi| {
+                            let previous_para = paragraphs.get(prev_pi)?;
+                            let current_para = paragraphs.get(item_para)?;
+                            saved_gap_after_textless_tac_table_px(
+                                previous_para,
+                                current_para,
+                                self.dpi,
+                            )
+                        })
+                    });
+                if let Some(delta) = tac_saved_gap {
+                    y_offset += delta;
+                    hcursor.shift_vpos_base_for_rendered_delta(delta);
+                }
+            }
+            if !shape_jumped
+                && !saved_para_gap_applied
+                && (!prev_tac_seg_applied || current_is_endnote_question_title)
+            {
                 // [Task #1027 Stage C] inter-item VPOS_CORR 보정을 HeightCursor 에 위임 (동작 동일).
                 // 이전 문단 overlay-shape/분할표 bypass, page/lazy base 산출, sb 차감,
                 // ≤8px 백워드 클램프를 모두 캡슐화 (Stage A/B 함수 결합). 렌더러·페이지네이터 공유.
@@ -4168,7 +4270,36 @@ impl LayoutEngine {
                 col_bottom,
                 self.last_item_endnote_equation_tail_line_box.get(),
             );
-            if check_y > col_bottom + tolerance && !tolerated_endnote_bottom_bleed {
+            let tolerated_short_form_heading_bleed = match item {
+                PageItem::Table {
+                    para_index,
+                    control_index,
+                } => paragraphs
+                    .get(*para_index)
+                    .and_then(|para| para.controls.get(*control_index))
+                    .and_then(|ctrl| match ctrl {
+                        Control::Table(table) => Some(table.as_ref()),
+                        _ => None,
+                    })
+                    .map(|table| {
+                        // Hancom-authored forms sometimes leave the next form heading
+                        // ([별지 제N호 서식]) visible in the bottom margin. Treat that
+                        // one-line marker as intentional bleed, not a table fitting error.
+                        let item_visual_height = (check_y - _y_in).max(0.0);
+                        item_ordinal + 1 == col_content.items.len()
+                            && item_ordinal > 0
+                            && _y_in <= col_bottom + tolerance
+                            && check_y - col_bottom <= 24.0
+                            && item_visual_height <= 32.0
+                            && table_is_short_form_heading_marker(table)
+                    })
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if check_y > col_bottom + tolerance
+                && !tolerated_endnote_bottom_bleed
+                && !tolerated_short_form_heading_bleed
+            {
                 let (item_type, para_idx) = match item {
                     PageItem::FullParagraph { para_index } => ("FullParagraph", *para_index),
                     PageItem::PartialParagraph { para_index, .. } => {
@@ -5109,6 +5240,7 @@ impl LayoutEngine {
                 .get(control_index)
                 .map(|c| matches!(c, Control::Table(t) if t.common.treat_as_char))
                 .unwrap_or(false);
+            let saved_gap_before_table = para.rhwp_saved_para_gap_before > 0;
             let is_current_empty_para_float = para
                 .controls
                 .get(control_index)
@@ -5150,7 +5282,7 @@ impl LayoutEngine {
                                 .get(ps_id)
                                 .map(|ps| ps.spacing_before)
                                 .unwrap_or(0.0);
-                            if spacing_before > 0.0 {
+                            if spacing_before > 0.0 && !saved_gap_before_table {
                                 y_offset += spacing_before;
                             }
                         }
@@ -5160,7 +5292,7 @@ impl LayoutEngine {
                     }
                 } else if !is_current_empty_para_float {
                     if let Some(ps) = styles.para_styles.get(ps_id) {
-                        if ps.spacing_before > 0.0 && !is_column_top {
+                        if ps.spacing_before > 0.0 && !is_column_top && !saved_gap_before_table {
                             y_offset += ps.spacing_before;
                         }
                     }
@@ -6198,13 +6330,14 @@ impl LayoutEngine {
                         let para_y_for_pic =
                             para_start_y.get(&para_index).copied().unwrap_or(y_offset)
                                 + sibling_reserved_px;
-                        let default_pic_y = self.compute_tac_picture_shape_y(
-                            para,
-                            comp,
-                            styles,
-                            para_y_for_pic,
-                            pic_h,
-                        );
+                        let default_pic_y =
+                            self.compute_tac_picture_shape_y(
+                                para,
+                                comp,
+                                styles,
+                                para_y_for_pic,
+                                pic_h,
+                            ) + hwpunit_to_px(signed_hwpunit(pic.common.vertical_offset), self.dpi);
                         let para_style_id = comp
                             .map(|c| c.para_style_id as usize)
                             .unwrap_or(para.para_shape_id as usize);
@@ -6317,7 +6450,10 @@ impl LayoutEngine {
                                 }
                                 _ => col_area.x + effective_margin_left,
                             }
-                        };
+                        } + hwpunit_to_px(
+                            signed_hwpunit(pic.common.horizontal_offset),
+                            self.dpi,
+                        );
 
                         // [Task #1151 v9 결함 D fix] pic_y 의 시퀀스 후속 picture 결정 —
                         // pic_x wrap 처리 후 갱신된 state.line_top_y 사용 (wrap 시 진행됨).
@@ -6595,6 +6731,16 @@ impl LayoutEngine {
                                 }
                                 pic_content_bottom = pic_content_bottom.max(cap_bottom);
                             }
+                        }
+                        if !has_real_text
+                            && (already_registered || !has_full_para_item)
+                            && (is_single_pic || is_last_in_seq)
+                            && pic.common.flow_with_text
+                            && matches!(pic.common.text_wrap, TextWrap::TopAndBottom)
+                            && signed_hwpunit(pic.common.vertical_offset) > 0
+                            && pic_content_bottom > result_y + 1.0
+                        {
+                            result_y = pic_content_bottom;
                         }
                         let prev_bottom = self.last_item_content_bottom.get();
                         self.last_item_content_bottom

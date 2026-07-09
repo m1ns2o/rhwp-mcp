@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "description": "Representative visual/render baseline policy for the file-based rhwp-mcp gate. This is intentionally a small mixed set, not a broad corpus sweep.",
+  "page_crop": { "x": 50, "y": 64, "width": 860, "height": 1208 },
+  "diff_threshold": 16,
+  "shift_tolerance_px": 2,
+  "visual_diff_policies": [
+    {
+      "name": "government-original-vs-edited-page18-diff",
+      "max_changed_percent": 0.1,
+      "max_mean_abs_diff": 0.15,
+      "intent": "Localized middle-heading edit in a government form"
+    },
+    {
+      "name": "government-original-vs-regenerated-page18-diff",
+      "max_changed_percent": 0.02,
+      "max_mean_abs_diff": 0.03,
+      "intent": "Same-page government form template regeneration"
+    },
+    {
+      "name": "government-original-vs-regenerated-best-match-diff",
+      "max_changed_percent": 0.02,
+      "max_mean_abs_diff": 0.03,
+      "intent": "Best-match government form template regeneration"
+    },
+    {
+      "name": "foreign-investment-original-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Authored HWPX save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "business-overview-original-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Compact business HWPX save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "k-water-rfp-original-vs-edited-page1-diff",
+      "max_changed_percent": 0.35,
+      "max_mean_abs_diff": 0.65,
+      "intent": "Localized cover-date edit in a long RFP HWPX"
+    },
+    {
+      "name": "k-water-rfp-edited-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Edited long RFP HWPX save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "hwp-multi-original-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.001,
+      "intent": "Authored multi-table/picture HWP save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "field-memo-original-vs-edited-page2-diff",
+      "max_changed_percent": 0.8,
+      "max_mean_abs_diff": 1.2,
+      "intent": "Authored field/memo HWP shape text-box field localized edit on page 2"
+    },
+    {
+      "name": "field-memo-edited-vs-reopened-page2-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Edited authored field/memo HWP save/reopen must be visually identical on page 2"
+    },
+    {
+      "name": "endnote-equation-original-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Authored endnote/equation HWP save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "water-mark-original-vs-reopened-page1-diff",
+      "max_changed_percent": 0.0001,
+      "max_mean_abs_diff": 0.0001,
+      "intent": "Authored water-mark HWP save/reopen must be visually identical on page 1"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-page1-diff",
+      "max_changed_percent": 1.2,
+      "max_mean_abs_diff": 0.6,
+      "intent": "Authored multi-section form page 1 regeneration tolerance"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-best-match-diff",
+      "max_changed_percent": 1.2,
+      "max_mean_abs_diff": 0.6,
+      "intent": "Authored multi-section form page 1 best-match tolerance"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-page2-diff",
+      "max_changed_percent": 0.01,
+      "max_mean_abs_diff": 0.01,
+      "intent": "Authored multi-section form page 2 should remain effectively identical"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-page2-best-match-diff",
+      "max_changed_percent": 0.01,
+      "max_mean_abs_diff": 0.01,
+      "intent": "Authored multi-section form page 2 best-match should remain effectively identical"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-page3-diff",
+      "max_changed_percent": 0.1,
+      "max_mean_abs_diff": 0.08,
+      "intent": "Authored multi-section form page 3 regeneration tolerance"
+    },
+    {
+      "name": "hcar-original-vs-regenerated-page3-best-match-diff",
+      "max_changed_percent": 0.1,
+      "max_mean_abs_diff": 0.08,
+      "intent": "Authored multi-section form page 3 best-match tolerance"
+    }
+  ],
+  "render_page_match_policies": [
+    {
+      "name": "hcar-page1",
+      "display_page": 1,
+      "min_score": 0.999,
+      "min_text_similarity": 0.999
+    },
+    {
+      "name": "hcar-page2",
+      "display_page": 2,
+      "min_score": 0.9999,
+      "min_text_similarity": 0.9999
+    },
+    {
+      "name": "hcar-page3",
+      "display_page": 3,
+      "min_score": 0.995,
+      "min_text_similarity": 0.99
+    }
+  ]
+}

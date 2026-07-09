@@ -302,6 +302,7 @@ fn parse_face_name(data: &[u8]) -> Result<Font, DocInfoError> {
 
     Ok(Font {
         raw_data: None,
+        raw_hwpx_children: None,
         name,
         alt_type: attr & 0x03,
         alt_name,
@@ -359,7 +360,12 @@ fn parse_border_fill(data: &[u8]) -> Result<BorderFill, DocInfoError> {
 
     Ok(BorderFill {
         raw_data: None,
+        raw_hwpx_children: None,
         attr,
+        three_d: (attr & 0x0001) != 0,
+        shadow: (attr & 0x0002) != 0,
+        center_line: None,
+        break_cell_separate_line: false,
         borders,
         diagonal,
         fill,
@@ -656,6 +662,7 @@ fn parse_tab_def(data: &[u8]) -> Result<TabDef, DocInfoError> {
 
     Ok(TabDef {
         raw_data: None,
+        raw_hwpx_children: None,
         attr,
         tabs,
         auto_tab_left: (attr & 0x01) != 0,
@@ -750,6 +757,10 @@ fn parse_para_shape(data: &[u8]) -> Result<ParaShape, DocInfoError> {
         attr2,
         attr3,
         line_spacing_v2,
+        suppress_line_numbers: false,
+        checked: false,
+        auto_spacing_easian_eng: None,
+        auto_spacing_easian_num: None,
         head_type,
         para_level,
     })
@@ -833,6 +844,7 @@ fn parse_bullet(data: &[u8]) -> Result<Bullet, DocInfoError> {
 
     Ok(Bullet {
         raw_data: None,
+        raw_hwpx_children: None,
         attr,
         width_adjust,
         text_distance,
@@ -863,7 +875,7 @@ fn parse_style(data: &[u8]) -> Result<Style, DocInfoError> {
     let _trailing = r.read_u16().unwrap_or(0);
 
     Ok(Style {
-        raw_data: None,
+        raw_data: Some(data.to_vec()),
         local_name,
         english_name,
         style_type,

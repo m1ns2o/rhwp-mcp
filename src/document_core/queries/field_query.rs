@@ -21,6 +21,12 @@ pub struct FieldLocation {
 /// 중첩 경로 항목 (표 셀 또는 글상자 내부)
 #[derive(Debug, Clone)]
 pub enum NestedEntry {
+    /// 머리말/꼬리말: (control_index, is_header, para_index)
+    HeaderFooter {
+        control_index: usize,
+        is_header: bool,
+        para_index: usize,
+    },
     /// 표 셀: (control_index, cell_index, para_index)
     TableCell {
         control_index: usize,
@@ -384,6 +390,42 @@ impl DocumentCore {
             .enumerate()
         {
             para = match entry {
+                NestedEntry::HeaderFooter {
+                    control_index,
+                    is_header,
+                    para_index,
+                } => {
+                    let ctrl = para.controls.get_mut(*control_index).ok_or_else(|| {
+                        HwpError::InvalidField(format!(
+                            "경로[{}]: 컨트롤 인덱스 {} 초과",
+                            i, control_index
+                        ))
+                    })?;
+                    match ctrl {
+                        Control::Header(header) if *is_header => {
+                            header.paragraphs.get_mut(*para_index).ok_or_else(|| {
+                                HwpError::InvalidField(format!(
+                                    "경로[{}]: 머리말 문단 인덱스 {} 초과",
+                                    i, para_index
+                                ))
+                            })?
+                        }
+                        Control::Footer(footer) if !*is_header => {
+                            footer.paragraphs.get_mut(*para_index).ok_or_else(|| {
+                                HwpError::InvalidField(format!(
+                                    "경로[{}]: 꼬리말 문단 인덱스 {} 초과",
+                                    i, para_index
+                                ))
+                            })?
+                        }
+                        _ => {
+                            return Err(HwpError::InvalidField(format!(
+                                "경로[{}]: controls[{}]가 지정한 머리말/꼬리말이 아님",
+                                i, control_index
+                            )))
+                        }
+                    }
+                }
                 NestedEntry::TableCell {
                     control_index,
                     cell_index,
@@ -564,6 +606,42 @@ impl DocumentCore {
 
         for (i, entry) in location.nested_path.iter().enumerate() {
             para = match entry {
+                NestedEntry::HeaderFooter {
+                    control_index,
+                    is_header,
+                    para_index,
+                } => {
+                    let ctrl = para.controls.get_mut(*control_index).ok_or_else(|| {
+                        HwpError::InvalidField(format!(
+                            "경로[{}]: 컨트롤 인덱스 {} 초과",
+                            i, control_index
+                        ))
+                    })?;
+                    match ctrl {
+                        Control::Header(header) if *is_header => {
+                            header.paragraphs.get_mut(*para_index).ok_or_else(|| {
+                                HwpError::InvalidField(format!(
+                                    "경로[{}]: 머리말 문단 인덱스 {} 초과",
+                                    i, para_index
+                                ))
+                            })?
+                        }
+                        Control::Footer(footer) if !*is_header => {
+                            footer.paragraphs.get_mut(*para_index).ok_or_else(|| {
+                                HwpError::InvalidField(format!(
+                                    "경로[{}]: 꼬리말 문단 인덱스 {} 초과",
+                                    i, para_index
+                                ))
+                            })?
+                        }
+                        _ => {
+                            return Err(HwpError::InvalidField(format!(
+                                "경로[{}]: controls[{}]가 지정한 머리말/꼬리말이 아님",
+                                i, control_index
+                            )))
+                        }
+                    }
+                }
                 NestedEntry::TableCell {
                     control_index,
                     cell_index,
@@ -708,6 +786,119 @@ impl DocumentCore {
         remove_field_in_para(para, char_offset)?;
         self.recompose_section(section_idx);
         Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    /// path 기반 중첩 표 셀/글상자 문단의 커서 위치에서 필드를 제거한다.
+    pub fn remove_field_at_by_path(
+        &mut self,
+        section_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        char_offset: usize,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::InvalidField("cellPath가 비어 있음".into()));
+        }
+        {
+            let para = self.get_cell_paragraph_mut_by_path(section_idx, parent_para_idx, path)?;
+            remove_field_in_para(para, char_offset)?;
+        }
+
+        let outer_ctrl = path[0].0;
+        self.mark_cell_control_dirty(section_idx, parent_para_idx, outer_ctrl);
+        if let Some(section) = self.document.sections.get_mut(section_idx) {
+            section.raw_stream = None;
+        }
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::CellTextChanged {
+            section: section_idx,
+            para: parent_para_idx,
+            ctrl: outer_ctrl,
+            cell: path[0].1,
+        });
+
+        Ok(r#"{"ok":true}"#.to_string())
+    }
+
+    /// 머리말/꼬리말 문단의 현재 커서 위치에 빈 ClickHere 누름틀을 삽입한다.
+    pub fn insert_click_here_field_in_header_footer_native(
+        &mut self,
+        section_idx: usize,
+        is_header: bool,
+        apply_to: u8,
+        hf_para_idx: usize,
+        char_offset: usize,
+        guide: &str,
+        memo: &str,
+        name: &str,
+        editable: bool,
+    ) -> Result<String, HwpError> {
+        let field_id = self.next_click_here_field_id();
+        let inserted_offset = {
+            let para = self.get_hf_paragraph_mut(section_idx, is_header, apply_to, hf_para_idx)?;
+            insert_click_here_field_in_para(
+                para,
+                char_offset,
+                field_id,
+                guide,
+                memo,
+                name,
+                editable,
+            )?
+        };
+
+        self.reflow_hf_paragraph(section_idx, is_header, apply_to, hf_para_idx);
+        if let Some(section) = self.document.sections.get_mut(section_idx) {
+            section.raw_stream = None;
+        }
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+        self.event_log.push(DocumentEvent::TextInserted {
+            section: section_idx,
+            para: 0,
+            offset: inserted_offset,
+            len: 0,
+        });
+
+        Ok(format!(
+            "{{\"ok\":true,\"fieldId\":{},\"charOffset\":{},\"scope\":\"{}\",\"hfPara\":{}}}",
+            field_id,
+            inserted_offset,
+            if is_header { "header" } else { "footer" },
+            hf_para_idx
+        ))
+    }
+
+    /// 머리말/꼬리말 문단의 커서 위치에서 ClickHere 누름틀을 제거한다.
+    pub fn remove_field_in_header_footer_native(
+        &mut self,
+        section_idx: usize,
+        is_header: bool,
+        apply_to: u8,
+        hf_para_idx: usize,
+        char_offset: usize,
+    ) -> Result<String, HwpError> {
+        {
+            let para = self.get_hf_paragraph_mut(section_idx, is_header, apply_to, hf_para_idx)?;
+            remove_field_in_para(para, char_offset)?;
+        }
+
+        self.reflow_hf_paragraph(section_idx, is_header, apply_to, hf_para_idx);
+        if let Some(section) = self.document.sections.get_mut(section_idx) {
+            section.raw_stream = None;
+        }
+        self.mark_section_dirty(section_idx);
+        self.paginate_if_needed();
+        self.invalidate_page_tree_cache();
+
+        Ok(format!(
+            "{{\"ok\":true,\"scope\":\"{}\",\"hfPara\":{}}}",
+            if is_header { "header" } else { "footer" },
+            hf_para_idx
+        ))
     }
 
     /// 커서가 진입한 활성 필드를 설정한다 (안내문 렌더링 스킵용).
@@ -1020,6 +1211,28 @@ fn collect_fields_from_paragraph(
                     }
                 }
             }
+            Control::Header(header) => {
+                for (pi, header_para) in header.paragraphs.iter().enumerate() {
+                    let mut loc = base_location.clone();
+                    loc.nested_path.push(NestedEntry::HeaderFooter {
+                        control_index: ci,
+                        is_header: true,
+                        para_index: pi,
+                    });
+                    collect_fields_from_paragraph(header_para, &loc, result);
+                }
+            }
+            Control::Footer(footer) => {
+                for (pi, footer_para) in footer.paragraphs.iter().enumerate() {
+                    let mut loc = base_location.clone();
+                    loc.nested_path.push(NestedEntry::HeaderFooter {
+                        control_index: ci,
+                        is_header: false,
+                        para_index: pi,
+                    });
+                    collect_fields_from_paragraph(footer_para, &loc, result);
+                }
+            }
             Control::Shape(shape) => {
                 if let Some(drawing) = shape.drawing() {
                     if let Some(tb) = &drawing.text_box {
@@ -1048,6 +1261,11 @@ fn field_location_json(loc: &FieldLocation) -> String {
         )
     } else {
         let path_entries: Vec<String> = loc.nested_path.iter().map(|e| match e {
+            NestedEntry::HeaderFooter { control_index, is_header, para_index } => {
+                let kind = if *is_header { "header" } else { "footer" };
+                format!("{{\"type\":\"{}\",\"controlIndex\":{},\"paraIndex\":{}}}",
+                    kind, control_index, para_index)
+            }
             NestedEntry::TableCell { control_index, cell_index, para_index } => {
                 format!("{{\"type\":\"cell\",\"controlIndex\":{},\"cellIndex\":{},\"paraIndex\":{}}}",
                     control_index, cell_index, para_index)
@@ -1076,6 +1294,18 @@ fn para_at_location<'a>(core: &'a DocumentCore, location: &FieldLocation) -> Opt
 
     for entry in &location.nested_path {
         para = match entry {
+            NestedEntry::HeaderFooter {
+                control_index,
+                is_header,
+                para_index,
+            } => {
+                let ctrl = para.controls.get(*control_index)?;
+                match ctrl {
+                    Control::Header(header) if *is_header => header.paragraphs.get(*para_index)?,
+                    Control::Footer(footer) if !*is_header => footer.paragraphs.get(*para_index)?,
+                    _ => return None,
+                }
+            }
             NestedEntry::TableCell {
                 control_index,
                 cell_index,
@@ -1196,6 +1426,16 @@ fn collect_max_field_id(para: &Paragraph, max_id: &mut u32) {
                     for cap_para in &caption.paragraphs {
                         collect_max_field_id(cap_para, max_id);
                     }
+                }
+            }
+            Control::Header(header) => {
+                for para in &header.paragraphs {
+                    collect_max_field_id(para, max_id);
+                }
+            }
+            Control::Footer(footer) => {
+                for para in &footer.paragraphs {
+                    collect_max_field_id(para, max_id);
                 }
             }
             Control::Shape(shape) => {

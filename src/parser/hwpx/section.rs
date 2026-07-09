@@ -5,6 +5,7 @@
 
 use quick_xml::events::{BytesRef, Event};
 use quick_xml::Reader;
+use quick_xml::Writer;
 
 use crate::model::control::{
     AutoNumber, AutoNumberType, Bookmark, CharOverlap, Control, Equation, Field, FieldType,
@@ -14,18 +15,19 @@ use crate::model::document::{Section, SectionDef};
 use crate::model::footnote::{Endnote, Footnote};
 use crate::model::header_footer::{Footer, Header, HeaderFooterApply, MasterPage};
 use crate::model::image::{
-    CropInfo, EffectColor, EffectPoint, EffectRgb, ImageAttr, ImageEffect, PictureEffects,
-    PictureShadow,
+    CropInfo, EffectColor, EffectPoint, EffectRange, EffectRgb, ImageAttr, ImageEffect,
+    PictureBlur, PictureEffectChild, PictureEffects, PictureFillOverlay, PictureGlow,
+    PictureReflection, PictureShadow, PictureSoftEdge, PictureSolidFill, PictureThreeD,
 };
 use crate::model::page::{
     BindingMethod, ColumnDef, ColumnDirection, ColumnType, PageBorderBasis, PageBorderFill,
     PageBorderUiBasis, PageDef,
 };
-use crate::model::paragraph::{CharShapeRef, FieldRange, LineSeg, Paragraph};
+use crate::model::paragraph::{CharShapeRef, FieldRange, HwpxTextMarker, LineSeg, Paragraph};
 use crate::model::shape::{
     ArcShape, CommonObjAttr, CurveShape, DrawingObjAttr, EllipseShape, GroupShape, HorzAlign,
-    HorzRelTo, LineShape, PolygonShape, RectangleShape, ShapeComponentAttr, ShapeObject,
-    SizeCriterion, TextBox, TextWrap, VertAlign, VertRelTo,
+    HorzRelTo, LineShape, ObjectNumberingType, PolygonShape, RectangleShape, ShapeComponentAttr,
+    ShapeObject, SizeCriterion, TextBox, TextFlow, TextWrap, VertAlign, VertRelTo,
 };
 use crate::model::style::{Fill, ShapeBorderLine};
 use crate::model::table::{Cell, Table, TablePageBreak, VerticalAlign};
@@ -34,8 +36,8 @@ use crate::parser::tags;
 
 use super::utils::{
     attr_str, local_name, parse_bool, parse_color, parse_gradient_type, parse_hatch_style,
-    parse_i16, parse_i32, parse_i32_wrapping, parse_i8, parse_u16, parse_u32, parse_u8,
-    skip_element,
+    parse_i16, parse_i32, parse_i32_wrapping, parse_i8, parse_image_effect_name, parse_u16,
+    parse_u32, parse_u8, skip_element,
 };
 use super::HwpxError;
 
@@ -53,7 +55,8 @@ pub fn parse_hwpx_section(xml: &str) -> Result<Section, HwpxError> {
                 match local {
                     b"p" => {
                         // 최상위 문단
-                        let (para, sec_def_opt) = parse_paragraph(e, &mut reader)?;
+                        let (para, sec_def_opt) =
+                            parse_paragraph_with_xml(e, &mut reader, Some(xml))?;
                         if let Some(sec_def) = sec_def_opt {
                             section.section_def = sec_def;
                         }
@@ -265,12 +268,27 @@ fn build_hwpx_master_page_list_header(master_page: &MasterPage) -> Vec<u8> {
 fn parse_section_def_start(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
+            b"id" => {
+                sec_def.section_id = attr_str(&attr);
+            }
             b"textDirection" => {
                 let val = attr_str(&attr);
-                sec_def.text_direction = if val == "VERTICAL" { 1 } else { 0 };
+                sec_def.text_direction = if val.eq_ignore_ascii_case("VERTICAL") {
+                    1
+                } else if val.eq_ignore_ascii_case("VERTICALALL") {
+                    2
+                } else {
+                    0
+                };
             }
             b"tabStop" => {
                 sec_def.default_tab_spacing = parse_u32(&attr);
+            }
+            b"tabStopVal" => {
+                sec_def.tab_stop_val = parse_u32(&attr);
+            }
+            b"tabStopUnit" => {
+                sec_def.tab_stop_unit = attr_str(&attr);
             }
             b"masterPageCnt" => {
                 let count = parse_u32(&attr).min(3);
@@ -285,6 +303,12 @@ fn parse_section_def_start(e: &quick_xml::events::BytesStart, sec_def: &mut Sect
             }
             b"outlineShapeIDRef" => {
                 sec_def.outline_numbering_id = parse_u16(&attr);
+            }
+            b"memoShapeIDRef" => {
+                sec_def.memo_shape_id_ref = parse_u16(&attr);
+            }
+            b"textVerticalWidthHead" => {
+                sec_def.text_vertical_width_head = parse_u32(&attr);
             }
             _ => {}
         }
@@ -320,6 +344,9 @@ fn parse_page_pr(e: &quick_xml::events::BytesStart, page: &mut PageDef) {
                     _ => BindingMethod::SingleSided,
                 };
             }
+            b"rhwpPaginationBottomTolerance" | b"paginationBottomTolerance" => {
+                page.pagination_bottom_tolerance = parse_u32(&attr);
+            }
             _ => {}
         }
     }
@@ -330,6 +357,9 @@ fn parse_grid(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
         match attr.key.as_ref() {
             b"lineGrid" => sec_def.line_grid = parse_i32(&attr) as i16,
             b"charGrid" => sec_def.char_grid = parse_i32(&attr) as i16,
+            b"wonggojiFormat" => {
+                sec_def.wonggoji_format = parse_u32(&attr).min(u8::MAX as u32) as u8
+            }
             _ => {}
         }
     }
@@ -355,6 +385,14 @@ fn parse_page_margin(e: &quick_xml::events::BytesStart, page: &mut PageDef) {
 fn parse_paragraph(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
+) -> Result<(Paragraph, Option<SectionDef>), HwpxError> {
+    parse_paragraph_with_xml(e, reader, None)
+}
+
+fn parse_paragraph_with_xml(
+    e: &quick_xml::events::BytesStart,
+    reader: &mut Reader<&[u8]>,
+    xml: Option<&str>,
 ) -> Result<(Paragraph, Option<SectionDef>), HwpxError> {
     let mut para = Paragraph::default();
     let mut sec_def: Option<SectionDef> = None;
@@ -396,6 +434,7 @@ fn parse_paragraph(
     let mut text_parts: Vec<String> = Vec::new();
     let mut current_char_shape_id: u32 = 0;
     let mut char_shape_changes: Vec<(u32, u32)> = Vec::new(); // (utf16_pos, char_shape_id)
+    let mut hwpx_text_markers: Vec<HwpxTextMarker> = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
@@ -416,7 +455,12 @@ fn parse_paragraph(
                     }
                     b"t" => {
                         // 텍스트 읽기 (탭 확장 데이터 포함)
-                        let (text, tab_exts) = read_text_content_with_tabs(reader)?;
+                        let marker_base = calc_visible_char_len_from_parts(&text_parts);
+                        let (text, tab_exts, markers) = read_text_content_with_tabs(reader)?;
+                        hwpx_text_markers.extend(markers.into_iter().map(|mut marker| {
+                            marker.char_idx += marker_base;
+                            marker
+                        }));
                         text_parts.push(text);
                         para.tab_extended.extend(tab_exts);
                     }
@@ -464,7 +508,7 @@ fn parse_paragraph(
                         // 문단 내 섹션 정의 파싱
                         let mut sd = SectionDef::default();
                         parse_section_def_start(ce, &mut sd);
-                        let col_def_opt = parse_sec_pr_children(reader, &mut sd)?;
+                        let col_def_opt = parse_sec_pr_children(reader, &mut sd, xml)?;
                         sec_def = Some(sd.clone());
                         // [Task #901] SectionDef 도 HWP 바이너리에서 8 utf16 inline marker —
                         // line_seg.text_start (file 값) 가 HWP 인코딩 가정. HWPX parser
@@ -573,6 +617,14 @@ fn parse_paragraph(
                         // 단독 lineseg (linesegarray 밖에 나올 경우)
                         para.line_segs.push(parse_lineseg_element(ce));
                     }
+                    b"secPr" => {
+                        // 자식이 없는 self-closing secPr도 섹션 정의로 보존한다.
+                        let mut sd = SectionDef::default();
+                        parse_section_def_start(ce, &mut sd);
+                        sec_def = Some(sd.clone());
+                        para.controls.push(Control::SectionDef(Box::new(sd)));
+                        text_parts.push("\u{0002}".to_string());
+                    }
                     _ => {}
                 }
             }
@@ -665,6 +717,7 @@ fn parse_paragraph(
 
     para.text = visual_text;
     para.char_offsets = char_offsets;
+    para.hwpx_text_markers = hwpx_text_markers;
     para.char_count = utf16_pos + 1; // +1 for 끝 마커
     para.has_para_text = !para.text.is_empty() || !para.controls.is_empty();
 
@@ -751,6 +804,7 @@ fn parse_paragraph(
 fn parse_sec_pr_children(
     reader: &mut Reader<&[u8]>,
     sec_def: &mut SectionDef,
+    xml: Option<&str>,
 ) -> Result<Option<ColumnDef>, HwpxError> {
     let mut buf = Vec::new();
     let mut col_def: Option<ColumnDef> = None;
@@ -769,17 +823,28 @@ fn parse_sec_pr_children(
                     }
                     b"startNum" => parse_start_num(e, sec_def),
                     b"visibility" => parse_visibility(e, sec_def),
+                    b"lineNumberShape" => parse_line_number_shape(e, sec_def),
                     b"pageBorderFill" => {
-                        let pbf = parse_page_border_fill(e, reader)?;
+                        let pbf = parse_page_border_fill(e, reader, xml)?;
                         push_page_border_fill(sec_def, pbf, &mut page_border_fill_count);
                     }
                     // [Task #1050] footNotePr / endNotePr 의 자식 (autoNumFormat, noteLine 등)
                     // 파싱 — 한컴 정답 footnote 영역 렌더링을 위한 FootnoteShape contract.
                     b"footNotePr" => {
-                        parse_note_pr_children(reader, &mut sec_def.footnote_shape, b"footNotePr")?;
+                        parse_note_pr_children(
+                            reader,
+                            &mut sec_def.footnote_shape,
+                            b"footNotePr",
+                            xml,
+                        )?;
                     }
                     b"endNotePr" => {
-                        parse_note_pr_children(reader, &mut sec_def.endnote_shape, b"endNotePr")?;
+                        parse_note_pr_children(
+                            reader,
+                            &mut sec_def.endnote_shape,
+                            b"endNotePr",
+                            xml,
+                        )?;
                     }
                     _ => {}
                 }
@@ -796,6 +861,7 @@ fn parse_sec_pr_children(
                     }
                     b"startNum" => parse_start_num(e, sec_def),
                     b"visibility" => parse_visibility(e, sec_def),
+                    b"lineNumberShape" => parse_line_number_shape(e, sec_def),
                     b"pageBorderFill" => {
                         let pbf = parse_page_border_fill_empty(e);
                         push_page_border_fill(sec_def, pbf, &mut page_border_fill_count);
@@ -828,11 +894,15 @@ fn parse_note_pr_children(
     reader: &mut Reader<&[u8]>,
     shape: &mut crate::model::footnote::FootnoteShape,
     end_tag: &[u8],
+    xml: Option<&str>,
 ) -> Result<(), HwpxError> {
     let is_end_note = end_tag == b"endNotePr";
+    let inner_start = xml.map(|_| reader.buffer_position() as usize);
+    let mut inner_end = inner_start.unwrap_or(0);
     let mut saw_above_line = false;
     let mut buf = Vec::new();
     loop {
+        let pos_before = reader.buffer_position() as usize;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
                 let ename = e.name();
@@ -1046,10 +1116,14 @@ fn parse_note_pr_children(
             }
             Ok(Event::End(ref e)) => {
                 if local_name(e.name().as_ref()) == end_tag {
+                    inner_end = pos_before;
                     break;
                 }
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                inner_end = pos_before;
+                break;
+            }
             Err(e) => {
                 return Err(HwpxError::XmlError(format!(
                     "{}: {}",
@@ -1060,6 +1134,11 @@ fn parse_note_pr_children(
             _ => {}
         }
         buf.clear();
+    }
+    if let (Some(xml), Some(inner_start)) = (xml, inner_start) {
+        if inner_end > inner_start && inner_end <= xml.len() {
+            shape.raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
+        }
     }
     shape.attr = shape.encode_attr();
     Ok(())
@@ -1081,10 +1160,14 @@ fn push_page_border_fill(
 fn parse_page_border_fill(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
+    xml: Option<&str>,
 ) -> Result<PageBorderFill, HwpxError> {
     let mut page_border_fill = parse_page_border_fill_empty(e);
+    let inner_start = xml.map(|_| reader.buffer_position() as usize);
+    let mut inner_end = inner_start.unwrap_or(0);
     let mut buf = Vec::new();
     loop {
+        let pos_before = reader.buffer_position() as usize;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref child)) | Ok(Event::Empty(ref child)) => {
                 if local_name(child.name().as_ref()) == b"offset" {
@@ -1093,16 +1176,25 @@ fn parse_page_border_fill(
             }
             Ok(Event::End(ref end)) => {
                 if local_name(end.name().as_ref()) == b"pageBorderFill" {
+                    inner_end = pos_before;
                     break;
                 }
             }
-            Ok(Event::Eof) => break,
+            Ok(Event::Eof) => {
+                inner_end = pos_before;
+                break;
+            }
             Err(err) => {
                 return Err(HwpxError::XmlError(format!("pageBorderFill: {}", err)));
             }
             _ => {}
         }
         buf.clear();
+    }
+    if let (Some(xml), Some(inner_start)) = (xml, inner_start) {
+        if inner_end > inner_start && inner_end <= xml.len() {
+            page_border_fill.raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
+        }
     }
     Ok(page_border_fill)
 }
@@ -1193,6 +1285,11 @@ fn page_border_fill_attr(
 fn parse_start_num(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
+            b"pageStartsOn" => {
+                sec_def.page_num_type = parse_page_starts_on(&attr_str(&attr));
+                sec_def.flags &= !0x0030_0000;
+                sec_def.flags |= ((sec_def.page_num_type as u32) & 0x03) << 20;
+            }
             b"page" => sec_def.page_num = parse_u16(&attr),
             b"pic" => sec_def.picture_num = parse_u16(&attr),
             b"tbl" => sec_def.table_num = parse_u16(&attr),
@@ -1202,12 +1299,36 @@ fn parse_start_num(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) 
     }
 }
 
+fn parse_page_starts_on(value: &str) -> u8 {
+    if value.eq_ignore_ascii_case("ODD") {
+        1
+    } else if value.eq_ignore_ascii_case("EVEN") {
+        2
+    } else {
+        0
+    }
+}
+
+fn normalize_visibility_value(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("HIDE_FIRST") {
+        Some("HIDE_FIRST")
+    } else if value.eq_ignore_ascii_case("HIDE_ALL") {
+        Some("HIDE_ALL")
+    } else if value.eq_ignore_ascii_case("SHOW_FIRST") {
+        Some("SHOW_FIRST")
+    } else if value.eq_ignore_ascii_case("SHOW_ALL") {
+        Some("SHOW_ALL")
+    } else {
+        None
+    }
+}
+
 /// <hp:visibility> 요소 파싱
 fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
             b"hideFirstHeader" => {
-                sec_def.hide_header = attr_str(&attr) == "1";
+                sec_def.hide_header = parse_bool(&attr);
                 if sec_def.hide_header {
                     sec_def.flags |= 0x0001;
                 } else {
@@ -1215,7 +1336,7 @@ fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef)
                 }
             }
             b"hideFirstFooter" => {
-                sec_def.hide_footer = attr_str(&attr) == "1";
+                sec_def.hide_footer = parse_bool(&attr);
                 if sec_def.hide_footer {
                     sec_def.flags |= 0x0002;
                 } else {
@@ -1223,7 +1344,7 @@ fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef)
                 }
             }
             b"hideFirstMasterPage" => {
-                sec_def.hide_master_page = attr_str(&attr) == "1";
+                sec_def.hide_master_page = parse_bool(&attr);
                 if sec_def.hide_master_page {
                     sec_def.flags |= 0x0004;
                 } else {
@@ -1231,7 +1352,10 @@ fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef)
                 }
             }
             b"border" => {
-                sec_def.hide_border = attr_str(&attr) == "HIDE_ALL";
+                if let Some(value) = normalize_visibility_value(&attr_str(&attr)) {
+                    sec_def.visibility_border = value.to_string();
+                    sec_def.hide_border = matches!(value, "HIDE_FIRST" | "HIDE_ALL");
+                }
                 if sec_def.hide_border {
                     sec_def.flags |= 0x0008;
                 } else {
@@ -1239,14 +1363,45 @@ fn parse_visibility(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef)
                 }
             }
             b"fill" => {
-                sec_def.hide_fill = attr_str(&attr) == "HIDE_ALL";
+                if let Some(value) = normalize_visibility_value(&attr_str(&attr)) {
+                    sec_def.visibility_fill = value.to_string();
+                    sec_def.hide_fill = matches!(value, "HIDE_FIRST" | "HIDE_ALL");
+                }
                 if sec_def.hide_fill {
                     sec_def.flags |= 0x0010;
                 } else {
                     sec_def.flags &= !0x0010;
                 }
             }
-            b"hideFirstEmptyLine" => sec_def.hide_empty_line = attr_str(&attr) == "1",
+            b"hideFirstPageNum" => {
+                sec_def.hide_page_number = parse_bool(&attr);
+                if sec_def.hide_page_number {
+                    sec_def.flags |= 0x0020;
+                } else {
+                    sec_def.flags &= !0x0020;
+                }
+            }
+            b"hideFirstEmptyLine" => {
+                sec_def.hide_empty_line = parse_bool(&attr);
+                if sec_def.hide_empty_line {
+                    sec_def.flags |= 0x0008_0000;
+                } else {
+                    sec_def.flags &= !0x0008_0000;
+                }
+            }
+            b"showLineNumber" => sec_def.show_line_number = parse_bool(&attr),
+            _ => {}
+        }
+    }
+}
+
+fn parse_line_number_shape(e: &quick_xml::events::BytesStart, sec_def: &mut SectionDef) {
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"restartType" => sec_def.line_number_restart_type = parse_u16(&attr) as u8,
+            b"countBy" => sec_def.line_number_count_by = parse_u16(&attr),
+            b"distance" => sec_def.line_number_distance = parse_u32(&attr),
+            b"startNumber" => sec_def.line_number_start_number = parse_u16(&attr),
             _ => {}
         }
     }
@@ -1257,22 +1412,26 @@ fn parse_col_pr(e: &quick_xml::events::BytesStart) -> ColumnDef {
     let mut cd = ColumnDef::default();
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
+            b"id" => {
+                cd.column_id = attr_str(&attr);
+            }
             b"type" => {
                 cd.column_type = match attr_str(&attr).as_str() {
                     "NEWSPAPER" => ColumnType::Normal,
-                    "BalancedNewspaper" => ColumnType::Distribute,
-                    "Parallel" => ColumnType::Parallel,
+                    "BALANCED_NEWSPAPER" | "BalancedNewspaper" => ColumnType::Distribute,
+                    "PARALLEL" | "Parallel" => ColumnType::Parallel,
                     _ => ColumnType::Normal,
                 };
             }
             b"layout" => {
                 cd.direction = match attr_str(&attr).as_str() {
                     "RIGHT" => ColumnDirection::RightToLeft,
+                    "MIRROR" => ColumnDirection::Mirror,
                     _ => ColumnDirection::LeftToRight,
                 };
             }
             b"colCount" => cd.column_count = parse_u16(&attr),
-            b"sameSz" => cd.same_width = parse_u8(&attr) != 0,
+            b"sameSz" => cd.same_width = parse_bool_attr(&attr),
             b"sameGap" => cd.spacing = parse_i16(&attr),
             _ => {}
         }
@@ -1293,6 +1452,7 @@ fn parse_col_pr_with_children(
                 let cname = ce.name();
                 match local_name(cname.as_ref()) {
                     b"colLine" => parse_col_line(ce, &mut cd),
+                    b"colSz" => parse_col_sz(ce, &mut cd),
                     _ => {}
                 }
             }
@@ -1303,6 +1463,10 @@ fn parse_col_pr_with_children(
                     b"colLine" => {
                         parse_col_line(ce, &mut cd);
                         skip_element(reader, b"colLine")?;
+                    }
+                    b"colSz" => {
+                        parse_col_sz(ce, &mut cd);
+                        skip_element(reader, b"colSz")?;
                     }
                     _ => {
                         let tag = local.to_vec();
@@ -1322,6 +1486,21 @@ fn parse_col_pr_with_children(
         buf.clear();
     }
     Ok(cd)
+}
+
+fn parse_col_sz(e: &quick_xml::events::BytesStart, cd: &mut ColumnDef) {
+    let mut width = 0;
+    let mut gap = 0;
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"width" => width = parse_i16(&attr),
+            b"gap" => gap = parse_i16(&attr),
+            _ => {}
+        }
+    }
+    cd.widths.push(width);
+    cd.gaps.push(gap);
+    cd.proportional_widths = false;
 }
 
 fn parse_col_line(e: &quick_xml::events::BytesStart, cd: &mut ColumnDef) {
@@ -1441,7 +1620,7 @@ fn parse_lineseg_element(e: &quick_xml::events::BytesStart) -> LineSeg {
 /// <hp:t> 텍스트 컨텐츠를 읽는다.
 /// 탭 확장 데이터도 함께 반환 (HWPX 인라인 탭의 leader/type/width)
 fn read_text_content(reader: &mut Reader<&[u8]>) -> Result<String, HwpxError> {
-    let (text, _) = read_text_content_with_tabs(reader)?;
+    let (text, _, _) = read_text_content_with_tabs(reader)?;
     Ok(text)
 }
 
@@ -1463,9 +1642,10 @@ fn decode_xml_general_ref(r: &BytesRef<'_>) -> String {
 
 fn read_text_content_with_tabs(
     reader: &mut Reader<&[u8]>,
-) -> Result<(String, Vec<[u16; 7]>), HwpxError> {
+) -> Result<(String, Vec<[u16; 7]>, Vec<HwpxTextMarker>), HwpxError> {
     let mut text = String::new();
     let mut tab_ext_buf: Vec<[u16; 7]> = Vec::new();
+    let mut markers: Vec<HwpxTextMarker> = Vec::new();
     let mut buf = Vec::new();
 
     loop {
@@ -1493,6 +1673,12 @@ fn read_text_content_with_tabs(
                     }
                     b"nbSpace" => text.push('\u{00A0}'),
                     b"fwSpace" => text.push('\u{2007}'),
+                    b"insertBegin" | b"insertEnd" | b"deleteBegin" | b"deleteEnd" => {
+                        markers.push(HwpxTextMarker {
+                            char_idx: text.chars().count(),
+                            raw_xml: raw_empty_xml_element(ce)?,
+                        });
+                    }
                     _ => {}
                 }
             }
@@ -1503,7 +1689,7 @@ fn read_text_content_with_tabs(
         buf.clear();
     }
 
-    Ok((text, tab_ext_buf))
+    Ok((text, tab_ext_buf, markers))
 }
 
 fn parse_tab_extension(e: &quick_xml::events::BytesStart) -> [u16; 7] {
@@ -1525,6 +1711,95 @@ fn parse_tab_extension(e: &quick_xml::events::BytesStart) -> [u16; 7] {
     ext
 }
 
+fn parse_object_numbering_type(value: &str) -> ObjectNumberingType {
+    match object_enum_key(value).as_str() {
+        "PICTURE" => ObjectNumberingType::Picture,
+        "TABLE" => ObjectNumberingType::Table,
+        "EQUATION" => ObjectNumberingType::Equation,
+        _ => ObjectNumberingType::None,
+    }
+}
+
+fn object_enum_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '_' | '-' | ' '))
+        .collect::<String>()
+        .to_ascii_uppercase()
+}
+
+fn parse_object_text_wrap(value: &str) -> TextWrap {
+    match object_enum_key(value).as_str() {
+        "TIGHT" => TextWrap::Tight,
+        "THROUGH" => TextWrap::Through,
+        "TOPANDBOTTOM" => TextWrap::TopAndBottom,
+        "BEHINDTEXT" => TextWrap::BehindText,
+        "INFRONTOFTEXT" => TextWrap::InFrontOfText,
+        _ => TextWrap::Square,
+    }
+}
+
+fn parse_object_text_flow(value: &str) -> TextFlow {
+    match object_enum_key(value).as_str() {
+        "LEFTONLY" => TextFlow::LeftOnly,
+        "RIGHTONLY" => TextFlow::RightOnly,
+        "LARGESTONLY" => TextFlow::LargestOnly,
+        _ => TextFlow::BothSides,
+    }
+}
+
+fn parse_object_vert_rel_to(value: &str) -> VertRelTo {
+    match object_enum_key(value).as_str() {
+        "PAPER" => VertRelTo::Paper,
+        "PAGE" => VertRelTo::Page,
+        "PARA" => VertRelTo::Para,
+        _ => VertRelTo::Para,
+    }
+}
+
+fn parse_object_horz_rel_to(value: &str) -> HorzRelTo {
+    match object_enum_key(value).as_str() {
+        "PAPER" => HorzRelTo::Paper,
+        "PAGE" => HorzRelTo::Page,
+        "COLUMN" => HorzRelTo::Column,
+        "PARA" => HorzRelTo::Para,
+        _ => HorzRelTo::Para,
+    }
+}
+
+fn parse_object_vert_align(value: &str) -> VertAlign {
+    match object_enum_key(value).as_str() {
+        "CENTER" => VertAlign::Center,
+        "BOTTOM" => VertAlign::Bottom,
+        "INSIDE" => VertAlign::Inside,
+        "OUTSIDE" => VertAlign::Outside,
+        _ => VertAlign::Top,
+    }
+}
+
+fn parse_object_horz_align(value: &str) -> HorzAlign {
+    match object_enum_key(value).as_str() {
+        "CENTER" => HorzAlign::Center,
+        "RIGHT" => HorzAlign::Right,
+        "INSIDE" => HorzAlign::Inside,
+        "OUTSIDE" => HorzAlign::Outside,
+        _ => HorzAlign::Left,
+    }
+}
+
+fn parse_object_dropcap_style(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    match object_enum_key(trimmed).as_str() {
+        "NONE" => None,
+        "DOUBLELINE" => Some("DoubleLine".to_string()),
+        "TRIPLELINE" => Some("TripleLine".to_string()),
+        _ => Some(trimmed.to_string()),
+    }
+}
+
 // ─── Table ───
 
 fn parse_table(
@@ -1543,6 +1818,14 @@ fn parse_table(
             b"colCnt" => table.col_count = parse_u16(&attr),
             b"cellSpacing" => table.cell_spacing = parse_i16(&attr),
             b"borderFillIDRef" => table.border_fill_id = parse_u16(&attr),
+            b"numberingType" => {
+                table.common.numbering_type = parse_object_numbering_type(&attr_str(&attr));
+                table.common.numbering_type_explicit = true;
+            }
+            b"lock" => table.common.lock = parse_bool(&attr),
+            b"dropcapstyle" => {
+                table.common.dropcap_style = parse_object_dropcap_style(&attr_str(&attr));
+            }
             b"noAdjust" => {
                 if attr_str(&attr) == "1" {
                     table_record_flags |= 0x08;
@@ -1564,20 +1847,10 @@ fn parse_table(
                 table.repeat_header = attr_str(&attr) == "1";
             }
             b"textWrap" => {
-                table.common.text_wrap = match attr_str(&attr).as_str() {
-                    "TOP_AND_BOTTOM" => crate::model::shape::TextWrap::TopAndBottom,
-                    "BEHIND_TEXT" => crate::model::shape::TextWrap::BehindText,
-                    "IN_FRONT_OF_TEXT" => crate::model::shape::TextWrap::InFrontOfText,
-                    _ => crate::model::shape::TextWrap::Square,
-                };
+                table.common.text_wrap = parse_object_text_wrap(&attr_str(&attr));
             }
             b"textFlow" => {
-                table.common.text_flow = match attr_str(&attr).as_str() {
-                    "LEFT_ONLY" => crate::model::shape::TextFlow::LeftOnly,
-                    "RIGHT_ONLY" => crate::model::shape::TextFlow::RightOnly,
-                    "LARGEST_ONLY" => crate::model::shape::TextFlow::LargestOnly,
-                    _ => crate::model::shape::TextFlow::BothSides,
-                };
+                table.common.text_flow = parse_object_text_flow(&attr_str(&attr));
             }
             _ => {}
         }
@@ -1630,6 +1903,7 @@ fn parse_table(
                                     table.common.height_criterion =
                                         parse_size_criterion(&attr_str(&attr), false);
                                 }
+                                b"protect" => table.common.size_protect = parse_bool(&attr),
                                 _ => {}
                             }
                         }
@@ -1648,39 +1922,20 @@ fn parse_table(
                                         if parse_bool(&attr) { 1 } else { 0 };
                                 }
                                 b"vertRelTo" => {
-                                    table.common.vert_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => crate::model::shape::VertRelTo::Paper,
-                                        "PAGE" => crate::model::shape::VertRelTo::Page,
-                                        _ => crate::model::shape::VertRelTo::Para,
-                                    };
+                                    table.common.vert_rel_to =
+                                        parse_object_vert_rel_to(&attr_str(&attr));
                                 }
                                 b"horzRelTo" => {
-                                    table.common.horz_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => crate::model::shape::HorzRelTo::Paper,
-                                        "PAGE" => crate::model::shape::HorzRelTo::Page,
-                                        "COLUMN" => crate::model::shape::HorzRelTo::Column,
-                                        _ => crate::model::shape::HorzRelTo::Para,
-                                    };
+                                    table.common.horz_rel_to =
+                                        parse_object_horz_rel_to(&attr_str(&attr));
                                 }
                                 b"vertAlign" => {
-                                    table.common.vert_align = match attr_str(&attr).as_str() {
-                                        "TOP" => crate::model::shape::VertAlign::Top,
-                                        "CENTER" => crate::model::shape::VertAlign::Center,
-                                        "BOTTOM" => crate::model::shape::VertAlign::Bottom,
-                                        "INSIDE" => crate::model::shape::VertAlign::Inside,
-                                        "OUTSIDE" => crate::model::shape::VertAlign::Outside,
-                                        _ => crate::model::shape::VertAlign::Top,
-                                    };
+                                    table.common.vert_align =
+                                        parse_object_vert_align(&attr_str(&attr));
                                 }
                                 b"horzAlign" => {
-                                    table.common.horz_align = match attr_str(&attr).as_str() {
-                                        "LEFT" => crate::model::shape::HorzAlign::Left,
-                                        "CENTER" => crate::model::shape::HorzAlign::Center,
-                                        "RIGHT" => crate::model::shape::HorzAlign::Right,
-                                        "INSIDE" => crate::model::shape::HorzAlign::Inside,
-                                        "OUTSIDE" => crate::model::shape::HorzAlign::Outside,
-                                        _ => crate::model::shape::HorzAlign::Left,
-                                    };
+                                    table.common.horz_align =
+                                        parse_object_horz_align(&attr_str(&attr));
                                 }
                                 b"vertOffset" => {
                                     table.common.vertical_offset = parse_i32(&attr) as u32;
@@ -1767,7 +2022,7 @@ fn parse_table(
 }
 
 fn parse_size_criterion(value: &str, allow_column_para: bool) -> SizeCriterion {
-    match value {
+    match object_enum_key(value).as_str() {
         "PAPER" => SizeCriterion::Paper,
         "PAGE" => SizeCriterion::Page,
         "COLUMN" if allow_column_para => SizeCriterion::Column,
@@ -1889,7 +2144,7 @@ fn parse_table_caption(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
 ) -> Result<crate::model::shape::Caption, HwpxError> {
-    use crate::model::shape::{Caption, CaptionDirection};
+    use crate::model::shape::{Caption, CaptionDirection, CaptionVertAlign};
 
     let mut caption = Caption::default();
     for attr in e.attributes().flatten() {
@@ -1918,7 +2173,17 @@ fn parse_table_caption(
             Ok(Event::Start(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
-                if local == b"p" {
+                if local == b"subList" {
+                    for attr in ce.attributes().flatten() {
+                        if attr.key.as_ref() == b"vertAlign" {
+                            caption.vert_align = match attr_str(&attr).as_str() {
+                                "CENTER" => CaptionVertAlign::Center,
+                                "BOTTOM" => CaptionVertAlign::Bottom,
+                                _ => CaptionVertAlign::Top,
+                            };
+                        }
+                    }
+                } else if local == b"p" {
                     let (para, _) = parse_paragraph(ce, reader)?;
                     caption.paragraphs.push(para);
                 }
@@ -1955,6 +2220,17 @@ fn parse_table_cell(
             b"hasMargin" => cell.set_apply_inner_margin(parse_bool(&attr)),
             b"protect" => cell.set_cell_protect(parse_bool(&attr)),
             b"editable" => cell.set_editable_in_form(parse_bool(&attr)),
+            b"dirty" => cell.dirty = parse_bool(&attr),
+            b"textDirection" => cell.text_direction = parse_cell_text_direction(&attr_str(&attr)),
+            b"vertAlign" | b"vAlign" => {
+                cell.vertical_align = parse_cell_vertical_align(&attr_str(&attr));
+            }
+            b"colAddr" => cell.col = parse_u16(&attr),
+            b"rowAddr" => cell.row = parse_u16(&attr),
+            b"colSpan" => cell.col_span = parse_u16(&attr).max(1),
+            b"rowSpan" => cell.row_span = parse_u16(&attr).max(1),
+            b"width" => cell.width = parse_u32(&attr),
+            b"height" => cell.height = parse_u32(&attr),
             // 셀 필드 이름 (누름틀 셀 필드, #493). 직렬화기는 무명 셀도 name=""로
             // 항상 방출하므로 빈 값은 None — HWP5 파서(parse_cell_field_name)와
             // 동일 의미. 누락 시 HWPX 로드에서 getFieldList가 셀 필드를 반환하지 못하고
@@ -2021,46 +2297,31 @@ fn parse_table_cell(
                             match attr.key.as_ref() {
                                 b"borderFillIDRef" => cell.border_fill_id = parse_u16(&attr),
                                 b"textDirection" => {
-                                    let val = attr_str(&attr);
-                                    cell.text_direction = if val == "VERTICAL" { 1 } else { 0 };
+                                    cell.text_direction =
+                                        parse_cell_text_direction(&attr_str(&attr));
                                 }
                                 b"vAlign" => {
-                                    cell.vertical_align = match attr_str(&attr).as_str() {
-                                        "CENTER" => VerticalAlign::Center,
-                                        "BOTTOM" => VerticalAlign::Bottom,
-                                        _ => VerticalAlign::Top,
-                                    };
+                                    cell.vertical_align =
+                                        parse_cell_vertical_align(&attr_str(&attr));
                                 }
                                 _ => {}
                             }
                         }
                     }
                     b"subList" => {
-                        // subList: vertAlign 속성 파싱
-                        for attr in ce.attributes().flatten() {
-                            if attr.key.as_ref() == b"vertAlign" {
-                                cell.vertical_align = match attr_str(&attr).as_str() {
-                                    "CENTER" => VerticalAlign::Center,
-                                    "BOTTOM" => VerticalAlign::Bottom,
-                                    _ => VerticalAlign::Top,
-                                };
-                            }
-                        }
+                        parse_cell_sublist_attrs(ce, &mut cell);
                     }
                     b"cellPr" => {
                         for attr in ce.attributes().flatten() {
                             match attr.key.as_ref() {
                                 b"borderFillIDRef" => cell.border_fill_id = parse_u16(&attr),
                                 b"textDirection" => {
-                                    let val = attr_str(&attr);
-                                    cell.text_direction = if val == "VERTICAL" { 1 } else { 0 };
+                                    cell.text_direction =
+                                        parse_cell_text_direction(&attr_str(&attr));
                                 }
                                 b"vAlign" => {
-                                    cell.vertical_align = match attr_str(&attr).as_str() {
-                                        "CENTER" => VerticalAlign::Center,
-                                        "BOTTOM" => VerticalAlign::Bottom,
-                                        _ => VerticalAlign::Top,
-                                    };
+                                    cell.vertical_align =
+                                        parse_cell_vertical_align(&attr_str(&attr));
                                 }
                                 _ => {}
                             }
@@ -2118,6 +2379,7 @@ fn parse_table_cell(
                             }
                         }
                     }
+                    b"subList" => parse_cell_sublist_attrs(ce, &mut cell),
                     _ => {}
                 }
             }
@@ -2142,6 +2404,41 @@ fn parse_table_cell(
     Ok(cell)
 }
 
+fn parse_cell_text_direction(value: &str) -> u8 {
+    if value.eq_ignore_ascii_case("VERTICAL") {
+        1
+    } else {
+        0
+    }
+}
+
+fn parse_cell_sublist_attrs(e: &quick_xml::events::BytesStart, cell: &mut Cell) {
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"textDirection" => cell.text_direction = parse_cell_text_direction(&attr_str(&attr)),
+            b"lineWrap" => cell.sub_list_line_wrap = attr_str(&attr),
+            b"vertAlign" => cell.vertical_align = parse_cell_vertical_align(&attr_str(&attr)),
+            b"linkListIDRef" => cell.sub_list_link_list_id_ref = parse_u32(&attr),
+            b"linkListNextIDRef" => cell.sub_list_link_list_next_id_ref = parse_u32(&attr),
+            b"textWidth" => cell.sub_list_text_width = parse_u32(&attr),
+            b"textHeight" => cell.sub_list_text_height = parse_u32(&attr),
+            b"hasTextRef" => cell.sub_list_text_ref = parse_u8(&attr),
+            b"hasNumRef" => cell.sub_list_num_ref = parse_u8(&attr),
+            _ => {}
+        }
+    }
+}
+
+fn parse_cell_vertical_align(value: &str) -> VerticalAlign {
+    if value.eq_ignore_ascii_case("CENTER") {
+        VerticalAlign::Center
+    } else if value.eq_ignore_ascii_case("BOTTOM") {
+        VerticalAlign::Bottom
+    } else {
+        VerticalAlign::Top
+    }
+}
+
 // ─── Picture ───
 
 fn parse_picture(
@@ -2160,6 +2457,7 @@ fn parse_picture(
     let mut href: Option<String> = None;
     let mut picture_instance_id = 0;
     let mut effects = PictureEffects::default();
+    let mut border_line: Option<ShapeBorderLine> = None;
 
     // <hp:pic> 요소 자체의 속성 파싱
     for attr in e.attributes().flatten() {
@@ -2167,23 +2465,18 @@ fn parse_picture(
             b"id" => common.instance_id = parse_u32(&attr),
             b"zOrder" => common.z_order = parse_i32(&attr),
             b"textWrap" => {
-                common.text_wrap = match attr_str(&attr).as_str() {
-                    "SQUARE" => TextWrap::Square,
-                    "TIGHT" => TextWrap::Tight,
-                    "THROUGH" => TextWrap::Through,
-                    "TOP_AND_BOTTOM" => TextWrap::TopAndBottom,
-                    "BEHIND_TEXT" => TextWrap::BehindText,
-                    "IN_FRONT_OF_TEXT" => TextWrap::InFrontOfText,
-                    _ => TextWrap::Square,
-                };
+                common.text_wrap = parse_object_text_wrap(&attr_str(&attr));
             }
             b"textFlow" => {
-                common.text_flow = match attr_str(&attr).as_str() {
-                    "LEFT_ONLY" => crate::model::shape::TextFlow::LeftOnly,
-                    "RIGHT_ONLY" => crate::model::shape::TextFlow::RightOnly,
-                    "LARGEST_ONLY" => crate::model::shape::TextFlow::LargestOnly,
-                    _ => crate::model::shape::TextFlow::BothSides,
-                };
+                common.text_flow = parse_object_text_flow(&attr_str(&attr));
+            }
+            b"numberingType" => {
+                common.numbering_type = parse_object_numbering_type(&attr_str(&attr));
+                common.numbering_type_explicit = true;
+            }
+            b"lock" => common.lock = parse_bool(&attr),
+            b"dropcapstyle" => {
+                common.dropcap_style = parse_object_dropcap_style(&attr_str(&attr));
             }
             b"instid" => picture_instance_id = parse_u32(&attr),
             b"href" => {
@@ -2236,6 +2529,15 @@ fn parse_picture(
                                         common.height = v;
                                     }
                                 }
+                                b"widthRelTo" => {
+                                    common.width_criterion =
+                                        parse_size_criterion(&attr_str(&attr), true);
+                                }
+                                b"heightRelTo" => {
+                                    common.height_criterion =
+                                        parse_size_criterion(&attr_str(&attr), false);
+                                }
+                                b"protect" => common.size_protect = parse_bool(&attr),
                                 _ => {}
                             }
                         }
@@ -2305,42 +2607,21 @@ fn parse_picture(
                                 }
                                 b"flowWithText" => common.flow_with_text = parse_bool(&attr),
                                 b"allowOverlap" => common.allow_overlap = parse_bool(&attr),
+                                b"holdAnchorAndSO" => {
+                                    common.prevent_page_break =
+                                        if parse_bool(&attr) { 1 } else { 0 };
+                                }
                                 b"vertRelTo" => {
-                                    common.vert_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => VertRelTo::Paper,
-                                        "PAGE" => VertRelTo::Page,
-                                        "PARA" => VertRelTo::Para,
-                                        _ => VertRelTo::Para,
-                                    };
+                                    common.vert_rel_to = parse_object_vert_rel_to(&attr_str(&attr));
                                 }
                                 b"horzRelTo" => {
-                                    common.horz_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => HorzRelTo::Paper,
-                                        "PAGE" => HorzRelTo::Page,
-                                        "COLUMN" => HorzRelTo::Column,
-                                        "PARA" => HorzRelTo::Para,
-                                        _ => HorzRelTo::Para,
-                                    };
+                                    common.horz_rel_to = parse_object_horz_rel_to(&attr_str(&attr));
                                 }
                                 b"vertAlign" => {
-                                    common.vert_align = match attr_str(&attr).as_str() {
-                                        "TOP" => VertAlign::Top,
-                                        "CENTER" => VertAlign::Center,
-                                        "BOTTOM" => VertAlign::Bottom,
-                                        "INSIDE" => VertAlign::Inside,
-                                        "OUTSIDE" => VertAlign::Outside,
-                                        _ => VertAlign::Top,
-                                    };
+                                    common.vert_align = parse_object_vert_align(&attr_str(&attr));
                                 }
                                 b"horzAlign" => {
-                                    common.horz_align = match attr_str(&attr).as_str() {
-                                        "LEFT" => HorzAlign::Left,
-                                        "CENTER" => HorzAlign::Center,
-                                        "RIGHT" => HorzAlign::Right,
-                                        "INSIDE" => HorzAlign::Inside,
-                                        "OUTSIDE" => HorzAlign::Outside,
-                                        _ => HorzAlign::Left,
-                                    };
+                                    common.horz_align = parse_object_horz_align(&attr_str(&attr));
                                 }
                                 b"vertOffset" => {
                                     common.vertical_offset = parse_i32_wrapping(&attr) as u32
@@ -2402,12 +2683,7 @@ fn parse_picture(
                                         parse_picture_transparency_attr(&attr_str(&attr));
                                 }
                                 b"effect" => {
-                                    img_attr.effect = match attr_str(&attr).as_str() {
-                                        "REAL_PIC" => ImageEffect::RealPic,
-                                        "GRAY_SCALE" => ImageEffect::GrayScale,
-                                        "BLACK_WHITE" => ImageEffect::BlackWhite,
-                                        _ => ImageEffect::RealPic,
-                                    };
+                                    img_attr.effect = image_effect_from_hwpx_name(&attr_str(&attr));
                                 }
                                 _ => {}
                             }
@@ -2448,6 +2724,9 @@ fn parse_picture(
                     b"rotationInfo" => {
                         parse_shape_rotation_info(ce, &mut shape_attr);
                     }
+                    b"lineShape" => {
+                        border_line = Some(parse_line_shape_attr(ce));
+                    }
                     _ => {}
                 }
             }
@@ -2467,6 +2746,7 @@ fn parse_picture(
     if common.instance_id == 0 && picture_instance_id != 0 {
         common.instance_id = picture_instance_id;
     }
+    common.inst_id = picture_instance_id;
 
     materialize_shape_hwp_storage_defaults(&mut common, &mut shape_attr, ShapeStorageKind::Picture);
 
@@ -2479,12 +2759,26 @@ fn parse_picture(
     pic.padding = padding;
     pic.border_x = border_x;
     pic.border_y = border_y;
+    if let Some(line) = border_line {
+        pic.border_color = line.color;
+        pic.border_width = line.width;
+        pic.border_attr = line;
+    }
     pic.instance_id = picture_instance_id;
     pic.effects = effects;
     pic.caption = caption;
     pic.img_dim = img_dim;
 
     Ok(Control::Picture(Box::new(pic)))
+}
+
+fn image_effect_from_hwpx_name(value: &str) -> ImageEffect {
+    match parse_image_effect_name(value) {
+        1 => ImageEffect::GrayScale,
+        2 => ImageEffect::BlackWhite,
+        3 => ImageEffect::Pattern8x8,
+        _ => ImageEffect::RealPic,
+    }
 }
 
 fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, HwpxError> {
@@ -2499,6 +2793,48 @@ fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, H
             Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"shadow" => {
                 effects.shadow = Some(parse_picture_shadow_attrs(e));
             }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"glow" => {
+                effects.glow = Some(parse_picture_glow(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"glow" => {
+                effects.glow = Some(parse_picture_glow_attrs(e));
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"softEdge" => {
+                effects.soft_edge = Some(parse_picture_soft_edge(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"softEdge" => {
+                effects.soft_edge = Some(parse_picture_soft_edge_attrs(e));
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"reflection" => {
+                effects.reflection = Some(parse_picture_reflection(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"reflection" => {
+                effects.reflection = Some(parse_picture_reflection_attrs(e));
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"threeD" => {
+                effects.three_d = Some(parse_picture_three_d(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"threeD" => {
+                effects.three_d = Some(parse_picture_three_d_attrs(e));
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"blur" => {
+                effects.blur = Some(parse_picture_blur(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"blur" => {
+                effects.blur = Some(parse_picture_blur_attrs(e));
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"fillOverlay" => {
+                effects.fill_overlay = Some(parse_picture_fill_overlay(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"fillOverlay" => {
+                effects.fill_overlay = Some(parse_picture_fill_overlay_attrs(e));
+            }
+            Ok(Event::Start(ref e)) => {
+                effects.raw_xml.push(capture_raw_xml_element(e, reader)?);
+            }
+            Ok(Event::Empty(ref e)) => {
+                effects.raw_xml.push(raw_empty_xml_element(e)?);
+            }
             Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effects" => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(HwpxError::XmlError(format!("effects: {}", e))),
@@ -2508,6 +2844,124 @@ fn parse_picture_effects(reader: &mut Reader<&[u8]>) -> Result<PictureEffects, H
     }
 
     Ok(effects)
+}
+
+fn write_raw_xml_event<'a>(
+    writer: &mut Writer<&mut Vec<u8>>,
+    event: Event<'a>,
+    context: &str,
+) -> Result<(), HwpxError> {
+    writer
+        .write_event(event)
+        .map_err(|e| HwpxError::XmlError(format!("{context}: {}", e)))
+}
+
+fn raw_xml_string(raw: Vec<u8>, context: &str) -> Result<String, HwpxError> {
+    String::from_utf8(raw)
+        .map_err(|e| HwpxError::XmlError(format!("{context}: invalid utf-8: {}", e)))
+}
+
+fn raw_empty_xml_element(e: &quick_xml::events::BytesStart<'_>) -> Result<String, HwpxError> {
+    let mut raw = Vec::new();
+    let mut writer = Writer::new(&mut raw);
+    write_raw_xml_event(
+        &mut writer,
+        Event::Empty(e.to_owned()),
+        "effects raw element",
+    )?;
+    raw_xml_string(raw, "effects raw element")
+}
+
+fn capture_raw_xml_element(
+    start: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<String, HwpxError> {
+    let mut raw = Vec::new();
+    let mut writer = Writer::new(&mut raw);
+    write_raw_xml_event(
+        &mut writer,
+        Event::Start(start.to_owned()),
+        "effects raw element",
+    )?;
+
+    let mut depth = 1usize;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) => {
+                depth += 1;
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::Start(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::End(ref e)) => {
+                write_raw_xml_event(&mut writer, Event::End(e.to_owned()), "effects raw element")?;
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    break;
+                }
+            }
+            Ok(Event::Empty(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::Empty(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::Text(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::Text(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::CData(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::CData(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::Comment(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::Comment(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::PI(ref e)) => {
+                write_raw_xml_event(&mut writer, Event::PI(e.to_owned()), "effects raw element")?;
+            }
+            Ok(Event::DocType(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::DocType(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::GeneralRef(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::GeneralRef(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::Decl(ref e)) => {
+                write_raw_xml_event(
+                    &mut writer,
+                    Event::Decl(e.to_owned()),
+                    "effects raw element",
+                )?;
+            }
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("effects raw element: {}", e))),
+        }
+        buf.clear();
+    }
+
+    raw_xml_string(raw, "effects raw element")
 }
 
 fn parse_picture_shadow(
@@ -2525,11 +2979,24 @@ fn parse_picture_shadow(
                 b"effectsColor" => {
                     shadow.color = Some(parse_effect_color_attrs(e));
                 }
-                _ => {}
+                _ => shadow.raw_child_xml.push(raw_empty_xml_element(e)?),
             },
-            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
-                shadow.color = Some(parse_effect_color(e, reader)?);
-            }
+            Ok(Event::Start(ref e)) => match local_name(e.name().as_ref()) {
+                b"skew" => {
+                    shadow.skew = Some(parse_effect_point(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                b"scale" => {
+                    shadow.scale = Some(parse_effect_point(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                b"effectsColor" => {
+                    shadow.color = Some(parse_effect_color(e, reader)?);
+                }
+                _ => shadow
+                    .raw_child_xml
+                    .push(capture_raw_xml_element(e, reader)?),
+            },
             Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"shadow" => break,
             Ok(Event::Eof) => break,
             Err(e) => return Err(HwpxError::XmlError(format!("shadow: {}", e))),
@@ -2539,6 +3006,332 @@ fn parse_picture_shadow(
     }
 
     Ok(shadow)
+}
+
+fn parse_picture_glow(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureGlow, HwpxError> {
+    let mut glow = parse_picture_glow_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
+                glow.color = Some(parse_effect_color_attrs(e));
+            }
+            Ok(Event::Empty(ref e)) => {
+                glow.raw_child_xml.push(raw_empty_xml_element(e)?);
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
+                glow.color = Some(parse_effect_color(e, reader)?);
+            }
+            Ok(Event::Start(ref e)) => {
+                glow.raw_child_xml.push(capture_raw_xml_element(e, reader)?);
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"glow" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("glow: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(glow)
+}
+
+fn parse_picture_glow_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureGlow {
+    let mut glow = PictureGlow::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"alpha" => glow.alpha = Some(attr_str(&attr)),
+            b"radius" => glow.radius = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    glow
+}
+
+fn parse_picture_soft_edge_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureSoftEdge {
+    let mut soft_edge = PictureSoftEdge::default();
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"radius" {
+            soft_edge.radius = Some(attr_str(&attr));
+        }
+    }
+    soft_edge
+}
+
+fn parse_picture_soft_edge(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureSoftEdge, HwpxError> {
+    let mut soft_edge = parse_picture_soft_edge_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) => soft_edge.raw_child_xml.push(raw_empty_xml_element(e)?),
+            Ok(Event::Start(ref e)) => soft_edge
+                .raw_child_xml
+                .push(capture_raw_xml_element(e, reader)?),
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"softEdge" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("softEdge: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(soft_edge)
+}
+
+fn parse_picture_reflection(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureReflection, HwpxError> {
+    let mut reflection = parse_picture_reflection_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) => match local_name(e.name().as_ref()) {
+                b"skew" => reflection.skew = Some(parse_effect_point(e)),
+                b"scale" => reflection.scale = Some(parse_effect_point(e)),
+                b"effectsColor" => {
+                    reflection.color = Some(parse_effect_color_attrs(e));
+                }
+                b"alpha" => reflection.alpha = Some(parse_effect_range(e)),
+                b"pos" => reflection.pos = Some(parse_effect_range(e)),
+                _ => reflection.raw_child_xml.push(raw_empty_xml_element(e)?),
+            },
+            Ok(Event::Start(ref e)) => match local_name(e.name().as_ref()) {
+                b"skew" => {
+                    reflection.skew = Some(parse_effect_point(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                b"scale" => {
+                    reflection.scale = Some(parse_effect_point(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                b"effectsColor" => {
+                    reflection.color = Some(parse_effect_color(e, reader)?);
+                }
+                b"alpha" => {
+                    reflection.alpha = Some(parse_effect_range(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                b"pos" => {
+                    reflection.pos = Some(parse_effect_range(e));
+                    skip_element(reader, e.name().as_ref())?;
+                }
+                _ => reflection
+                    .raw_child_xml
+                    .push(capture_raw_xml_element(e, reader)?),
+            },
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"reflection" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("reflection: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(reflection)
+}
+
+fn parse_picture_reflection_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureReflection {
+    let mut reflection = PictureReflection::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"alignStyle" => reflection.align_style = Some(attr_str(&attr)),
+            b"radius" => reflection.radius = Some(attr_str(&attr)),
+            b"direction" => reflection.direction = Some(attr_str(&attr)),
+            b"distance" => reflection.distance = Some(attr_str(&attr)),
+            b"rotationStyle" => reflection.rotation_style = Some(attr_str(&attr)),
+            b"fadeDirection" => reflection.fade_direction = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    reflection
+}
+
+fn parse_picture_blur_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureBlur {
+    let mut blur = PictureBlur::default();
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"radius" {
+            blur.radius = Some(attr_str(&attr));
+        }
+    }
+    blur
+}
+
+fn parse_picture_blur(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureBlur, HwpxError> {
+    let mut blur = parse_picture_blur_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) => blur.raw_child_xml.push(raw_empty_xml_element(e)?),
+            Ok(Event::Start(ref e)) => blur.raw_child_xml.push(capture_raw_xml_element(e, reader)?),
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"blur" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("blur: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(blur)
+}
+
+fn parse_effect_attr_map(
+    e: &quick_xml::events::BytesStart<'_>,
+) -> std::collections::BTreeMap<String, String> {
+    e.attributes()
+        .flatten()
+        .map(|attr| {
+            (
+                String::from_utf8_lossy(attr.key.as_ref()).to_string(),
+                attr_str(&attr),
+            )
+        })
+        .collect()
+}
+
+fn parse_picture_three_d_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureThreeD {
+    PictureThreeD {
+        attrs: parse_effect_attr_map(e),
+        ..PictureThreeD::default()
+    }
+}
+
+fn parse_picture_effect_child_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureEffectChild {
+    PictureEffectChild {
+        attrs: parse_effect_attr_map(e),
+    }
+}
+
+fn parse_picture_three_d(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureThreeD, HwpxError> {
+    let mut three_d = parse_picture_three_d_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"bevel" => {
+                three_d.bevel = Some(parse_picture_effect_child_attrs(e));
+            }
+            Ok(Event::Empty(ref e)) => {
+                three_d.raw_child_xml.push(raw_empty_xml_element(e)?);
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"bevel" => {
+                three_d.bevel = Some(parse_picture_effect_child_attrs(e));
+                skip_element(reader, e.name().as_ref())?;
+            }
+            Ok(Event::Start(ref e)) => {
+                three_d
+                    .raw_child_xml
+                    .push(capture_raw_xml_element(e, reader)?);
+            }
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"threeD" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("threeD: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(three_d)
+}
+
+fn parse_picture_fill_overlay_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureFillOverlay {
+    let mut fill_overlay = PictureFillOverlay::default();
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"blend" {
+            fill_overlay.blend = Some(attr_str(&attr));
+        }
+    }
+    fill_overlay
+}
+
+fn parse_picture_fill_overlay(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureFillOverlay, HwpxError> {
+    let mut fill_overlay = parse_picture_fill_overlay_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"solidFill" => {
+                fill_overlay.solid_fill = Some(parse_picture_solid_fill_attrs(e));
+            }
+            Ok(Event::Empty(ref e)) => {
+                fill_overlay.raw_child_xml.push(raw_empty_xml_element(e)?);
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"solidFill" => {
+                fill_overlay.solid_fill = Some(parse_picture_solid_fill(e, reader)?);
+            }
+            Ok(Event::Start(ref e)) => fill_overlay
+                .raw_child_xml
+                .push(capture_raw_xml_element(e, reader)?),
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"fillOverlay" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("fillOverlay: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(fill_overlay)
+}
+
+fn parse_picture_solid_fill_attrs(e: &quick_xml::events::BytesStart<'_>) -> PictureSolidFill {
+    let mut solid_fill = PictureSolidFill::default();
+    for attr in e.attributes().flatten() {
+        if attr.key.as_ref() == b"color" {
+            solid_fill.color = Some(attr_str(&attr));
+        }
+    }
+    solid_fill
+}
+
+fn parse_picture_solid_fill(
+    e: &quick_xml::events::BytesStart<'_>,
+    reader: &mut Reader<&[u8]>,
+) -> Result<PictureSolidFill, HwpxError> {
+    let mut solid_fill = parse_picture_solid_fill_attrs(e);
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
+                solid_fill.effect_color = Some(parse_effect_color_attrs(e));
+            }
+            Ok(Event::Empty(ref e)) => {
+                solid_fill.raw_child_xml.push(raw_empty_xml_element(e)?);
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => {
+                solid_fill.effect_color = Some(parse_effect_color(e, reader)?);
+            }
+            Ok(Event::Start(ref e)) => solid_fill
+                .raw_child_xml
+                .push(capture_raw_xml_element(e, reader)?),
+            Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"solidFill" => break,
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(HwpxError::XmlError(format!("solidFill: {}", e))),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(solid_fill)
 }
 
 fn parse_picture_transparency_attr(raw: &str) -> u8 {
@@ -2585,6 +3378,18 @@ fn parse_effect_point(e: &quick_xml::events::BytesStart<'_>) -> EffectPoint {
     point
 }
 
+fn parse_effect_range(e: &quick_xml::events::BytesStart<'_>) -> EffectRange {
+    let mut range = EffectRange::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"start" => range.start = Some(attr_str(&attr)),
+            b"end" => range.end = Some(attr_str(&attr)),
+            _ => {}
+        }
+    }
+    range
+}
+
 fn parse_effect_color(
     e: &quick_xml::events::BytesStart<'_>,
     reader: &mut Reader<&[u8]>,
@@ -2596,6 +3401,18 @@ fn parse_effect_color(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Empty(ref e)) if local_name(e.name().as_ref()) == b"rgb" => {
                 color.rgb = Some(parse_effect_rgb(e));
+            }
+            Ok(Event::Empty(ref e)) => {
+                color.raw_child_xml.push(raw_empty_xml_element(e)?);
+            }
+            Ok(Event::Start(ref e)) if local_name(e.name().as_ref()) == b"rgb" => {
+                color.rgb = Some(parse_effect_rgb(e));
+                skip_element(reader, e.name().as_ref())?;
+            }
+            Ok(Event::Start(ref e)) => {
+                color
+                    .raw_child_xml
+                    .push(capture_raw_xml_element(e, reader)?);
             }
             Ok(Event::End(ref e)) if local_name(e.name().as_ref()) == b"effectsColor" => break,
             Ok(Event::Eof) => break,
@@ -2731,35 +3548,28 @@ fn parse_object_element_attrs(
             b"id" => common.instance_id = parse_u32(&attr),
             b"zOrder" => common.z_order = parse_i32(&attr),
             b"textWrap" => {
-                common.text_wrap = match attr_str(&attr).as_str() {
-                    "SQUARE" => TextWrap::Square,
-                    "TIGHT" => TextWrap::Tight,
-                    "THROUGH" => TextWrap::Through,
-                    "TOP_AND_BOTTOM" => TextWrap::TopAndBottom,
-                    "BEHIND_TEXT" => TextWrap::BehindText,
-                    "IN_FRONT_OF_TEXT" => TextWrap::InFrontOfText,
-                    _ => TextWrap::Square,
-                };
+                common.text_wrap = parse_object_text_wrap(&attr_str(&attr));
             }
             b"textFlow" => {
-                common.text_flow = match attr_str(&attr).as_str() {
-                    "LEFT_ONLY" => crate::model::shape::TextFlow::LeftOnly,
-                    "RIGHT_ONLY" => crate::model::shape::TextFlow::RightOnly,
-                    "LARGEST_ONLY" => crate::model::shape::TextFlow::LargestOnly,
-                    _ => crate::model::shape::TextFlow::BothSides,
-                };
+                common.text_flow = parse_object_text_flow(&attr_str(&attr));
             }
             b"instid" => ids.instid = parse_u32(&attr),
+            b"href" => {
+                let value = attr_str(&attr);
+                if !value.is_empty() {
+                    common.href = Some(value);
+                }
+            }
             b"groupLevel" => shape_attr.group_level = attr_str(&attr).parse().unwrap_or(0),
             b"ratio" => ids.round_rate = parse_u8(&attr).min(100),
             // [Task #1379] numberingType (캡션 번호 범주) 보존 — exam_kor 등 광범위 사용.
             b"numberingType" => {
-                common.numbering_type = match attr_str(&attr).to_ascii_uppercase().as_str() {
-                    "PICTURE" => crate::model::shape::ObjectNumberingType::Picture,
-                    "TABLE" => crate::model::shape::ObjectNumberingType::Table,
-                    "EQUATION" => crate::model::shape::ObjectNumberingType::Equation,
-                    _ => crate::model::shape::ObjectNumberingType::None,
-                };
+                common.numbering_type = parse_object_numbering_type(&attr_str(&attr));
+                common.numbering_type_explicit = true;
+            }
+            b"lock" => common.lock = parse_bool(&attr),
+            b"dropcapstyle" => {
+                common.dropcap_style = parse_object_dropcap_style(&attr_str(&attr));
             }
             _ => {}
         }
@@ -2768,6 +3578,7 @@ fn parse_object_element_attrs(
     if common.instance_id == 0 && ids.instid != 0 {
         common.instance_id = ids.instid;
     }
+    common.inst_id = ids.instid;
 
     ids
 }
@@ -2858,42 +3669,20 @@ fn parse_object_layout_child(
                     }
                     b"flowWithText" => common.flow_with_text = parse_bool(&attr),
                     b"allowOverlap" => common.allow_overlap = parse_bool(&attr),
+                    b"holdAnchorAndSO" => {
+                        common.prevent_page_break = if parse_bool(&attr) { 1 } else { 0 };
+                    }
                     b"vertRelTo" => {
-                        common.vert_rel_to = match attr_str(&attr).as_str() {
-                            "PAPER" => VertRelTo::Paper,
-                            "PAGE" => VertRelTo::Page,
-                            "PARA" => VertRelTo::Para,
-                            _ => VertRelTo::Para,
-                        };
+                        common.vert_rel_to = parse_object_vert_rel_to(&attr_str(&attr));
                     }
                     b"horzRelTo" => {
-                        common.horz_rel_to = match attr_str(&attr).as_str() {
-                            "PAPER" => HorzRelTo::Paper,
-                            "PAGE" => HorzRelTo::Page,
-                            "COLUMN" => HorzRelTo::Column,
-                            "PARA" => HorzRelTo::Para,
-                            _ => HorzRelTo::Para,
-                        };
+                        common.horz_rel_to = parse_object_horz_rel_to(&attr_str(&attr));
                     }
                     b"vertAlign" => {
-                        common.vert_align = match attr_str(&attr).as_str() {
-                            "TOP" => VertAlign::Top,
-                            "CENTER" => VertAlign::Center,
-                            "BOTTOM" => VertAlign::Bottom,
-                            "INSIDE" => VertAlign::Inside,
-                            "OUTSIDE" => VertAlign::Outside,
-                            _ => VertAlign::Top,
-                        };
+                        common.vert_align = parse_object_vert_align(&attr_str(&attr));
                     }
                     b"horzAlign" => {
-                        common.horz_align = match attr_str(&attr).as_str() {
-                            "LEFT" => HorzAlign::Left,
-                            "CENTER" => HorzAlign::Center,
-                            "RIGHT" => HorzAlign::Right,
-                            "INSIDE" => HorzAlign::Inside,
-                            "OUTSIDE" => HorzAlign::Outside,
-                            _ => HorzAlign::Left,
-                        };
+                        common.horz_align = parse_object_horz_align(&attr_str(&attr));
                     }
                     b"vertOffset" => common.vertical_offset = parse_i32_wrapping(&attr) as u32,
                     b"horzOffset" => common.horizontal_offset = parse_i32_wrapping(&attr) as u32,
@@ -3315,9 +4104,21 @@ fn parse_shape_fill_brush(reader: &mut Reader<&[u8]>) -> Result<Fill, HwpxError>
                         // Header BorderFill already handles the same construct; shape-local
                         // fillBrush needs the same color stop materialization for rendering.
                         if let Some(ref mut grad) = fill.gradient {
+                            let mut color = None;
+                            let mut position = None;
                             for attr in ce.attributes().flatten() {
-                                if attr.key.as_ref() == b"value" {
-                                    grad.colors.push(parse_color(&attr));
+                                match attr.key.as_ref() {
+                                    b"value" => color = Some(parse_color(&attr)),
+                                    b"position" | b"pos" | b"offset" => {
+                                        position = Some(parse_i32(&attr))
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if let Some(color) = color {
+                                grad.colors.push(color);
+                                if let Some(position) = position {
+                                    grad.positions.push(position);
                                 }
                             }
                         }
@@ -3337,10 +4138,36 @@ fn parse_shape_fill_brush(reader: &mut Reader<&[u8]>) -> Result<Fill, HwpxError>
                                         _ => ImageFillMode::TileAll,
                                     };
                                 }
+                                b"binaryItemIDRef" => {
+                                    img.bin_data_id = parse_binary_item_id_ref(&attr_str(&attr));
+                                }
+                                b"bright" => img.brightness = parse_i8(&attr),
+                                b"contrast" => img.contrast = parse_i8(&attr),
+                                b"effect" => {
+                                    img.effect = parse_image_effect_name(&attr_str(&attr));
+                                }
                                 _ => {}
                             }
                         }
                         fill.image = Some(img);
+                    }
+                    b"img" | b"image" => {
+                        if let Some(ref mut img) = fill.image {
+                            for attr in ce.attributes().flatten() {
+                                match attr.key.as_ref() {
+                                    b"binaryItemIDRef" => {
+                                        img.bin_data_id =
+                                            parse_binary_item_id_ref(&attr_str(&attr));
+                                    }
+                                    b"bright" => img.brightness = parse_i8(&attr),
+                                    b"contrast" => img.contrast = parse_i8(&attr),
+                                    b"effect" => {
+                                        img.effect = parse_image_effect_name(&attr_str(&attr));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -3359,6 +4186,34 @@ fn parse_shape_fill_brush(reader: &mut Reader<&[u8]>) -> Result<Fill, HwpxError>
     Ok(fill)
 }
 
+fn parse_binary_item_id_ref(value: &str) -> u16 {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0)
+}
+
+fn parse_shape_shadow_type_name(value: &str) -> u32 {
+    let key = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+
+    match key.as_str() {
+        "" | "0" | "none" => 0,
+        "1" | "lefttop" | "topleft" => 1,
+        "2" | "righttop" | "topright" => 2,
+        "3" | "leftbottom" | "bottomleft" => 3,
+        "4" | "rightbottom" | "bottomright" => 4,
+        "5" | "center" | "inside" | "outside" => 5,
+        _ => 0,
+    }
+}
+
 fn parse_shape_shadow_attr(e: &quick_xml::events::BytesStart) -> (u32, u32, i32, i32, u8) {
     let mut shadow_type = 0_u32;
     let mut shadow_color = 0_u32;
@@ -3369,15 +4224,7 @@ fn parse_shape_shadow_attr(e: &quick_xml::events::BytesStart) -> (u32, u32, i32,
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
             b"type" => {
-                shadow_type = match attr_str(&attr).as_str() {
-                    "NONE" => 0,
-                    "LEFT_TOP" => 1,
-                    "RIGHT_TOP" => 2,
-                    "LEFT_BOTTOM" => 3,
-                    "RIGHT_BOTTOM" => 4,
-                    "CENTER" | "INSIDE" | "OUTSIDE" => 5,
-                    _ => 0,
-                };
+                shadow_type = parse_shape_shadow_type_name(&attr_str(&attr));
             }
             b"color" => shadow_color = parse_color(&attr),
             b"offsetX" => shadow_offset_x = parse_i32(&attr),
@@ -3492,6 +4339,36 @@ fn parse_draw_text(reader: &mut Reader<&[u8]>, text_box: &mut TextBox) -> Result
 
 // ─── 그리기 객체 파싱 (rect, ellipse, line, arc, polygon, curve) ───
 
+fn should_capture_shape_raw_child(local: &[u8]) -> bool {
+    !matches!(
+        local,
+        b"shapeComment"
+            | b"caption"
+            | b"sz"
+            | b"curSz"
+            | b"orgSz"
+            | b"pos"
+            | b"offset"
+            | b"outMargin"
+            | b"flip"
+            | b"rotationInfo"
+            | b"renderingInfo"
+            | b"lineShape"
+            | b"extent"
+            | b"fillBrush"
+            | b"shadow"
+            | b"drawText"
+            | b"pt0"
+            | b"pt1"
+            | b"pt2"
+            | b"pt3"
+            | b"pt"
+            | b"seg"
+            | b"startPt"
+            | b"endPt"
+    )
+}
+
 /// `<hp:rect>`, `<hp:ellipse>` 등 그리기 객체를 파싱하여 `Control::Shape`를 반환한다.
 fn parse_shape_object(
     shape_type: &[u8],
@@ -3510,6 +4387,7 @@ fn parse_shape_object(
     // [Task #1067] polygon / curve 의 가변 꼭짓점 `<hc:pt x=... y=.../>` 누적.
     // 기존 pt0/pt1/pt2/pt3 (rect 의 4 꼭짓점) 와 별개.
     let mut polygon_points: Vec<crate::model::Point> = Vec::new();
+    let mut raw_hwpx_child_xml: Vec<String> = Vec::new();
 
     let object_ids = parse_object_element_attrs(e, &mut common, &mut shape_attr);
 
@@ -3524,6 +4402,16 @@ fn parse_shape_object(
             // 도형 캡션 (#1403) — 미적재 시 roundtrip 에서 캡션 subList 소실
             Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"caption" => {
                 caption = Some(parse_table_caption(ce, reader)?);
+            }
+            Ok(Event::Start(ref ce))
+                if should_capture_shape_raw_child(local_name(ce.name().as_ref())) =>
+            {
+                raw_hwpx_child_xml.push(capture_raw_xml_element(ce, reader)?);
+            }
+            Ok(Event::Empty(ref ce))
+                if should_capture_shape_raw_child(local_name(ce.name().as_ref())) =>
+            {
+                raw_hwpx_child_xml.push(raw_empty_xml_element(ce)?);
             }
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
@@ -3686,6 +4574,7 @@ fn parse_shape_object(
         inst_id: object_ids.instid,
         text_box,
         caption,
+        raw_hwpx_child_xml,
     };
 
     let shape = match shape_type {
@@ -3695,6 +4584,7 @@ fn parse_shape_object(
             round_rate: object_ids.round_rate,
             x_coords,
             y_coords,
+            raw_trailing: Vec::new(),
         }),
         b"ellipse" => ShapeObject::Ellipse(EllipseShape {
             common,
@@ -3740,6 +4630,7 @@ fn parse_shape_object(
             round_rate: object_ids.round_rate,
             x_coords,
             y_coords,
+            raw_trailing: Vec::new(),
         }),
     };
 
@@ -3832,6 +4723,7 @@ fn parse_container(
         common,
         shape_attr,
         children,
+        raw_component_extra: Vec::new(),
         caption,
     };
 
@@ -4010,7 +4902,7 @@ fn parse_ctrl(
 
 fn parse_bool_attr(attr: &quick_xml::events::attributes::Attribute) -> bool {
     let s = attr_str(attr);
-    s == "1" || s == "true"
+    s == "1" || s.eq_ignore_ascii_case("true")
 }
 
 fn parse_page_hiding_attrs(e: &quick_xml::events::BytesStart) -> PageHide {
@@ -4863,20 +5755,27 @@ fn parse_dutmal(
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
             b"posType" => {
-                ruby.alignment = match attr_str(&attr).as_str() {
+                let value = attr_str(&attr);
+                ruby.pos_type = Some(value.clone());
+                ruby.alignment = match value.as_str() {
                     "TOP" => 0,
                     "BOTTOM" => 1,
                     _ => 0,
                 };
             }
             b"align" => {
-                ruby.alignment = match attr_str(&attr).as_str() {
+                let value = attr_str(&attr);
+                ruby.align = Some(value.clone());
+                ruby.alignment = match value.as_str() {
                     "LEFT" => 0,
                     "RIGHT" => 1,
                     "CENTER" => 2,
                     _ => 0,
                 };
             }
+            b"szRatio" => ruby.size_ratio = Some(attr_str(&attr)),
+            b"option" => ruby.option = Some(attr_str(&attr)),
+            b"styleIDRef" => ruby.style_id_ref = Some(attr_str(&attr)),
             _ => {}
         }
     }
@@ -4890,8 +5789,7 @@ fn parse_dutmal(
                 if local == b"subText" {
                     ruby.ruby_text = read_dutmal_text(reader, b"subText")?;
                 } else if local == b"mainText" {
-                    // mainText는 이미 문단 텍스트에 포함되므로 스킵
-                    skip_element(reader, b"mainText")?;
+                    ruby.main_text = read_dutmal_text(reader, b"mainText")?;
                 } else {
                     let tag = local.to_vec();
                     skip_element(reader, &tag)?;
@@ -4962,6 +5860,7 @@ fn parse_equation(
     let mut color: u32 = 0;
     let mut font_size: u32 = 1000;
     let mut font_name = String::new();
+    let mut line_mode = String::new();
 
     // 공통 개체 속성 + 수식 속성 파싱
     parse_object_element_attrs(e, &mut common, &mut shape_attr);
@@ -4972,6 +5871,7 @@ fn parse_equation(
             b"textColor" => color = parse_color(&attr),
             b"baseUnit" => font_size = parse_u32(&attr),
             b"font" => font_name = attr_str(&attr),
+            b"lineMode" => line_mode = attr_str(&attr),
             _ => {}
         }
     }
@@ -5056,6 +5956,7 @@ fn parse_equation(
         baseline,
         unknown: 0,
         font_name,
+        line_mode,
         version_info,
         raw_ctrl_data: Vec::new(),
     };
@@ -5086,6 +5987,17 @@ fn calc_utf16_len_from_parts(parts: &[String]) -> u32 {
                     }
                 })
                 .sum(),
+        })
+        .sum()
+}
+
+fn calc_visible_char_len_from_parts(parts: &[String]) -> usize {
+    parts
+        .iter()
+        .map(|s| match s.as_str() {
+            "\u{0002}" | "\u{0003}" | "\u{0004}" => 0,
+            "\u{0012}" => 1,
+            _ => s.chars().count(),
         })
         .sum()
 }
@@ -5427,6 +6339,30 @@ fn parse_switch_chart_or_ole(reader: &mut Reader<&[u8]>) -> Result<Option<Contro
         }
         buf.clear();
     }
+    if let (Some(Control::Shape(chart_shape)), Some(Control::Shape(fallback_shape))) =
+        (chart_ctrl.as_mut(), ole_ctrl.as_ref())
+    {
+        if let (ShapeObject::Ole(chart_ole), ShapeObject::Ole(fallback_ole)) =
+            (chart_shape.as_mut(), fallback_shape.as_ref())
+        {
+            if chart_ole.hwpx_object_type.is_none() {
+                chart_ole.hwpx_object_type = fallback_ole.hwpx_object_type.clone();
+            }
+            if chart_ole.hwpx_draw_aspect.is_none() {
+                chart_ole.hwpx_draw_aspect = fallback_ole.hwpx_draw_aspect.clone();
+            }
+            if chart_ole.hwpx_eq_base_line.is_none() {
+                chart_ole.hwpx_eq_base_line = fallback_ole.hwpx_eq_base_line.clone();
+            }
+            if chart_ole.hwpx_has_moniker.is_none() {
+                chart_ole.hwpx_has_moniker = fallback_ole.hwpx_has_moniker.clone();
+            }
+            chart_ole.drawing = fallback_ole.drawing.clone();
+            chart_ole.extent_x = fallback_ole.extent_x;
+            chart_ole.extent_y = fallback_ole.extent_y;
+        }
+    }
+
     Ok(chart_ctrl.or(ole_ctrl))
 }
 
@@ -5438,48 +6374,25 @@ fn parse_hp_chart_element(
     use crate::model::shape::OleShape;
 
     let mut common = CommonObjAttr::default();
-    common.hwp5_gen_shape_attr_bit26 = true;
+    let mut shape_attr = ShapeComponentAttr::default();
+    parse_object_element_attrs(e, &mut common, &mut shape_attr);
     let mut chart_num: u16 = 0;
-    let mut numbering_type_picture = false;
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"numberingType" => {
-                numbering_type_picture = attr_str(&attr).eq_ignore_ascii_case("PICTURE");
-            }
-            b"zOrder" => common.z_order = parse_i32(&attr),
-            b"textWrap" => {
-                common.text_wrap = match attr_str(&attr).as_str() {
-                    "SQUARE" => TextWrap::Square,
-                    "TIGHT" => TextWrap::Tight,
-                    "THROUGH" => TextWrap::Through,
-                    "TOP_AND_BOTTOM" => TextWrap::TopAndBottom,
-                    "BEHIND_TEXT" => TextWrap::BehindText,
-                    "IN_FRONT_OF_TEXT" => TextWrap::InFrontOfText,
-                    _ => TextWrap::Square,
-                };
-            }
-            b"textFlow" => {
-                common.text_flow = match attr_str(&attr).as_str() {
-                    "LEFT_ONLY" => crate::model::shape::TextFlow::LeftOnly,
-                    "RIGHT_ONLY" => crate::model::shape::TextFlow::RightOnly,
-                    "LARGEST_ONLY" => crate::model::shape::TextFlow::LargestOnly,
-                    _ => crate::model::shape::TextFlow::BothSides,
-                };
-            }
             b"chartIDRef" => {
                 // "Chart/chart1.xml" → 1
                 let s = attr_str(&attr);
                 let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
                 chart_num = digits.parse().unwrap_or(0);
             }
-            b"instid" => common.instance_id = parse_u32(&attr),
             _ => {}
         }
     }
 
-    parse_common_shape_children(reader, &mut common, b"chart")?;
-    if numbering_type_picture {
+    let parsed_children =
+        parse_common_shape_children(reader, &mut common, &mut shape_attr, b"chart")?;
+    if common.numbering_type == ObjectNumberingType::Picture {
         common.hwp5_gen_shape_attr_bit28 = true;
     }
     common.attr = pack_hwpx_common_obj_attr(&common);
@@ -5490,9 +6403,16 @@ fn parse_hp_chart_element(
 
     let mut ole = OleShape::default();
     ole.common = common;
+    ole.drawing.shape_attr = shape_attr;
+    if let Some(border_line) = parsed_children.border_line {
+        ole.drawing.border_line = border_line;
+    }
+    ole.drawing.raw_hwpx_child_xml = parsed_children.raw_hwpx_child_xml;
+    ole.caption = parsed_children.caption;
     ole.bin_data_id = 60000u32 + chart_num as u32;
-    ole.extent_x = 7200;
-    ole.extent_y = 7200;
+    let (extent_x, extent_y) = parsed_children.extent.unwrap_or((7200, 7200));
+    ole.extent_x = extent_x;
+    ole.extent_y = extent_y;
     apply_hwpx_ole_shape_component_contract(&mut ole);
     Ok(Some(Control::Shape(Box::new(ShapeObject::Ole(Box::new(
         ole,
@@ -5507,56 +6427,52 @@ fn parse_hp_ole_element(
     use crate::model::shape::OleShape;
 
     let mut common = CommonObjAttr::default();
-    common.hwp5_gen_shape_attr_bit26 = true;
+    let mut shape_attr = ShapeComponentAttr::default();
+    parse_object_element_attrs(e, &mut common, &mut shape_attr);
     let mut bin_id: u32 = 0;
-    let mut numbering_type_picture = false;
+    let mut hwpx_object_type: Option<String> = None;
+    let mut hwpx_draw_aspect: Option<String> = None;
+    let mut hwpx_eq_base_line: Option<String> = None;
+    let mut hwpx_has_moniker: Option<String> = None;
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"numberingType" => {
-                numbering_type_picture = attr_str(&attr).eq_ignore_ascii_case("PICTURE");
-            }
-            b"zOrder" => common.z_order = parse_i32(&attr),
-            b"textWrap" => {
-                common.text_wrap = match attr_str(&attr).as_str() {
-                    "SQUARE" => TextWrap::Square,
-                    "TIGHT" => TextWrap::Tight,
-                    "THROUGH" => TextWrap::Through,
-                    "TOP_AND_BOTTOM" => TextWrap::TopAndBottom,
-                    "BEHIND_TEXT" => TextWrap::BehindText,
-                    "IN_FRONT_OF_TEXT" => TextWrap::InFrontOfText,
-                    _ => TextWrap::Square,
-                };
-            }
-            b"textFlow" => {
-                common.text_flow = match attr_str(&attr).as_str() {
-                    "LEFT_ONLY" => crate::model::shape::TextFlow::LeftOnly,
-                    "RIGHT_ONLY" => crate::model::shape::TextFlow::RightOnly,
-                    "LARGEST_ONLY" => crate::model::shape::TextFlow::LargestOnly,
-                    _ => crate::model::shape::TextFlow::BothSides,
-                };
-            }
             b"binaryItemIDRef" => {
                 let s = attr_str(&attr);
                 let digits: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
                 bin_id = digits.parse().unwrap_or(0);
             }
-            b"instid" => common.instance_id = parse_u32(&attr),
+            b"objectType" => hwpx_object_type = Some(attr_str(&attr)),
+            b"drawAspect" => hwpx_draw_aspect = Some(attr_str(&attr)),
+            b"eqBaseLine" => hwpx_eq_base_line = Some(attr_str(&attr)),
+            b"hasMoniker" => hwpx_has_moniker = Some(attr_str(&attr)),
             _ => {}
         }
     }
 
-    parse_common_shape_children(reader, &mut common, b"ole")?;
-    if numbering_type_picture {
+    let parsed_children =
+        parse_common_shape_children(reader, &mut common, &mut shape_attr, b"ole")?;
+    if common.numbering_type == ObjectNumberingType::Picture {
         common.hwp5_gen_shape_attr_bit28 = true;
     }
     common.attr = pack_hwpx_common_obj_attr(&common);
 
     let mut ole = OleShape::default();
     ole.common = common;
+    ole.drawing.shape_attr = shape_attr;
+    if let Some(border_line) = parsed_children.border_line {
+        ole.drawing.border_line = border_line;
+    }
+    ole.drawing.raw_hwpx_child_xml = parsed_children.raw_hwpx_child_xml;
+    ole.caption = parsed_children.caption;
     ole.bin_data_id = bin_id;
-    ole.extent_x = 7200;
-    ole.extent_y = 7200;
+    ole.hwpx_object_type = hwpx_object_type;
+    ole.hwpx_draw_aspect = hwpx_draw_aspect;
+    ole.hwpx_eq_base_line = hwpx_eq_base_line;
+    ole.hwpx_has_moniker = hwpx_has_moniker;
+    let (extent_x, extent_y) = parsed_children.extent.unwrap_or((7200, 7200));
+    ole.extent_x = extent_x;
+    ole.extent_y = extent_y;
     apply_hwpx_ole_shape_component_contract(&mut ole);
     Ok(Some(Control::Shape(Box::new(ShapeObject::Ole(Box::new(
         ole,
@@ -5594,83 +6510,68 @@ fn apply_hwpx_ole_shape_component_contract(ole: &mut crate::model::shape::OleSha
     }
 }
 
+#[derive(Default)]
+struct ParsedCommonShapeChildren {
+    border_line: Option<ShapeBorderLine>,
+    caption: Option<crate::model::shape::Caption>,
+    extent: Option<(i32, i32)>,
+    raw_hwpx_child_xml: Vec<String>,
+}
+
 /// `<hp:sz>`, `<hp:pos>`, `<hp:outMargin>` 등 공통 자식 요소를 공통 속성에 반영한다.
 fn parse_common_shape_children(
     reader: &mut Reader<&[u8]>,
     common: &mut CommonObjAttr,
+    shape_attr: &mut ShapeComponentAttr,
     end_tag: &[u8],
-) -> Result<(), HwpxError> {
+) -> Result<ParsedCommonShapeChildren, HwpxError> {
+    let mut parsed = ParsedCommonShapeChildren::default();
+    let mut has_pos = false;
     let mut buf = Vec::new();
     loop {
         match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"shapeComment" => {
+                common.description = read_dutmal_text(reader, b"shapeComment")?;
+            }
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"caption" => {
+                parsed.caption = Some(parse_table_caption(ce, reader)?);
+            }
+            Ok(Event::Start(ref ce)) if local_name(ce.name().as_ref()) == b"renderingInfo" => {
+                parse_rendering_info(reader, shape_attr)?;
+            }
+            Ok(Event::Start(ref ce))
+                if should_capture_shape_raw_child(local_name(ce.name().as_ref())) =>
+            {
+                parsed
+                    .raw_hwpx_child_xml
+                    .push(capture_raw_xml_element(ce, reader)?);
+            }
+            Ok(Event::Empty(ref ce))
+                if should_capture_shape_raw_child(local_name(ce.name().as_ref())) =>
+            {
+                parsed.raw_hwpx_child_xml.push(raw_empty_xml_element(ce)?);
+            }
             Ok(Event::Start(ref ce)) | Ok(Event::Empty(ref ce)) => {
                 let cname = ce.name();
                 let local = local_name(cname.as_ref());
                 match local {
-                    b"sz" => {
+                    b"sz" | b"curSz" | b"orgSz" | b"pos" | b"offset" | b"outMargin" | b"flip"
+                    | b"rotationInfo" => {
+                        parse_object_layout_child(local, ce, common, shape_attr, &mut has_pos)
+                    }
+                    b"lineShape" => parsed.border_line = Some(parse_line_shape_attr(ce)),
+                    b"extent" => {
+                        let mut x = 0;
+                        let mut y = 0;
                         for attr in ce.attributes().flatten() {
                             match attr.key.as_ref() {
-                                b"width" => common.width = parse_u32(&attr),
-                                b"height" => common.height = parse_u32(&attr),
-                                b"protect" => common.size_protect = parse_bool(&attr),
+                                b"x" => x = parse_i32(&attr),
+                                b"y" => y = parse_i32(&attr),
                                 _ => {}
                             }
                         }
-                    }
-                    b"pos" => {
-                        for attr in ce.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"vertRelTo" => {
-                                    common.vert_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => VertRelTo::Paper,
-                                        "PAGE" => VertRelTo::Page,
-                                        _ => VertRelTo::Para,
-                                    };
-                                }
-                                b"horzRelTo" => {
-                                    common.horz_rel_to = match attr_str(&attr).as_str() {
-                                        "PAPER" => HorzRelTo::Paper,
-                                        "PAGE" => HorzRelTo::Page,
-                                        "COLUMN" => HorzRelTo::Column,
-                                        _ => HorzRelTo::Para,
-                                    };
-                                }
-                                b"vertAlign" => {
-                                    common.vert_align = match attr_str(&attr).as_str() {
-                                        "CENTER" => VertAlign::Center,
-                                        "BOTTOM" => VertAlign::Bottom,
-                                        "INSIDE" => VertAlign::Inside,
-                                        "OUTSIDE" => VertAlign::Outside,
-                                        _ => VertAlign::Top,
-                                    };
-                                }
-                                b"horzAlign" => {
-                                    common.horz_align = match attr_str(&attr).as_str() {
-                                        "CENTER" => HorzAlign::Center,
-                                        "RIGHT" => HorzAlign::Right,
-                                        "INSIDE" => HorzAlign::Inside,
-                                        "OUTSIDE" => HorzAlign::Outside,
-                                        _ => HorzAlign::Left,
-                                    };
-                                }
-                                b"vertOffset" => common.vertical_offset = parse_u32(&attr),
-                                b"horzOffset" => common.horizontal_offset = parse_u32(&attr),
-                                b"treatAsChar" => common.treat_as_char = parse_bool(&attr),
-                                b"flowWithText" => common.flow_with_text = parse_bool(&attr),
-                                b"allowOverlap" => common.allow_overlap = parse_bool(&attr),
-                                _ => {}
-                            }
-                        }
-                    }
-                    b"outMargin" => {
-                        for attr in ce.attributes().flatten() {
-                            match attr.key.as_ref() {
-                                b"left" => common.margin.left = parse_i32(&attr) as i16,
-                                b"right" => common.margin.right = parse_i32(&attr) as i16,
-                                b"top" => common.margin.top = parse_i32(&attr) as i16,
-                                b"bottom" => common.margin.bottom = parse_i32(&attr) as i16,
-                                _ => {}
-                            }
+                        if x > 0 || y > 0 {
+                            parsed.extent = Some((x, y));
                         }
                     }
                     _ => {}
@@ -5687,7 +6588,7 @@ fn parse_common_shape_children(
         }
         buf.clear();
     }
-    Ok(())
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -5696,20 +6597,46 @@ mod tests {
 
     #[test]
     fn test_parse_simple_section() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
         xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
   <hp:p paraPrIDRef="0" styleIDRef="0">
     <hp:run charPrIDRef="0">
       <hp:t>Hello World</hp:t>
     </hp:run>
-  </hp:p>
-</hs:sec>"#;
+	  </hp:p>
+</hs:sec>"##;
 
         let section = parse_hwpx_section(xml).unwrap();
         assert_eq!(section.paragraphs.len(), 1);
         assert_eq!(section.paragraphs[0].text, "Hello World");
         assert_eq!(section.paragraphs[0].para_shape_id, 0);
+    }
+
+    #[test]
+    fn test_parse_picture_effect_name_aliases() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:pic id="1" zOrder="0">
+        <hp:sz width="1000" height="1000"/>
+        <hp:pos treatAsChar="1"/>
+        <hp:img binaryItemIDRef="image1" effect="pattern-8-8"/>
+      </hp:pic>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Picture(pic) = &section.paragraphs[0].controls[0] else {
+            panic!("expected picture control");
+        };
+        assert_eq!(pic.image_attr.effect, ImageEffect::Pattern8x8);
     }
 
     // ---------- #1382: autoNum 폭 축 일관화 ----------
@@ -5863,6 +6790,62 @@ mod tests {
     }
 
     #[test]
+    fn note_pr_captures_raw_hwpx_children_for_roundtrip() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" outlineShapeIDRef="1" masterPageCnt="0">
+        <hp:footNotePr>
+          <hp:switch><hp:case hp:required-namespace="custom"/></hp:switch>
+          <hp:autoNumFormat type="USER_CHAR" userChar="*" prefixChar="[" suffixChar="]" supscript="1"/>
+          <hp:noteLine length="321" type="DOT" width="0.7 mm" color="#112233"/>
+          <hp:noteSpacing betweenNotes="77" belowLine="88" aboveLine="99"/>
+          <hp:numbering type="ON_PAGE" newNum="5"/>
+          <hp:placement place="BELOW_TEXT" beneathText="1"/>
+        </hp:footNotePr>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let shape = &section.section_def.footnote_shape;
+
+        assert!(
+            shape
+                .raw_hwpx_children
+                .as_deref()
+                .unwrap_or_default()
+                .contains(r#"<hp:switch><hp:case hp:required-namespace="custom"/></hp:switch>"#),
+            "{:?}",
+            shape.raw_hwpx_children
+        );
+        assert_eq!(
+            shape.number_format,
+            crate::model::footnote::NumberFormat::UserChar
+        );
+        assert_eq!(shape.user_char, '*');
+        assert_eq!(shape.separator_line_type, 3);
+        assert_eq!(shape.separator_line_width, 9);
+        assert_eq!(shape.separator_color, 0x0033_2211);
+        assert_eq!(shape.between_notes_margin_hu(), 77);
+        assert_eq!(shape.separator_below_margin_hu(), 88);
+        assert_eq!(shape.separator_above_margin_hu(), 99);
+        assert_eq!(
+            shape.numbering,
+            crate::model::footnote::FootnoteNumbering::RestartPage
+        );
+        assert_eq!(
+            shape.placement,
+            crate::model::footnote::FootnotePlacement::BelowText
+        );
+        assert!(shape.number_code_superscript);
+        assert!(shape.print_inline_after_text);
+    }
+
+    #[test]
     fn test_parse_endnote_placement_end_of_section() {
         let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
@@ -5920,6 +6903,148 @@ mod tests {
         assert_eq!(section.section_def.endnote_shape.start_number, 5);
         assert_eq!((section.section_def.endnote_shape.attr >> 8) & 0x03, 0);
         assert_eq!((section.section_def.endnote_shape.attr >> 10) & 0x03, 1);
+    }
+
+    #[test]
+    fn line_number_shape_is_parsed_from_secpr() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" outlineShapeIDRef="1" masterPageCnt="0">
+        <hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="1" hideFirstEmptyLine="0" showLineNumber="1"/>
+        <hp:lineNumberShape restartType="2" countBy="3" distance="450" startNumber="7"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let sec_def = &section.section_def;
+
+        assert!(sec_def.show_line_number);
+        assert!(sec_def.hide_page_number);
+        assert_ne!(sec_def.flags & 0x0020, 0);
+        assert_eq!(sec_def.line_number_restart_type, 2);
+        assert_eq!(sec_def.line_number_count_by, 3);
+        assert_eq!(sec_def.line_number_distance, 450);
+        assert_eq!(sec_def.line_number_start_number, 7);
+    }
+
+    #[test]
+    fn visibility_and_start_num_materialize_hwp_section_flags() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" outlineShapeIDRef="1" masterPageCnt="0">
+        <hp:startNum pageStartsOn="EVEN" page="12" pic="2" tbl="3" equation="4"/>
+        <hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="1" showLineNumber="0"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let sec_def = &section.section_def;
+
+        assert_eq!(sec_def.page_num, 12);
+        assert_eq!(sec_def.picture_num, 2);
+        assert_eq!(sec_def.table_num, 3);
+        assert_eq!(sec_def.equation_num, 4);
+        assert_eq!(sec_def.page_num_type, 2);
+        assert!(sec_def.hide_empty_line);
+        assert_ne!(sec_def.flags & 0x0008_0000, 0);
+        assert_eq!((sec_def.flags >> 20) & 0x03, 2);
+    }
+
+    #[test]
+    fn visibility_boolean_text_values_materialize_hwp_section_flags() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr>
+        <hp:visibility hideFirstHeader="true" hideFirstFooter="TRUE" hideFirstMasterPage="true" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="true" hideFirstEmptyLine="TRUE" showLineNumber="true"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let sec_def = &section.section_def;
+
+        assert!(sec_def.hide_header);
+        assert!(sec_def.hide_footer);
+        assert!(sec_def.hide_master_page);
+        assert!(sec_def.hide_page_number);
+        assert!(sec_def.hide_empty_line);
+        assert!(sec_def.show_line_number);
+        assert_ne!(sec_def.flags & 0x0001, 0);
+        assert_ne!(sec_def.flags & 0x0002, 0);
+        assert_ne!(sec_def.flags & 0x0004, 0);
+        assert_ne!(sec_def.flags & 0x0020, 0);
+        assert_ne!(sec_def.flags & 0x0008_0000, 0);
+    }
+
+    #[test]
+    fn visibility_border_and_fill_enums_are_parsed_from_secpr() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr>
+        <hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_FIRST" fill="HIDE_FIRST" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let sec_def = &section.section_def;
+
+        assert_eq!(sec_def.visibility_border, "SHOW_FIRST");
+        assert_eq!(sec_def.visibility_fill, "HIDE_FIRST");
+        assert!(!sec_def.hide_border);
+        assert!(sec_def.hide_fill);
+        assert_eq!(sec_def.flags & 0x0008, 0);
+        assert_ne!(sec_def.flags & 0x0010, 0);
+    }
+
+    #[test]
+    fn visibility_hide_all_and_mixed_case_start_num_are_preserved() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr>
+        <hp:startNum pageStartsOn="eVeN" page="3" pic="4" tbl="5" equation="6"/>
+        <hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="hide_all" fill="HIDE_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let sec_def = &section.section_def;
+
+        assert_eq!(sec_def.page_num_type, 2);
+        assert_eq!((sec_def.flags >> 20) & 0x03, 2);
+        assert_eq!(sec_def.page_num, 3);
+        assert_eq!(sec_def.picture_num, 4);
+        assert_eq!(sec_def.table_num, 5);
+        assert_eq!(sec_def.equation_num, 6);
+        assert_eq!(sec_def.visibility_border, "HIDE_ALL");
+        assert_eq!(sec_def.visibility_fill, "HIDE_ALL");
+        assert!(sec_def.hide_border);
+        assert!(sec_def.hide_fill);
+        assert_ne!(sec_def.flags & 0x0008, 0);
+        assert_ne!(sec_def.flags & 0x0010, 0);
     }
 
     #[test]
@@ -6165,6 +7290,39 @@ mod tests {
     }
 
     #[test]
+    fn page_border_fill_captures_raw_hwpx_children_for_roundtrip() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="HORIZONTAL">
+        <hp:pageBorderFill type="BOTH" borderFillIDRef="2" textBorder="PAPER" fillArea="PAGE">
+          <hp:switch><hp:case hp:required-namespace="custom"/></hp:switch>
+          <hp:offset left="100" right="200" top="300" bottom="400"/>
+        </hp:pageBorderFill>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let pbf = &section.section_def.page_border_fill;
+        assert_eq!(pbf.border_fill_id, 2);
+        assert_eq!(pbf.spacing_left, 100);
+        assert_eq!(pbf.spacing_right, 200);
+        let raw = pbf
+            .raw_hwpx_children
+            .as_deref()
+            .expect("pageBorderFill raw child XML");
+        assert!(raw.contains(r#"<hp:switch>"#), "{raw}");
+        assert!(
+            raw.contains(r#"<hp:offset left="100" right="200" top="300" bottom="400"/>"#),
+            "{raw}"
+        );
+    }
+
+    #[test]
     fn test_parse_section_grid_preserves_line_and_char_grid() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
@@ -6182,6 +7340,130 @@ mod tests {
 
         assert_eq!(section.section_def.line_grid, 1200);
         assert_eq!(section.section_def.char_grid, 900);
+    }
+
+    #[test]
+    fn test_parse_section_grid_preserves_wonggoji_format() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr>
+        <hp:grid lineGrid="1200" charGrid="900" wonggojiFormat="1"/>
+      </hp:secPr>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.wonggoji_format, 1);
+    }
+
+    #[test]
+    fn test_parse_section_text_direction_preserves_vertical() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="VERTICAL"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.text_direction, 1);
+    }
+
+    #[test]
+    fn test_parse_section_text_direction_preserves_vertical_all() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr textDirection="VERTICALALL"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.text_direction, 2);
+    }
+
+    #[test]
+    fn test_parse_section_id_preserves_secpr_id_attr() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr id="section-alpha"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.section_id, "section-alpha");
+    }
+
+    #[test]
+    fn test_parse_section_memo_shape_and_vertical_width_head() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr memoShapeIDRef="3" textVerticalWidthHead="456"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.memo_shape_id_ref, 3);
+        assert_eq!(section.section_def.text_vertical_width_head, 456);
+    }
+
+    #[test]
+    fn test_parse_section_outline_shape_id_ref() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr outlineShapeIDRef="8"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.outline_numbering_id, 8);
+    }
+
+    #[test]
+    fn test_parse_section_tab_stop_val_and_unit() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:secPr tabStop="8040" tabStopVal="2345" tabStopUnit="CUSTOMUNIT"/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        assert_eq!(section.section_def.default_tab_spacing, 8040);
+        assert_eq!(section.section_def.tab_stop_val, 2345);
+        assert_eq!(section.section_def.tab_stop_unit, "CUSTOMUNIT");
     }
 
     #[test]
@@ -6333,6 +7615,115 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_table_cell_preserves_dirty_attr() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:tbl rowCnt="1" colCnt="1" cellSpacing="0" borderFillIDRef="0">
+      <hp:tr>
+        <hp:tc name="" header="0" hasMargin="0" editable="1" dirty="1" borderFillIDRef="0">
+          <hp:cellAddr colAddr="0" rowAddr="0"/>
+          <hp:cellSpan colSpan="1" rowSpan="1"/>
+          <hp:cellSz width="1000" height="1000"/>
+        </hp:tc>
+      </hp:tr>
+    </hp:tbl>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let table = match &section.paragraphs[0].controls[0] {
+            crate::model::control::Control::Table(table) => table,
+            other => panic!("expected table, got {:?}", other),
+        };
+        assert!(table.cells[0].editable_in_form());
+        assert!(table.cells[0].dirty);
+    }
+
+    #[test]
+    fn test_parse_table_cell_direct_attrs_without_child_geometry() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:tbl rowCnt="2" colCnt="3" cellSpacing="0" borderFillIDRef="0">
+      <hp:tr>
+        <hp:tc name="DIRECT" header="1" hasMargin="1" protect="1" editable="1"
+               dirty="1" borderFillIDRef="2" textDirection="VERTICAL"
+               vertAlign="BOTTOM" colAddr="1" rowAddr="0" colSpan="2"
+               rowSpan="2" width="4321" height="8765">
+          <hp:cellMargin left="11" right="22" top="33" bottom="44"/>
+          <hp:subList textDirection="VERTICAL" lineWrap="SQUEEZE"
+                      vertAlign="CENTER" linkListIDRef="7"
+                      linkListNextIDRef="8" textWidth="66502"
+                      textHeight="3401" hasTextRef="1" hasNumRef="2">
+            <hp:p paraPrIDRef="0" styleIDRef="0">
+              <hp:run charPrIDRef="0"><hp:t>T</hp:t></hp:run>
+            </hp:p>
+          </hp:subList>
+        </hp:tc>
+      </hp:tr>
+    </hp:tbl>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let table = match &section.paragraphs[0].controls[0] {
+            crate::model::control::Control::Table(table) => table,
+            other => panic!("expected table, got {:?}", other),
+        };
+        let cell = &table.cells[0];
+        assert_eq!(cell.field_name.as_deref(), Some("DIRECT"));
+        assert_eq!(cell.border_fill_id, 2);
+        assert_eq!(cell.col, 1);
+        assert_eq!(cell.row, 0);
+        assert_eq!(cell.col_span, 2);
+        assert_eq!(cell.row_span, 2);
+        assert_eq!(cell.width, 4321);
+        assert_eq!(cell.height, 8765);
+        assert_eq!(cell.text_direction, 1);
+        assert_eq!(cell.vertical_align, VerticalAlign::Center);
+        assert_eq!(cell.sub_list_line_wrap, "SQUEEZE");
+        assert_eq!(cell.sub_list_link_list_id_ref, 7);
+        assert_eq!(cell.sub_list_link_list_next_id_ref, 8);
+        assert_eq!(cell.sub_list_text_width, 66502);
+        assert_eq!(cell.sub_list_text_height, 3401);
+        assert_eq!(cell.sub_list_text_ref, 1);
+        assert_eq!(cell.sub_list_num_ref, 2);
+        assert!(cell.is_header);
+        assert!(cell.apply_inner_margin);
+        assert!(cell.cell_protect());
+        assert!(cell.editable_in_form());
+        assert!(cell.dirty);
+        assert_eq!(cell.padding.left, 11);
+        assert_eq!(cell.padding.bottom, 44);
+    }
+
+    #[test]
+    fn parse_form_caption_unescapes_xml_entities() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:checkBtn caption="R&amp;&amp;D 연계" value="CHECKED" name="CheckBox1">
+        <hp:sz width="1000" height="500"/>
+      </hp:checkBtn>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let form = match &section.paragraphs[0].controls[0] {
+            crate::model::control::Control::Form(form) => form,
+            other => panic!("expected form, got {:?}", other),
+        };
+        assert_eq!(form.caption, "R&&D 연계");
+        assert_eq!(form.value, 1);
+    }
+
+    #[test]
     fn test_parse_table_page_break_table_vs_cell_mapping() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
@@ -6368,7 +7759,7 @@ mod tests {
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
         xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
   <hp:p paraPrIDRef="0" styleIDRef="0">
-    <hp:tbl numberingType="TABLE" textWrap="TOP_AND_BOTTOM" pageBreak="CELL"
+    <hp:tbl numberingType="PICTURE" textWrap="TOP_AND_BOTTOM" textFlow="RIGHT_ONLY" lock="1" pageBreak="CELL"
             repeatHeader="1" rowCnt="1" colCnt="1" cellSpacing="0" borderFillIDRef="0"
             noAdjust="1">
       <hp:sz width="30613" widthRelTo="ABSOLUTE" height="8580" heightRelTo="ABSOLUTE"/>
@@ -6395,10 +7786,179 @@ mod tests {
         };
 
         assert!(table.common.treat_as_char);
+        assert_eq!(table.common.numbering_type, ObjectNumberingType::Picture);
+        assert!(table.common.lock);
         assert_eq!(table.common.text_wrap, TextWrap::TopAndBottom);
-        assert_eq!(table.common.attr, 0x082a_2211);
+        assert_eq!(
+            table.common.text_flow,
+            crate::model::shape::TextFlow::RightOnly
+        );
+        assert_eq!(table.common.attr, 0x0a2a_2211);
         assert_eq!(table.attr, 0x01);
         assert_eq!(table.raw_table_record_attr, 0x0400_000e);
+    }
+
+    #[test]
+    fn test_parse_hwpx_picture_preserves_object_attrs() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:pic id="77" zOrder="2" numberingType="NONE" textWrap="TOP_AND_BOTTOM"
+              textFlow="RIGHT_ONLY" lock="1" dropcapstyle="None" href=""
+              groupLevel="4" instid="88" reverse="0">
+        <hp:orgSz width="100" height="80"/>
+        <hp:curSz width="100" height="80"/>
+        <hp:imgRect>
+          <hc:pt0 x="0" y="0"/><hc:pt1 x="100" y="0"/>
+          <hc:pt2 x="100" y="80"/><hc:pt3 x="0" y="80"/>
+        </hp:imgRect>
+        <hp:sz width="100" widthRelTo="ABSOLUTE" height="80" heightRelTo="ABSOLUTE"/>
+        <hp:pos treatAsChar="1" flowWithText="1" allowOverlap="0"
+                vertRelTo="PARA" horzRelTo="PARA" vertAlign="TOP" horzAlign="LEFT"
+                vertOffset="0" horzOffset="0"/>
+      </hp:pic>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let picture = match &section.paragraphs[0].controls[0] {
+            crate::model::control::Control::Picture(picture) => picture,
+            other => panic!("expected picture, got {:?}", other),
+        };
+
+        assert_eq!(picture.common.numbering_type, ObjectNumberingType::None);
+        assert!(picture.common.numbering_type_explicit);
+        assert!(picture.common.lock);
+        assert_eq!(
+            picture.common.text_flow,
+            crate::model::shape::TextFlow::RightOnly
+        );
+        assert_eq!(picture.shape_attr.group_level, 4);
+        assert_eq!(picture.instance_id, 88);
+        assert_eq!(picture.common.inst_id, 88);
+    }
+
+    #[test]
+    fn object_text_wrap_and_flow_lexical_variants_are_parsed() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:tbl numberingType="picture" textWrap="topAndBottom" textFlow="right-only" dropcapstyle="none"
+            rowCnt="1" colCnt="1" cellSpacing="0" borderFillIDRef="0">
+      <hp:sz width="1000" widthRelTo="page" height="1000" heightRelTo="absolute"/>
+      <hp:pos treatAsChar="1" vertRelTo="paper" horzRelTo="column"
+              vertAlign="inside" horzAlign="outside"/>
+      <hp:tr>
+        <hp:tc borderFillIDRef="0">
+          <hp:cellAddr colAddr="0" rowAddr="0"/>
+          <hp:cellSpan colSpan="1" rowSpan="1"/>
+          <hp:cellSz width="1000" height="1000"/>
+        </hp:tc>
+      </hp:tr>
+    </hp:tbl>
+    <hp:run charPrIDRef="0">
+      <hp:pic id="77" zOrder="2" numberingType="none" textWrap="behind-text"
+              textFlow="leftOnly" dropcapstyle="double-line" groupLevel="0" instid="88" reverse="0">
+        <hp:orgSz width="100" height="80"/>
+        <hp:curSz width="100" height="80"/>
+        <hp:imgRect>
+          <hc:pt0 x="0" y="0"/><hc:pt1 x="100" y="0"/>
+          <hc:pt2 x="100" y="80"/><hc:pt3 x="0" y="80"/>
+        </hp:imgRect>
+        <hp:sz width="100" widthRelTo="para" height="80" heightRelTo="page"/>
+        <hp:pos treatAsChar="1" vertRelTo="page" horzRelTo="para"
+                vertAlign="bottom" horzAlign="right"/>
+      </hp:pic>
+      <hp:rect id="9" zOrder="3" textWrap="InFrontOfText" textFlow="largest_only" dropcapstyle="TRIPLE_LINE">
+        <hp:sz width="100" widthRelTo="COLUMN" height="50" heightRelTo="paper"/>
+        <hp:pos treatAsChar="0" vertRelTo="PAGE" horzRelTo="column"
+                vertAlign="center" horzAlign="inside"/>
+      </hp:rect>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+
+        let table = match &section.paragraphs[0].controls[0] {
+            Control::Table(table) => table,
+            other => panic!("expected table, got {:?}", other),
+        };
+        assert_eq!(table.common.numbering_type, ObjectNumberingType::Picture);
+        assert_eq!(table.common.text_wrap, TextWrap::TopAndBottom);
+        assert_eq!(table.common.text_flow, TextFlow::RightOnly);
+        assert_eq!(table.common.dropcap_style, None);
+        assert_eq!(table.common.width_criterion, SizeCriterion::Page);
+        assert_eq!(table.common.height_criterion, SizeCriterion::Absolute);
+        assert_eq!(table.common.vert_rel_to, VertRelTo::Paper);
+        assert_eq!(table.common.horz_rel_to, HorzRelTo::Column);
+        assert_eq!(table.common.vert_align, VertAlign::Inside);
+        assert_eq!(table.common.horz_align, HorzAlign::Outside);
+
+        let picture = match &section.paragraphs[0].controls[1] {
+            Control::Picture(picture) => picture,
+            other => panic!("expected picture, got {:?}", other),
+        };
+        assert_eq!(picture.common.numbering_type, ObjectNumberingType::None);
+        assert!(picture.common.numbering_type_explicit);
+        assert_eq!(picture.common.text_wrap, TextWrap::BehindText);
+        assert_eq!(picture.common.text_flow, TextFlow::LeftOnly);
+        assert_eq!(picture.common.dropcap_style.as_deref(), Some("DoubleLine"));
+        assert_eq!(picture.common.width_criterion, SizeCriterion::Para);
+        assert_eq!(picture.common.height_criterion, SizeCriterion::Page);
+        assert_eq!(picture.common.vert_rel_to, VertRelTo::Page);
+        assert_eq!(picture.common.horz_rel_to, HorzRelTo::Para);
+        assert_eq!(picture.common.vert_align, VertAlign::Bottom);
+        assert_eq!(picture.common.horz_align, HorzAlign::Right);
+
+        let shape = match &section.paragraphs[0].controls[2] {
+            Control::Shape(shape) => shape,
+            other => panic!("expected shape, got {:?}", other),
+        };
+        let ShapeObject::Rectangle(rect) = shape.as_ref() else {
+            panic!("expected rectangle shape");
+        };
+        assert_eq!(rect.common.text_wrap, TextWrap::InFrontOfText);
+        assert_eq!(rect.common.text_flow, TextFlow::LargestOnly);
+        assert_eq!(rect.common.dropcap_style.as_deref(), Some("TripleLine"));
+        assert_eq!(rect.common.width_criterion, SizeCriterion::Column);
+        assert_eq!(rect.common.height_criterion, SizeCriterion::Paper);
+        assert_eq!(rect.common.vert_rel_to, VertRelTo::Page);
+        assert_eq!(rect.common.horz_rel_to, HorzRelTo::Column);
+        assert_eq!(rect.common.vert_align, VertAlign::Center);
+        assert_eq!(rect.common.horz_align, HorzAlign::Inside);
+    }
+
+    #[test]
+    fn dropcap_style_lexical_variants_are_canonicalized() {
+        assert_eq!(parse_object_dropcap_style(""), None);
+        assert_eq!(parse_object_dropcap_style("none"), None);
+        assert_eq!(
+            parse_object_dropcap_style("double-line").as_deref(),
+            Some("DoubleLine")
+        );
+        assert_eq!(
+            parse_object_dropcap_style("DOUBLE_LINE").as_deref(),
+            Some("DoubleLine")
+        );
+        assert_eq!(
+            parse_object_dropcap_style("triple-line").as_deref(),
+            Some("TripleLine")
+        );
+        assert_eq!(
+            parse_object_dropcap_style("TRIPLE_LINE").as_deref(),
+            Some("TripleLine")
+        );
+        assert_eq!(
+            parse_object_dropcap_style("VendorSpecific").as_deref(),
+            Some("VendorSpecific")
+        );
     }
 
     #[test]
@@ -6410,7 +7970,7 @@ mod tests {
   <hp:subList textWidth="66502" textHeight="91136">
     <hp:p paraPrIDRef="0" styleIDRef="0">
       <hp:run charPrIDRef="0">
-        <hp:line id="1" zOrder="0" textWrap="BEHIND_TEXT" instid="2">
+        <hp:line id="1" zOrder="0" textWrap="BEHIND_TEXT" href="?MasterLine;0;0;0;" instid="2">
           <hp:offset x="0" y="0"/>
           <hp:orgSz width="100" height="100"/>
           <hp:curSz width="1" height="92409"/>
@@ -6443,8 +8003,11 @@ mod tests {
 
         assert_eq!(line.common.attr, 0x044a_4700);
         assert_eq!(line.common.text_wrap, TextWrap::BehindText);
+        assert_eq!(line.common.inst_id, 2);
+        assert_eq!(line.common.href.as_deref(), Some("?MasterLine;0;0;0;"));
         assert_eq!(line.common.width_criterion, SizeCriterion::Absolute);
         assert_eq!(line.common.height_criterion, SizeCriterion::Absolute);
+        assert_eq!(line.drawing.inst_id, 2);
         assert_eq!(line.drawing.border_line.color, 0x000000);
         assert_eq!(line.drawing.border_line.width, 113);
         assert_eq!(line.drawing.border_line.attr, 0xd100_0041);
@@ -6823,6 +8386,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_rect_preserves_dropcapstyle() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:rect id="1" zOrder="0" dropcapstyle="DoubleLine">
+        <hp:sz width="100" height="50"/>
+        <hp:pos treatAsChar="0" vertRelTo="PARA" horzRelTo="PARA"/>
+      </hp:rect>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"#;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Shape(shape) = &section.paragraphs[0].controls[0] else {
+            panic!("expected shape control");
+        };
+        let ShapeObject::Rectangle(rect) = shape.as_ref() else {
+            panic!("expected rectangle shape");
+        };
+        assert_eq!(rect.common.dropcap_style.as_deref(), Some("DoubleLine"));
+    }
+
+    #[test]
     fn test_parse_rect_preserves_size_protect() {
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
@@ -6860,6 +8449,265 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_hwpx_chart_preserves_common_object_attrs() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:chart id="123" instid="456" chartIDRef="Chart/chart2.xml"
+                zOrder="9" numberingType="PICTURE" textWrap="TIGHT"
+                textFlow="RIGHT_ONLY" lock="1" dropcapstyle="DoubleLine"
+                href="?ChartTarget;0;0;0;">
+        <hp:offset x="11" y="22"/>
+        <hp:orgSz width="700" height="800"/>
+        <hp:curSz width="701" height="801"/>
+        <hp:flip horizontal="1" vertical="0"/>
+        <hp:rotationInfo angle="12" centerX="350" centerY="400" rotateimage="1"/>
+        <hp:renderingInfo>
+          <hc:transMatrix e1="1" e2="0" e3="10" e4="0" e5="1" e6="20"/>
+          <hc:scaMatrix e1="2" e2="0" e3="0" e4="0" e5="3" e6="0"/>
+          <hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/>
+        </hp:renderingInfo>
+        <hc:extent x="900" y="901"/>
+        <hp:lineShape color="#112233" width="77" style="DASH"/>
+        <hp:vendorExt custom="chart"><hp:nested value="1"/></hp:vendorExt>
+        <hp:sz width="111" height="222" widthRelTo="PARA" heightRelTo="PAGE" protect="1"/>
+        <hp:pos treatAsChar="1" affectLSpacing="0" flowWithText="1"
+                allowOverlap="1" holdAnchorAndSO="1" vertRelTo="PAGE"
+                horzRelTo="COLUMN" vertAlign="CENTER" horzAlign="RIGHT"
+                vertOffset="10" horzOffset="20"/>
+        <hp:outMargin left="1" right="2" top="3" bottom="4"/>
+      </hp:chart>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Shape(shape) = &section.paragraphs[0].controls[0] else {
+            panic!("expected shape control");
+        };
+        let ShapeObject::Ole(ole) = shape.as_ref() else {
+            panic!("expected chart-backed ole shape");
+        };
+        let common = &ole.common;
+
+        assert_eq!(ole.bin_data_id, 60002);
+        assert_eq!(common.instance_id, 123);
+        assert_eq!(common.inst_id, 456);
+        assert_eq!(common.numbering_type, ObjectNumberingType::Picture);
+        assert!(common.numbering_type_explicit);
+        assert!(common.hwp5_gen_shape_attr_bit28);
+        assert_eq!(common.text_wrap, TextWrap::Tight);
+        assert_eq!(common.text_flow, crate::model::shape::TextFlow::RightOnly);
+        assert!(common.lock);
+        assert_eq!(common.dropcap_style.as_deref(), Some("DoubleLine"));
+        assert_eq!(common.href.as_deref(), Some("?ChartTarget;0;0;0;"));
+        assert_eq!(common.width_criterion, SizeCriterion::Para);
+        assert_eq!(common.height_criterion, SizeCriterion::Page);
+        assert!(common.size_protect);
+        assert!(common.treat_as_char);
+        assert!(common.flow_with_text);
+        assert!(common.allow_overlap);
+        assert_eq!(common.prevent_page_break, 1);
+        assert_eq!(common.horz_rel_to, HorzRelTo::Column);
+        assert_eq!(common.horz_align, HorzAlign::Right);
+        assert_eq!(ole.extent_x, 900);
+        assert_eq!(ole.extent_y, 901);
+        assert_eq!(ole.drawing.shape_attr.offset_x, 11);
+        assert_eq!(ole.drawing.shape_attr.offset_y, 22);
+        assert_eq!(ole.drawing.shape_attr.original_width, 700);
+        assert_eq!(ole.drawing.shape_attr.original_height, 800);
+        assert_eq!(ole.drawing.shape_attr.current_width, 701);
+        assert_eq!(ole.drawing.shape_attr.current_height, 801);
+        assert!(ole.drawing.shape_attr.horz_flip);
+        assert_eq!(ole.drawing.shape_attr.rotation_angle, 12);
+        assert_eq!(ole.drawing.shape_attr.rotation_center.x, 350);
+        assert_eq!(ole.drawing.shape_attr.rotation_center.y, 400);
+        assert!(ole.drawing.shape_attr.rotate_image);
+        assert!(!ole.drawing.shape_attr.raw_rendering.is_empty());
+        assert_eq!(ole.drawing.border_line.width, 77);
+        assert_eq!(ole.drawing.border_line.attr & 0x3f, 2);
+        assert_eq!(ole.drawing.raw_hwpx_child_xml.len(), 1);
+        assert!(
+            ole.drawing.raw_hwpx_child_xml[0].contains("vendorExt"),
+            "{:?}",
+            ole.drawing.raw_hwpx_child_xml
+        );
+        assert!(
+            ole.drawing.raw_hwpx_child_xml[0].contains(r#"custom="chart""#),
+            "{:?}",
+            ole.drawing.raw_hwpx_child_xml
+        );
+    }
+
+    #[test]
+    fn test_parse_hwpx_equation_preserves_line_mode() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:equation id="77" zOrder="1" numberingType="EQUATION"
+                   textWrap="TOP_AND_BOTTOM" textFlow="BOTH_SIDES"
+                   lock="0" dropcapstyle="None" version="Equation Version 60"
+                   baseLine="86" textColor="#000000" baseUnit="900"
+                   lineMode="CHAR" font="HYhwpEQ">
+        <hp:script>a over b</hp:script>
+        <hp:sz width="100" height="200" widthRelTo="ABSOLUTE" heightRelTo="ABSOLUTE"/>
+        <hp:pos treatAsChar="1" vertRelTo="PARA" horzRelTo="PARA"/>
+      </hp:equation>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Equation(eq) = &section.paragraphs[0].controls[0] else {
+            panic!("expected equation control");
+        };
+
+        assert_eq!(eq.script, "a over b");
+        assert_eq!(eq.font_name, "HYhwpEQ");
+        assert_eq!(eq.line_mode, "CHAR");
+    }
+
+    #[test]
+    fn test_parse_hwpx_ole_preserves_common_object_attrs() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:ole id="321" instid="654" binaryItemIDRef="ole3"
+              zOrder="7" numberingType="PICTURE" textWrap="TOP_AND_BOTTOM"
+	              textFlow="LEFT_ONLY" lock="1" dropcapstyle="DoubleLine"
+	              href="?OleTarget;0;0;0;" objectType="UNKNOWN"
+	              drawAspect="CONTENT" eqBaseLine="0" hasMoniker="0">
+	        <hp:offset x="11" y="22"/>
+	        <hp:orgSz width="700" height="800"/>
+	        <hp:curSz width="701" height="801"/>
+	        <hp:flip horizontal="1" vertical="0"/>
+	        <hp:rotationInfo angle="12" centerX="350" centerY="400" rotateimage="1"/>
+	        <hp:renderingInfo>
+	          <hc:transMatrix e1="1" e2="0" e3="10" e4="0" e5="1" e6="20"/>
+	          <hc:scaMatrix e1="2" e2="0" e3="0" e4="0" e5="3" e6="0"/>
+	          <hc:rotMatrix e1="1" e2="0" e3="0" e4="0" e5="1" e6="0"/>
+	        </hp:renderingInfo>
+	        <hc:extent x="900" y="901"/>
+	        <hp:lineShape color="#112233" width="77" style="DASH"/>
+	        <hp:vendorExt custom="ole"><hp:nested value="2"/></hp:vendorExt>
+	        <hp:sz width="333" height="444" widthRelTo="PAGE" heightRelTo="ABSOLUTE" protect="1"/>
+        <hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1"
+                allowOverlap="1" holdAnchorAndSO="1" vertRelTo="PARA"
+                horzRelTo="COLUMN" vertAlign="BOTTOM" horzAlign="CENTER"
+                vertOffset="30" horzOffset="40"/>
+        <hp:outMargin left="5" right="6" top="7" bottom="8"/>
+      </hp:ole>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Shape(shape) = &section.paragraphs[0].controls[0] else {
+            panic!("expected shape control");
+        };
+        let ShapeObject::Ole(ole) = shape.as_ref() else {
+            panic!("expected ole shape");
+        };
+        let common = &ole.common;
+
+        assert_eq!(ole.bin_data_id, 3);
+        assert_eq!(ole.hwpx_object_type.as_deref(), Some("UNKNOWN"));
+        assert_eq!(ole.hwpx_draw_aspect.as_deref(), Some("CONTENT"));
+        assert_eq!(ole.hwpx_eq_base_line.as_deref(), Some("0"));
+        assert_eq!(ole.hwpx_has_moniker.as_deref(), Some("0"));
+        assert_eq!(common.instance_id, 321);
+        assert_eq!(common.inst_id, 654);
+        assert_eq!(common.numbering_type, ObjectNumberingType::Picture);
+        assert!(common.numbering_type_explicit);
+        assert!(common.hwp5_gen_shape_attr_bit28);
+        assert_eq!(common.text_wrap, TextWrap::TopAndBottom);
+        assert_eq!(common.text_flow, crate::model::shape::TextFlow::LeftOnly);
+        assert!(common.lock);
+        assert_eq!(common.dropcap_style.as_deref(), Some("DoubleLine"));
+        assert_eq!(common.href.as_deref(), Some("?OleTarget;0;0;0;"));
+        assert_eq!(common.width_criterion, SizeCriterion::Page);
+        assert_eq!(common.height_criterion, SizeCriterion::Absolute);
+        assert!(common.size_protect);
+        assert!(common.flow_with_text);
+        assert!(common.allow_overlap);
+        assert_eq!(common.prevent_page_break, 1);
+        assert_eq!(common.horz_rel_to, HorzRelTo::Column);
+        assert_eq!(common.horz_align, HorzAlign::Center);
+        assert_eq!(ole.extent_x, 900);
+        assert_eq!(ole.extent_y, 901);
+        assert_eq!(ole.drawing.shape_attr.offset_x, 11);
+        assert_eq!(ole.drawing.shape_attr.offset_y, 22);
+        assert_eq!(ole.drawing.shape_attr.original_width, 700);
+        assert_eq!(ole.drawing.shape_attr.original_height, 800);
+        assert_eq!(ole.drawing.shape_attr.current_width, 701);
+        assert_eq!(ole.drawing.shape_attr.current_height, 801);
+        assert!(ole.drawing.shape_attr.horz_flip);
+        assert_eq!(ole.drawing.shape_attr.rotation_angle, 12);
+        assert_eq!(ole.drawing.shape_attr.rotation_center.x, 350);
+        assert_eq!(ole.drawing.shape_attr.rotation_center.y, 400);
+        assert!(ole.drawing.shape_attr.rotate_image);
+        assert!(!ole.drawing.shape_attr.raw_rendering.is_empty());
+        assert_eq!(ole.drawing.border_line.width, 77);
+        assert_eq!(ole.drawing.border_line.attr & 0x3F, 2);
+        assert_eq!(ole.drawing.raw_hwpx_child_xml.len(), 1);
+        assert!(
+            ole.drawing.raw_hwpx_child_xml[0].contains("vendorExt"),
+            "{:?}",
+            ole.drawing.raw_hwpx_child_xml
+        );
+        assert!(
+            ole.drawing.raw_hwpx_child_xml[0].contains(r#"custom="ole""#),
+            "{:?}",
+            ole.drawing.raw_hwpx_child_xml
+        );
+    }
+
+    #[test]
+    fn test_parse_shape_shadow_type_aliases() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p id="0" paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:rect id="1" zOrder="0">
+        <hp:sz width="1000" height="1000"/>
+        <hp:pos treatAsChar="1"/>
+        <hp:shadow type="right-bottom" color="#112233" offsetX="12" offsetY="-34" alpha="0.5"/>
+      </hp:rect>
+      <hp:t/>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let Control::Shape(shape) = &section.paragraphs[0].controls[0] else {
+            panic!("expected shape control");
+        };
+        let ShapeObject::Rectangle(rect) = shape.as_ref() else {
+            panic!("expected rectangle shape");
+        };
+
+        assert_eq!(parse_shape_shadow_type_name("rightBottom"), 4);
+        assert_eq!(parse_shape_shadow_type_name("bottom_right"), 4);
+        assert_eq!(rect.drawing.shadow_type, 4);
+        assert_eq!(rect.drawing.shadow_color, 0x00332211);
+        assert_eq!(rect.drawing.shadow_offset_x, 12);
+        assert_eq!(rect.drawing.shadow_offset_y, -34);
+        assert_eq!(rect.drawing.shadow_alpha, 127);
+    }
+
+    #[test]
     fn test_task1124_col_pr_parses_col_line() {
         let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
 <hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
@@ -6889,6 +8737,40 @@ mod tests {
         assert_eq!(cd.separator_type, 1);
         assert_eq!(cd.separator_width, 1);
         assert_eq!(cd.separator_color, 0x00000000);
+    }
+
+    #[test]
+    fn test_parse_col_pr_preserves_schema_tokens_id_mirror_and_col_sizes() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hs:sec xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"
+        xmlns:hs="http://www.hancom.co.kr/hwpml/2011/section">
+  <hp:p paraPrIDRef="0" styleIDRef="0">
+    <hp:run charPrIDRef="0">
+      <hp:ctrl>
+        <hp:colPr id="col-alpha" type="BALANCED_NEWSPAPER" layout="MIRROR" colCount="2" sameSz="false" sameGap="0">
+          <hp:colSz width="2200" gap="300"/>
+          <hp:colSz width="1800" gap="0"/>
+        </hp:colPr>
+      </hp:ctrl>
+      <hp:t>A</hp:t>
+    </hp:run>
+  </hp:p>
+</hs:sec>"##;
+
+        let section = parse_hwpx_section(xml).unwrap();
+        let para = &section.paragraphs[0];
+        let Control::ColumnDef(cd) = &para.controls[0] else {
+            panic!("expected ColumnDef control");
+        };
+
+        assert_eq!(cd.column_id, "col-alpha");
+        assert_eq!(cd.column_type, ColumnType::Distribute);
+        assert_eq!(cd.direction, ColumnDirection::Mirror);
+        assert_eq!(cd.column_count, 2);
+        assert!(!cd.same_width);
+        assert_eq!(cd.widths, vec![2200, 1800]);
+        assert_eq!(cd.gaps, vec![300, 0]);
+        assert!(!cd.proportional_widths);
     }
 
     #[test]

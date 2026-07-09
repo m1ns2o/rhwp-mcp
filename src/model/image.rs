@@ -1,5 +1,7 @@
 //! 그림 개체 (Picture, ImageData, CropInfo)
 
+use std::collections::BTreeMap;
+
 use super::shape::{CommonObjAttr, ShapeComponentAttr};
 use super::style::ShapeBorderLine;
 use super::*;
@@ -82,6 +84,17 @@ pub struct ImageAttr {
 #[derive(Debug, Clone, Default)]
 pub struct PictureEffects {
     pub shadow: Option<PictureShadow>,
+    pub glow: Option<PictureGlow>,
+    pub soft_edge: Option<PictureSoftEdge>,
+    pub reflection: Option<PictureReflection>,
+    pub three_d: Option<PictureThreeD>,
+    pub blur: Option<PictureBlur>,
+    pub fill_overlay: Option<PictureFillOverlay>,
+    /// `hp:effects` 하위의 아직 구조화하지 않은 효과 XML.
+    ///
+    /// 3D처럼 아직 의미 필드가 없는 작성물 효과를 삭제하지 않기 위한 보존 경로다.
+    /// 각 문자열은 `hp:effects` 바로 아래 child element 하나의 XML fragment이다.
+    pub raw_xml: Vec<String>,
 }
 
 /// HWPX 그림 그림자 효과 (`hp:shadow`).
@@ -97,6 +110,88 @@ pub struct PictureShadow {
     pub skew: Option<EffectPoint>,
     pub scale: Option<EffectPoint>,
     pub color: Option<EffectColor>,
+    /// `hp:shadow` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 glow 효과 (`hp:glow`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureGlow {
+    pub alpha: Option<String>,
+    pub radius: Option<String>,
+    pub color: Option<EffectColor>,
+    /// `hp:glow` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 soft-edge 효과 (`hp:softEdge`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureSoftEdge {
+    pub radius: Option<String>,
+    /// `hp:softEdge` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 반사 효과 (`hp:reflection`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureReflection {
+    pub align_style: Option<String>,
+    pub radius: Option<String>,
+    pub direction: Option<String>,
+    pub distance: Option<String>,
+    pub rotation_style: Option<String>,
+    pub fade_direction: Option<String>,
+    pub skew: Option<EffectPoint>,
+    pub scale: Option<EffectPoint>,
+    pub color: Option<EffectColor>,
+    pub alpha: Option<EffectRange>,
+    pub pos: Option<EffectRange>,
+    /// `hp:reflection` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 blur 효과 (`hp:blur`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureBlur {
+    pub radius: Option<String>,
+    /// `hp:blur` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 3D 효과 (`hp:threeD`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureThreeD {
+    /// `hp:threeD` attribute set. 예: `depth`.
+    pub attrs: BTreeMap<String, String>,
+    pub bevel: Option<PictureEffectChild>,
+    /// `hp:threeD` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 효과의 단순 attribute-only child.
+#[derive(Debug, Clone, Default)]
+pub struct PictureEffectChild {
+    pub attrs: BTreeMap<String, String>,
+}
+
+/// HWPX 그림 fill-overlay 효과 (`hp:fillOverlay`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureFillOverlay {
+    pub blend: Option<String>,
+    pub solid_fill: Option<PictureSolidFill>,
+    /// `hp:fillOverlay` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
+}
+
+/// HWPX 그림 fill-overlay solid-fill 자식 (`hp:solidFill`).
+#[derive(Debug, Clone, Default)]
+pub struct PictureSolidFill {
+    /// `hp:solidFill`의 `color` attribute.
+    pub color: Option<String>,
+    /// `hp:solidFill` 내부 `hp:effectsColor`.
+    pub effect_color: Option<EffectColor>,
+    /// `hp:solidFill` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
 }
 
 /// HWPX 효과의 x/y 좌표성 값 (`hp:skew`, `hp:scale`).
@@ -104,6 +199,13 @@ pub struct PictureShadow {
 pub struct EffectPoint {
     pub x: Option<String>,
     pub y: Option<String>,
+}
+
+/// HWPX 효과의 start/end 범위 값 (`hp:alpha`, `hp:pos`).
+#[derive(Debug, Clone, Default)]
+pub struct EffectRange {
+    pub start: Option<String>,
+    pub end: Option<String>,
 }
 
 /// HWPX 효과 색상 (`hp:effectsColor`).
@@ -114,6 +216,8 @@ pub struct EffectColor {
     pub system_idx: Option<String>,
     pub preset_idx: Option<String>,
     pub rgb: Option<EffectRgb>,
+    /// `hp:effectsColor` 내부의 아직 구조화하지 않은 child XML.
+    pub raw_child_xml: Vec<String>,
 }
 
 /// HWPX 효과 RGB 색상 (`hp:rgb`).

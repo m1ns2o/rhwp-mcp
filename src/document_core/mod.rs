@@ -30,6 +30,19 @@ use std::collections::HashMap;
 /// 기본 폰트 fallback 경로
 pub const DEFAULT_FALLBACK_FONT: &str = "/usr/share/fonts/truetype/nanum/NanumGothic.ttf";
 
+/// Text replacement layout behavior.
+///
+/// `Reflow` preserves normal editor behavior by recomputing the edited
+/// paragraph's line segments. `PreserveSourceLineSegments` keeps the source
+/// HWPX line segment arrays for the edited paragraph and following body
+/// paragraphs, which is useful for high-fidelity form/package preservation when
+/// the caller wants to avoid pagination drift after a small text replacement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextReplaceLayoutPolicy {
+    Reflow,
+    PreserveSourceLineSegments,
+}
+
 /// 내부 클립보드 데이터
 pub(crate) struct ClipboardData {
     /// 복사된 문단들 (서식 정보 포함)

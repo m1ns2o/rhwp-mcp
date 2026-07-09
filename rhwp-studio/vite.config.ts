@@ -5,6 +5,81 @@ import { VitePWA } from 'vite-plugin-pwa';
 
 const pkg = JSON.parse(readFileSync(resolve(__dirname, 'package.json'), 'utf-8'));
 
+function installLocalAiProxy(server: { middlewares: { use: (path: string, handler: any) => void } }): void {
+  server.middlewares.use('/api/ai/gemini', async (req: any, res: any) => {
+    if (req.method !== 'POST') {
+      res.statusCode = 405;
+      res.setHeader('content-type', 'application/json');
+      res.end(JSON.stringify({ error: 'method not allowed' }));
+      return;
+    }
+    try {
+      const body = await readRequestJson(req);
+      const model = typeof body.model === 'string' ? body.model : 'gemini-flash-latest';
+      const input = typeof body.input === 'string' ? body.input : '';
+      const apiKey = typeof body.apiKey === 'string' ? body.apiKey : '';
+      const bearerToken = typeof body.bearerToken === 'string' ? body.bearerToken : '';
+      if (!input) {
+        sendJson(res, 400, { error: 'input is required' });
+        return;
+      }
+      if (!apiKey && !bearerToken) {
+        sendJson(res, 400, { error: 'Gemini credential is required' });
+        return;
+      }
+      const headers: Record<string, string> = {
+        'content-type': 'application/json',
+      };
+      if (apiKey) {
+        headers['x-goog-api-key'] = apiKey;
+      } else {
+        headers.authorization = `Bearer ${bearerToken}`;
+      }
+      const normalizedModel = model.replace(/^models\//, '') || 'gemini-flash-latest';
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(normalizedModel)}:generateContent`, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: input }],
+            },
+          ],
+        }),
+      });
+      const text = await response.text();
+      res.statusCode = response.status;
+      res.setHeader('content-type', response.headers.get('content-type') ?? 'application/json');
+      res.end(text);
+    } catch (error) {
+      sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+    }
+  });
+}
+
+function readRequestJson(req: any): Promise<Record<string, unknown>> {
+  return new Promise((resolveJson, reject) => {
+    const chunks: Buffer[] = [];
+    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    req.on('end', () => {
+      try {
+        const text = Buffer.concat(chunks).toString('utf8');
+        resolveJson(text ? JSON.parse(text) : {});
+      } catch (error) {
+        reject(error);
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+function sendJson(res: any, statusCode: number, body: Record<string, unknown>): void {
+  res.statusCode = statusCode;
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(body));
+}
+
 export default defineConfig({
   define: {
     __APP_VERSION__: JSON.stringify(pkg.version),
@@ -54,6 +129,11 @@ export default defineConfig({
           });
         });
       },
+    },
+    {
+      name: 'local-ai-proxy',
+      configureServer: installLocalAiProxy,
+      configurePreviewServer: installLocalAiProxy,
     },
     VitePWA({
       registerType: 'autoUpdate',

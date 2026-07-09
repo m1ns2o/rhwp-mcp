@@ -7,7 +7,7 @@ use crate::document_core::{DocumentCore, DEFAULT_FALLBACK_FONT};
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::document::Document;
-use crate::model::paragraph::Paragraph;
+use crate::model::paragraph::{ColumnBreakType, Paragraph};
 use crate::renderer::composer::{compose_section, reflow_line_segs};
 use crate::renderer::layout::LayoutEngine;
 use crate::renderer::page_layout::PageLayoutInfo;
@@ -134,6 +134,79 @@ impl DocumentCore {
 
         doc.paginate();
         Ok(doc)
+    }
+
+    /// 이미 구성된 Document IR에서 DocumentCore를 생성한다.
+    ///
+    /// 외부 ingest/builder 파이프라인처럼 파서가 아닌 코드가 Document를 생성한 뒤,
+    /// 동일한 compose/paginate 상태를 갖는 편집 세션으로 연결할 때 사용한다.
+    pub fn from_document(mut document: Document) -> DocumentCore {
+        Self::ensure_section_def_controls(&mut document);
+        let styles = resolve_styles(&document.doc_info, DEFAULT_DPI);
+        Self::reflow_zero_height_paragraphs(&mut document, &styles, DEFAULT_DPI, true);
+        let composed = document
+            .sections
+            .iter()
+            .map(|s| compose_section(s))
+            .collect();
+        let sec_count = document.sections.len();
+        let mut doc = DocumentCore {
+            document,
+            pagination: Vec::new(),
+            styles,
+            composed,
+            dpi: DEFAULT_DPI,
+            fallback_font: DEFAULT_FALLBACK_FONT.to_string(),
+            layout_engine: LayoutEngine::new(DEFAULT_DPI),
+            clipboard: None,
+            paste_cascade_count: 0,
+            show_paragraph_marks: false,
+            show_control_codes: false,
+            show_transparent_borders: false,
+            clip_enabled: true,
+            debug_overlay: false,
+            respect_vpos_reset: false,
+            measured_tables: Vec::new(),
+            dirty_sections: vec![true; sec_count],
+            measured_sections: Vec::new(),
+            dirty_paragraphs: Vec::new(),
+            para_column_map: Vec::new(),
+            page_tree_cache: RefCell::new(Vec::new()),
+            batch_mode: false,
+            event_log: Vec::new(),
+            overflow_links_cache: RefCell::new(HashMap::new()),
+            snapshot_store: Vec::new(),
+            next_snapshot_id: 0,
+            hidden_header_footer: std::collections::HashSet::new(),
+            file_name: String::new(),
+            active_field: None,
+            para_offset: Vec::new(),
+            source_format: crate::parser::FileFormat::Hwp,
+            validation_report: ValidationReport::new(),
+        };
+        doc.paginate();
+        doc
+    }
+
+    fn ensure_section_def_controls(document: &mut Document) {
+        for section in &mut document.sections {
+            let Some(first_para) = section.paragraphs.first_mut() else {
+                continue;
+            };
+            if let Some(Control::SectionDef(section_def)) = first_para
+                .controls
+                .iter_mut()
+                .find(|control| matches!(control, Control::SectionDef(_)))
+            {
+                **section_def = section.section_def.clone();
+            } else {
+                first_para.controls.insert(
+                    0,
+                    Control::SectionDef(Box::new(section.section_def.clone())),
+                );
+                first_para.control_mask |= 1u32 << 0x0002;
+            }
+        }
     }
 
     /// HWPX 비표준 lineseg 감지 (#177).
@@ -580,7 +653,8 @@ impl DocumentCore {
 
     /// Document IR을 HWP 5.0 CFB 바이너리로 직렬화 (네이티브 에러 타입)
     pub fn export_hwp_native(&self) -> Result<Vec<u8>, HwpError> {
-        crate::serializer::serialize_document(&self.document)
+        let document = document_for_export_with_template_saved_gaps(&self.document);
+        crate::serializer::serialize_document(document.as_ref())
             .map_err(|e| HwpError::RenderError(e.to_string()))
     }
 
@@ -630,7 +704,8 @@ impl DocumentCore {
 
     /// Document IR을 HWPX(ZIP+XML)로 직렬화 (네이티브 에러 타입)
     pub fn export_hwpx_native(&self) -> Result<Vec<u8>, HwpError> {
-        crate::serializer::serialize_hwpx(&self.document)
+        let document = document_for_export_with_template_saved_gaps(&self.document);
+        crate::serializer::serialize_hwpx(document.as_ref())
             .map_err(|e| HwpError::RenderError(e.to_string()))
     }
 
@@ -970,11 +1045,201 @@ impl DocumentCore {
     }
 }
 
+fn document_for_export_with_template_saved_gaps(
+    document: &Document,
+) -> std::borrow::Cow<'_, Document> {
+    if !has_template_saved_gaps_in_document(document) {
+        return std::borrow::Cow::Borrowed(document);
+    }
+
+    let mut cloned = document.clone();
+    bake_template_saved_gaps_in_document(&mut cloned);
+    std::borrow::Cow::Owned(cloned)
+}
+
+fn has_template_saved_gaps_in_document(document: &Document) -> bool {
+    document
+        .sections
+        .iter()
+        .any(|section| has_template_saved_gaps_in_paragraphs(&section.paragraphs))
+}
+
+fn has_template_saved_gaps_in_paragraphs(paragraphs: &[Paragraph]) -> bool {
+    paragraphs.iter().any(|para| {
+        template_saved_gap_before(para) > 0
+            || para.controls.iter().any(|control| match control {
+                Control::Table(table) => table
+                    .cells
+                    .iter()
+                    .any(|cell| has_template_saved_gaps_in_paragraphs(&cell.paragraphs)),
+                _ => false,
+            })
+    })
+}
+
+fn bake_template_saved_gaps_in_document(document: &mut Document) {
+    for section in &mut document.sections {
+        bake_template_saved_gaps_in_paragraphs(&mut section.paragraphs);
+    }
+}
+
+fn bake_template_saved_gaps_in_paragraphs(paragraphs: &mut [Paragraph]) {
+    let mut cumulative_gap = 0i32;
+    let mut prev_raw_end: Option<i32> = None;
+
+    for para in paragraphs {
+        let first_raw_y = para.line_segs.first().map(|seg| seg.vertical_pos);
+        let starts_new_flow = matches!(
+            para.column_type,
+            ColumnBreakType::Section
+                | ColumnBreakType::MultiColumn
+                | ColumnBreakType::Page
+                | ColumnBreakType::Column
+        ) || matches!((first_raw_y, prev_raw_end), (Some(first), Some(prev)) if first < prev);
+
+        if starts_new_flow {
+            cumulative_gap = 0;
+        }
+
+        let raw_last_end = para.line_segs.last().map(|seg| {
+            seg.vertical_pos
+                .saturating_add(seg.line_height)
+                .saturating_add(seg.line_spacing)
+        });
+
+        let saved_gap = template_saved_gap_before(para);
+        if saved_gap > 0 {
+            cumulative_gap = cumulative_gap.saturating_add(saved_gap);
+        }
+
+        if cumulative_gap != 0 {
+            for seg in &mut para.line_segs {
+                seg.vertical_pos = seg.vertical_pos.saturating_add(cumulative_gap);
+            }
+        }
+
+        para.rhwp_saved_para_gap_before = 0;
+        para.rhwp_saved_tac_gap_before = 0;
+
+        for control in &mut para.controls {
+            if let Control::Table(table) = control {
+                for cell in &mut table.cells {
+                    bake_template_saved_gaps_in_paragraphs(&mut cell.paragraphs);
+                }
+            }
+        }
+
+        prev_raw_end = raw_last_end;
+    }
+}
+
+fn template_saved_gap_before(para: &Paragraph) -> i32 {
+    para.rhwp_saved_para_gap_before
+        .max(para.rhwp_saved_tac_gap_before)
+        .max(0)
+}
+
 #[cfg(test)]
 mod validate_linesegs_tests {
     use super::*;
     use crate::model::document::{Document, Section};
     use crate::model::paragraph::{LineSeg, Paragraph};
+
+    fn test_line_seg(vertical_pos: i32, line_height: i32, line_spacing: i32) -> LineSeg {
+        let mut seg = LineSeg::default();
+        seg.vertical_pos = vertical_pos;
+        seg.line_height = line_height;
+        seg.line_spacing = line_spacing;
+        seg
+    }
+
+    #[test]
+    fn export_gap_bake_restores_template_line_segment_flow() {
+        let mut doc = Document::default();
+        let mut section = Section::default();
+
+        let mut title = Paragraph::default();
+        title.text = "정      관".to_string();
+        title.line_segs.push(test_line_seg(0, 2000, 3000));
+
+        let mut chapter = Paragraph::default();
+        chapter.text = "제 1 장  총    칙".to_string();
+        chapter.line_segs.push(test_line_seg(5000, 1500, 2252));
+        chapter.rhwp_saved_para_gap_before = 3000;
+
+        let mut article = Paragraph::default();
+        article.text = "제 1조(상호)".to_string();
+        article.line_segs.push(test_line_seg(8752, 1200, 1800));
+        article.rhwp_saved_para_gap_before = 3000;
+
+        section.paragraphs.push(title);
+        section.paragraphs.push(chapter);
+        section.paragraphs.push(article);
+        doc.sections.push(section);
+
+        let export_doc = document_for_export_with_template_saved_gaps(&doc);
+        let baked = export_doc.as_ref();
+
+        assert_eq!(
+            doc.sections[0].paragraphs[1].line_segs[0].vertical_pos,
+            5000
+        );
+        assert_eq!(
+            baked.sections[0].paragraphs[1].line_segs[0].vertical_pos,
+            8000
+        );
+        assert_eq!(
+            baked.sections[0].paragraphs[2].line_segs[0].vertical_pos,
+            14752
+        );
+        assert_eq!(
+            baked.sections[0].paragraphs[1].rhwp_saved_para_gap_before,
+            0
+        );
+        assert_eq!(
+            baked.sections[0].paragraphs[2].rhwp_saved_para_gap_before,
+            0
+        );
+    }
+
+    #[test]
+    fn export_gap_bake_resets_at_new_page_flow() {
+        let mut doc = Document::default();
+        let mut section = Section::default();
+
+        let mut page_one = Paragraph::default();
+        page_one.text = "첫 쪽 마지막 문단".to_string();
+        page_one.line_segs.push(test_line_seg(60000, 1000, 600));
+        page_one.rhwp_saved_para_gap_before = 4000;
+
+        let mut page_two_head = Paragraph::default();
+        page_two_head.text = "새 쪽 제목".to_string();
+        page_two_head.column_type = ColumnBreakType::Page;
+        page_two_head.line_segs.push(test_line_seg(0, 1000, 600));
+
+        let mut page_two_body = Paragraph::default();
+        page_two_body.text = "새 쪽 본문".to_string();
+        page_two_body.line_segs.push(test_line_seg(1600, 1000, 600));
+        page_two_body.rhwp_saved_para_gap_before = 1000;
+
+        section.paragraphs.push(page_one);
+        section.paragraphs.push(page_two_head);
+        section.paragraphs.push(page_two_body);
+        doc.sections.push(section);
+
+        let export_doc = document_for_export_with_template_saved_gaps(&doc);
+        let baked = export_doc.as_ref();
+
+        assert_eq!(
+            baked.sections[0].paragraphs[0].line_segs[0].vertical_pos,
+            64000
+        );
+        assert_eq!(baked.sections[0].paragraphs[1].line_segs[0].vertical_pos, 0);
+        assert_eq!(
+            baked.sections[0].paragraphs[2].line_segs[0].vertical_pos,
+            2600
+        );
+    }
 
     /// 텍스트는 있는데 line_segs 가 비어있는 문단 — LinesegArrayEmpty 감지
     #[test]

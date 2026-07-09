@@ -12,6 +12,7 @@
 //! - #182: HWPX writer Picture 직렬화 분기 추가 (별도 작업자)
 
 use crate::model::document::{Document, Section};
+use crate::model::page::PageDef;
 use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
 use crate::parser::ingest::schema::{IngestDocument, StemBlock};
 
@@ -22,7 +23,9 @@ use crate::parser::ingest::schema::{IngestDocument, StemBlock};
 /// - 마지막 문제는 끝 빈 문단 없음
 pub fn build_exam_paper(ingest: &IngestDocument) -> Document {
     let mut doc = Document::default();
-    doc.sections.push(Section::default());
+    let mut section = Section::default();
+    section.section_def.page_def = page_def_from_ingest(ingest);
+    doc.sections.push(section);
 
     let total_questions = ingest.questions.len();
     for (q_idx, q) in ingest.questions.iter().enumerate() {
@@ -66,6 +69,24 @@ pub fn build_exam_paper(ingest: &IngestDocument) -> Document {
     }
 
     doc
+}
+
+fn page_def_from_ingest(ingest: &IngestDocument) -> PageDef {
+    let mut page_def = PageDef::a4_default();
+    let width = mm_to_hwpunit(ingest.page_size.width_mm);
+    let height = mm_to_hwpunit(ingest.page_size.height_mm);
+    if width > 0 && height > 0 {
+        page_def.width = width;
+        page_def.height = height;
+    }
+    page_def
+}
+
+fn mm_to_hwpunit(mm: f32) -> u32 {
+    if !mm.is_finite() || mm <= 0.0 {
+        return 0;
+    }
+    ((mm as f64) * 7200.0 / 25.4).round() as u32
 }
 
 /// 첫 stem 텍스트에 `{q.number}. ` 접두어를 적용하는 정책 결정.

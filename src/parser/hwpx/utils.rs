@@ -4,6 +4,7 @@
 
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use quick_xml::XmlVersion;
 
 use super::HwpxError;
 
@@ -19,7 +20,9 @@ pub fn local_name(name: &[u8]) -> &[u8] {
 
 /// 속성 값을 String으로 변환
 pub fn attr_str(attr: &quick_xml::events::attributes::Attribute) -> String {
-    String::from_utf8_lossy(&attr.value).to_string()
+    attr.normalized_value(XmlVersion::Implicit1_0)
+        .map(|value| value.into_owned())
+        .unwrap_or_else(|_| String::from_utf8_lossy(&attr.value).to_string())
 }
 
 /// 속성 값이 특정 문자열과 일치하는지 확인 (비교용)
@@ -33,6 +36,21 @@ pub fn parse_u8(attr: &quick_xml::events::attributes::Attribute) -> u8 {
 
 pub fn parse_i8(attr: &quick_xml::events::attributes::Attribute) -> i8 {
     attr_str(attr).parse().unwrap_or(0)
+}
+
+pub fn parse_image_effect_name(value: &str) -> u8 {
+    let key = value
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
+    match key.as_str() {
+        "1" | "gray" | "grey" | "grayscale" | "greyscale" => 1,
+        "2" | "blackwhite" | "bw" => 2,
+        "3" | "pattern8x8" | "pattern88" => 3,
+        _ => 0,
+    }
 }
 
 pub fn parse_u16(attr: &quick_xml::events::attributes::Attribute) -> u16 {
@@ -103,7 +121,7 @@ pub fn parse_color_str(s: &str) -> u32 {
 /// 속성 값을 bool로 파싱 ("true", "1" → true)
 pub fn parse_bool(attr: &quick_xml::events::attributes::Attribute) -> bool {
     let s = attr_str(attr);
-    s == "true" || s == "1"
+    s == "1" || s.eq_ignore_ascii_case("true")
 }
 
 /// OWPML `winBrush/@hatchStyle`을 HWP 무늬 번호로 변환한다.

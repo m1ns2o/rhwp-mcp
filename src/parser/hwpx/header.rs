@@ -12,7 +12,8 @@ use crate::parser::tags;
 
 use super::utils::{
     attr_str, local_name, parse_bool, parse_color, parse_gradient_type, parse_hatch_style,
-    parse_i16, parse_i32, parse_i8, parse_u16, parse_u32, parse_u8, skip_element,
+    parse_i16, parse_i32, parse_i8, parse_image_effect_name, parse_u16, parse_u32, parse_u8,
+    skip_element,
 };
 use super::HwpxError;
 
@@ -129,7 +130,7 @@ pub fn parse_hwpx_header(xml: &str) -> Result<(DocInfo, DocProperties), HwpxErro
                     }
                     b"beginNum" => parse_begin_num(e, &mut doc_props),
                     b"font" => {
-                        parse_font(e, &mut reader, &mut doc_info, current_font_group, true)?;
+                        parse_font(e, &mut reader, &mut doc_info, current_font_group, true, xml)?;
                     }
                     b"charPr" => {
                         parse_char_shape(e, &mut reader, &mut doc_info)?;
@@ -139,10 +140,10 @@ pub fn parse_hwpx_header(xml: &str) -> Result<(DocInfo, DocProperties), HwpxErro
                     }
                     b"style" => parse_style(e, &mut doc_info),
                     b"borderFill" => {
-                        parse_border_fill(e, &mut reader, &mut doc_info)?;
+                        parse_border_fill(e, &mut reader, &mut doc_info, xml)?;
                     }
                     b"tabPr" => {
-                        parse_tab_def(e, &mut reader, &mut doc_info)?;
+                        parse_tab_def(e, &mut reader, &mut doc_info, xml)?;
                     }
                     b"numbering" => {
                         parse_numbering(e, &mut reader, &mut doc_info, xml)?;
@@ -157,7 +158,7 @@ pub fn parse_hwpx_header(xml: &str) -> Result<(DocInfo, DocProperties), HwpxErro
                     // paragraph 에 자동 부여. HWPX `<hh:bullet id="N" char="❏" useImage="0">`
                     // 4개 → HWP BULLET record 4개. 누락 시 일반 문단 시작 글머리표 부작용.
                     b"bullet" => {
-                        let bullet = parse_bullet_hwpx(e, &mut reader)?;
+                        let bullet = parse_bullet_hwpx(e, &mut reader, xml)?;
                         doc_info.bullets.push(bullet);
                     }
                     _ => {}
@@ -169,7 +170,14 @@ pub fn parse_hwpx_header(xml: &str) -> Result<(DocInfo, DocProperties), HwpxErro
                 match local {
                     b"beginNum" => parse_begin_num(e, &mut doc_props),
                     b"font" => {
-                        parse_font(e, &mut reader, &mut doc_info, current_font_group, false)?;
+                        parse_font(
+                            e,
+                            &mut reader,
+                            &mut doc_info,
+                            current_font_group,
+                            false,
+                            xml,
+                        )?;
                     }
                     b"style" => parse_style(e, &mut doc_info),
                     b"tabPr" => {
@@ -206,6 +214,7 @@ pub fn parse_hwpx_header(xml: &str) -> Result<(DocInfo, DocProperties), HwpxErro
     // compatibleDocument/docOption/trackchageConfig 등은 본문과 무관한 전역
     // 설정이라 헤더 재생성 시 splice 로 무손실 복원한다.
     doc_info.hwpx_head_tail = extract_head_tail(xml);
+    doc_info.hwpx_ref_list_track_change_xml = extract_ref_list_track_change_xml(xml);
 
     Ok((doc_info, doc_props))
 }
@@ -219,6 +228,86 @@ fn extract_head_tail(xml: &str) -> Option<String> {
     let start = xml.find(REF_END)? + REF_END.len();
     let end = xml[start..].find(HEAD_END)? + start;
     Some(xml[start..end].to_string())
+}
+
+fn extract_ref_list_track_change_xml(xml: &str) -> Option<String> {
+    let ref_list = extract_first_element_by_local_name(xml, "refList")?;
+    let mut ranges = Vec::new();
+    ranges.extend(find_direct_element_ranges_by_local_name(
+        ref_list,
+        "trackChanges",
+    ));
+    ranges.extend(find_direct_element_ranges_by_local_name(
+        ref_list,
+        "trackChangeAuthors",
+    ));
+    ranges.sort_by_key(|(start, _)| *start);
+    ranges.dedup();
+
+    let mut raw = String::new();
+    for (start, end) in ranges {
+        raw.push_str(&ref_list[start..end]);
+    }
+
+    if raw.trim().is_empty() {
+        None
+    } else {
+        Some(raw)
+    }
+}
+
+fn extract_first_element_by_local_name<'a>(xml: &'a str, local: &str) -> Option<&'a str> {
+    let ranges = find_direct_element_ranges_by_local_name(xml, local);
+    let (start, end) = ranges.first().copied()?;
+    Some(&xml[start..end])
+}
+
+fn find_direct_element_ranges_by_local_name(xml: &str, local: &str) -> Vec<(usize, usize)> {
+    let bytes = xml.as_bytes();
+    let mut ranges = Vec::new();
+    let mut pos = 0;
+
+    while let Some(relative_start) = xml[pos..].find('<') {
+        let start = pos + relative_start;
+        let Some(next_byte) = bytes.get(start + 1) else {
+            break;
+        };
+        if matches!(*next_byte, b'/' | b'!' | b'?') {
+            pos = start + 1;
+            continue;
+        }
+
+        let Some(tag_end) = xml[start..].find('>').map(|end| start + end) else {
+            break;
+        };
+        let tag_body = &xml[start + 1..tag_end];
+        let tag_name_end = tag_body
+            .find(|ch: char| ch.is_whitespace() || ch == '/' || ch == '>')
+            .unwrap_or(tag_body.len());
+        let tag_name = &tag_body[..tag_name_end];
+        let tag_local = tag_name.rsplit_once(':').map_or(tag_name, |(_, name)| name);
+        if tag_local != local {
+            pos = tag_end + 1;
+            continue;
+        }
+
+        if tag_body.trim_end().ends_with('/') {
+            ranges.push((start, tag_end + 1));
+            pos = tag_end + 1;
+            continue;
+        }
+
+        let close_tag = format!("</{tag_name}>");
+        if let Some(relative_end) = xml[tag_end + 1..].find(&close_tag) {
+            let end = tag_end + 1 + relative_end + close_tag.len();
+            ranges.push((start, end));
+            pos = end;
+        } else {
+            pos = tag_end + 1;
+        }
+    }
+
+    ranges
 }
 
 fn parse_doc_option_linkinfo(e: &quick_xml::events::BytesStart, doc_info: &mut DocInfo) {
@@ -386,6 +475,7 @@ fn parse_font(
     doc_info: &mut DocInfo,
     font_group: usize,
     has_children: bool,
+    xml: &str,
 ) -> Result<(), HwpxError> {
     let mut name = String::new();
     let mut font_type = 0u8;
@@ -406,29 +496,42 @@ fn parse_font(
         }
     }
 
+    let mut raw_hwpx_children = None;
     if has_children {
+        let inner_start = reader.buffer_position() as usize;
+        let mut inner_end = inner_start;
         let mut buf = Vec::new();
         loop {
+            let pos_before = reader.buffer_position() as usize;
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref ce)) => match local_name(ce.name().as_ref()) {
                     b"typeInfo" => type_info = Some(parse_font_type_info(ce, &name, font_type)),
                     b"substFont" => subst_font = Some(parse_subst_font(ce)),
                     _ => {}
                 },
-                Ok(Event::Start(ref ce)) => {
-                    if local_name(ce.name().as_ref()) == b"typeInfo" {
-                        type_info = Some(parse_font_type_info(ce, &name, font_type));
-                    } else {
+                Ok(Event::Start(ref ce)) => match local_name(ce.name().as_ref()) {
+                    b"typeInfo" => type_info = Some(parse_font_type_info(ce, &name, font_type)),
+                    b"substFont" => subst_font = Some(parse_subst_font(ce)),
+                    _ => {
                         let tag = local_name(ce.name().as_ref()).to_vec();
                         skip_element(reader, &tag)?;
                     }
+                },
+                Ok(Event::End(ref ce)) if local_name(ce.name().as_ref()) == b"font" => {
+                    inner_end = pos_before;
+                    break;
                 }
-                Ok(Event::End(ref ce)) if local_name(ce.name().as_ref()) == b"font" => break,
-                Ok(Event::Eof) => break,
+                Ok(Event::Eof) => {
+                    inner_end = pos_before;
+                    break;
+                }
                 Err(e) => return Err(HwpxError::XmlError(e.to_string())),
                 _ => {}
             }
             buf.clear();
+        }
+        if inner_end > inner_start && inner_end <= xml.len() {
+            raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
         }
     }
 
@@ -440,6 +543,7 @@ fn parse_font(
             type_info,
             default_name,
             subst_font,
+            raw_hwpx_children,
             ..Default::default()
         };
         // fontface lang 컨텍스트에 따라 해당 언어 그룹에 추가
@@ -802,6 +906,9 @@ fn parse_para_shape(
     let mut ps = ParaShape::default();
     // OWPML ParaShapeType의 snapToGrid 기본값은 true.
     ps.attr1 |= 1 << 8;
+    // HWPX autoSpacing 기본값은 false이며 HWP attr 비트와 충돌하므로 별도 보존한다.
+    ps.auto_spacing_easian_eng = Some(false);
+    ps.auto_spacing_easian_num = Some(false);
 
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
@@ -824,6 +931,8 @@ fn parse_para_shape(
                     ps.attr1 &= !(1 << 8);
                 }
             }
+            b"suppressLineNumbers" => ps.suppress_line_numbers = parse_bool(&attr),
+            b"checked" => ps.checked = parse_bool(&attr),
             _ => {}
         }
     }
@@ -991,6 +1100,10 @@ fn parse_para_shape_child(
                             ps.attr1 &= !(1 << 7);
                         }
                     }
+                    b"breakLatinWord" => {
+                        ps.attr1 = (ps.attr1 & !(0x03 << 5))
+                            | (parse_break_latin_word_bits(&attr_str(&attr)) << 5);
+                    }
                     b"widowOrphan" => {
                         if parse_bool(&attr) {
                             ps.attr2 |= 1 << 5;
@@ -1011,6 +1124,9 @@ fn parse_para_shape_child(
                             ps.attr2 |= 1 << 8;
                         }
                     }
+                    b"lineWrap" => {
+                        ps.attr2 = (ps.attr2 & !0x03) | parse_line_wrap_bits(&attr_str(&attr));
+                    }
                     _ => {}
                 }
             }
@@ -1019,11 +1135,35 @@ fn parse_para_shape_child(
         b"autoSpacing" => {
             // HWPX autoSpacing은 HWP ParaShape.attr1 bits 20..21이 아니다.
             // 해당 비트는 문단 세로 정렬이며, <align vertical="...">에서 채운다.
-            // autoSpacing의 HWP 저장 위치는 별도 검증 전까지 attr1에 반영하지 않는다.
+            // autoSpacing의 HWP 저장 위치는 별도 검증 전까지 attr1에 반영하지 않고,
+            // HWPX 전용 필드로 보존한다.
+            for attr in ce.attributes().flatten() {
+                match attr.key.as_ref() {
+                    b"eAsianEng" => ps.auto_spacing_easian_eng = Some(parse_bool(&attr)),
+                    b"eAsianNum" => ps.auto_spacing_easian_num = Some(parse_bool(&attr)),
+                    _ => {}
+                }
+            }
             ParaShapeChildKind::Other
         }
         b"switch" => ParaShapeChildKind::Switch,
         _ => ParaShapeChildKind::Other,
+    }
+}
+
+fn parse_break_latin_word_bits(value: &str) -> u32 {
+    match value {
+        "HYPHENATION" => 1,
+        "BREAK_WORD" => 2,
+        _ => 0,
+    }
+}
+
+fn parse_line_wrap_bits(value: &str) -> u32 {
+    match value {
+        "SQUEEZE" => 1,
+        "KEEP" => 2,
+        _ => 0,
     }
 }
 
@@ -1298,13 +1438,40 @@ fn parse_border_fill(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
     doc_info: &mut DocInfo,
+    xml: &str,
 ) -> Result<(), HwpxError> {
     let mut bf = BorderFill::default();
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"threeD" => bf.three_d = parse_bool(&attr),
+            b"shadow" => bf.shadow = parse_bool(&attr),
+            b"centerLine" => bf.center_line = Some(attr_str(&attr)),
+            b"breakCellSeparateLine" => bf.break_cell_separate_line = parse_bool(&attr),
+            _ => {}
+        }
+    }
+    if bf.three_d {
+        bf.attr |= 0x0001;
+    }
+    if bf.shadow {
+        bf.attr |= 0x0002;
+    }
+    if bf
+        .center_line
+        .as_deref()
+        .map(|value| !value.eq_ignore_ascii_case("NONE"))
+        .unwrap_or(false)
+    {
+        bf.attr |= 0x2000;
+    }
 
     if !is_empty_event(e) {
+        let inner_start = reader.buffer_position() as usize;
+        let mut inner_end = inner_start;
         let mut buf = Vec::new();
         let mut border_idx = 0usize;
         loop {
+            let pos_before = reader.buffer_position() as usize;
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Empty(ref ce)) | Ok(Event::Start(ref ce)) => {
                     let cname = ce.name();
@@ -1431,9 +1598,21 @@ fn parse_border_fill(
                         b"color" => {
                             // <hh:color value="#RRGGBB"/> — gradation 자식
                             if let Some(ref mut grad) = bf.fill.gradient {
+                                let mut color = None;
+                                let mut position = None;
                                 for attr in ce.attributes().flatten() {
-                                    if attr.key.as_ref() == b"value" {
-                                        grad.colors.push(parse_color(&attr));
+                                    match attr.key.as_ref() {
+                                        b"value" => color = Some(parse_color(&attr)),
+                                        b"position" | b"pos" | b"offset" => {
+                                            position = Some(parse_i32(&attr))
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                if let Some(color) = color {
+                                    grad.colors.push(color);
+                                    if let Some(position) = position {
+                                        grad.positions.push(position);
                                     }
                                 }
                             }
@@ -1488,11 +1667,8 @@ fn parse_border_fill(
                                         b"bright" => img_fill.brightness = parse_i8(&attr),
                                         b"contrast" => img_fill.contrast = parse_i8(&attr),
                                         b"effect" => {
-                                            img_fill.effect = match attr_str(&attr).as_str() {
-                                                "GRAY_SCALE" => 1,
-                                                "BLACK_WHITE" => 2,
-                                                _ => 0, // REAL_PIC
-                                            };
+                                            img_fill.effect =
+                                                parse_image_effect_name(&attr_str(&attr));
                                         }
                                         _ => {}
                                     }
@@ -1525,14 +1701,21 @@ fn parse_border_fill(
                 Ok(Event::End(ref ee)) => {
                     let ename = ee.name();
                     if local_name(ename.as_ref()) == b"borderFill" {
+                        inner_end = pos_before;
                         break;
                     }
                 }
-                Ok(Event::Eof) => break,
+                Ok(Event::Eof) => {
+                    inner_end = pos_before;
+                    break;
+                }
                 Err(e) => return Err(HwpxError::XmlError(format!("borderFill: {}", e))),
                 _ => {}
             }
             buf.clear();
+        }
+        if inner_end >= inner_start && inner_end <= xml.len() {
+            bf.raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
         }
     }
 
@@ -1588,6 +1771,7 @@ fn parse_tab_def(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
     doc_info: &mut DocInfo,
+    xml: &str,
 ) -> Result<(), HwpxError> {
     let mut td = TabDef::default();
 
@@ -1600,12 +1784,15 @@ fn parse_tab_def(
     }
 
     if !is_empty_event(e) {
+        let inner_start = reader.buffer_position() as usize;
+        let mut inner_end = inner_start;
         let mut buf = Vec::new();
         let mut in_hwpunitchar_case = false;
         let mut in_default = false;
         let mut found_case = false;
         let mut default_tabs: Vec<TabItem> = Vec::new();
         loop {
+            let pos_before = reader.buffer_position() as usize;
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref ce)) => {
                     let cname = ce.name();
@@ -1656,15 +1843,24 @@ fn parse_tab_def(
                         b"default" => {
                             in_default = false;
                         }
-                        b"tabPr" => break,
+                        b"tabPr" => {
+                            inner_end = pos_before;
+                            break;
+                        }
                         _ => {}
                     }
                 }
-                Ok(Event::Eof) => break,
+                Ok(Event::Eof) => {
+                    inner_end = pos_before;
+                    break;
+                }
                 Err(e) => return Err(HwpxError::XmlError(format!("tabPr: {}", e))),
                 _ => {}
             }
             buf.clear();
+        }
+        if inner_end >= inner_start && inner_end <= xml.len() {
+            td.raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
         }
         // HwpUnitChar case가 없으면 default 값 적용
         if !found_case && !default_tabs.is_empty() {
@@ -1684,6 +1880,7 @@ fn parse_tab_def(
 fn parse_bullet_hwpx(
     e: &quick_xml::events::BytesStart,
     reader: &mut Reader<&[u8]>,
+    xml: &str,
 ) -> Result<Bullet, HwpxError> {
     let mut bullet = Bullet::default();
 
@@ -1707,25 +1904,57 @@ fn parse_bullet_hwpx(
         }
     }
 
-    // 자식 <hh:paraHead>, <hh:image> 등 skip
     if !is_empty_event(e) {
+        // 여는 태그 직후부터 닫는 bullet 직전까지를 그대로 보존한다. Bullet 모델은
+        // HWPX paraHead/image 세부 속성을 모두 표현하지 못하므로 serializer 에서
+        // raw splice 하도록 한다.
+        let inner_start = reader.buffer_position() as usize;
+        let mut inner_end = inner_start;
         let mut buf = Vec::new();
         loop {
+            let pos_before = reader.buffer_position() as usize;
             match reader.read_event_into(&mut buf) {
+                Ok(Event::Empty(ref ce)) | Ok(Event::Start(ref ce)) => {
+                    if local_name(ce.name().as_ref()) == b"paraHead" {
+                        apply_bullet_para_head_attrs(&mut bullet, ce);
+                    }
+                }
                 Ok(Event::End(ref ee)) => {
                     if local_name(ee.name().as_ref()) == b"bullet" {
+                        inner_end = pos_before;
                         break;
                     }
                 }
-                Ok(Event::Eof) => break,
+                Ok(Event::Eof) => {
+                    inner_end = pos_before;
+                    break;
+                }
                 Err(e) => return Err(HwpxError::XmlError(format!("bullet: {}", e))),
                 _ => {}
             }
             buf.clear();
         }
+        if inner_end >= inner_start && inner_end <= xml.len() {
+            bullet.raw_hwpx_children = Some(xml[inner_start..inner_end].to_string());
+        }
     }
 
     Ok(bullet)
+}
+
+fn apply_bullet_para_head_attrs(bullet: &mut Bullet, e: &quick_xml::events::BytesStart) {
+    for attr in e.attributes().flatten() {
+        match attr.key.as_ref() {
+            b"widthAdjust" => bullet.width_adjust = parse_i16(&attr),
+            b"textOffset" => bullet.text_distance = parse_i16(&attr),
+            b"checkable" => {
+                if parse_bool(&attr) && bullet.check_bullet_char == '\0' {
+                    bullet.check_bullet_char = bullet.bullet_char;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 fn parse_numbering(
@@ -2091,6 +2320,25 @@ mod tests {
     }
 
     #[test]
+    fn tab_pr_captures_switch_children_for_lossless_roundtrip() {
+        let inner = r#"<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"><hh:tabItem pos="123" type="RIGHT" leader="DASH" unit="HWPUNIT"/></hp:case><hp:default><hh:tabItem pos="246" type="RIGHT" leader="DASH"/></hp:default></hp:switch>"#;
+        let xml = format!(
+            r#"<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head" xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph"><hh:refList><hh:tabProperties itemCnt="1"><hh:tabPr id="1" autoTabLeft="1" autoTabRight="0">{inner}</hh:tabPr></hh:tabProperties></hh:refList></hh:head>"#
+        );
+
+        let (doc_info, _) = parse_hwpx_header(&xml).unwrap();
+        let tab = &doc_info.tab_defs[0];
+
+        assert!(tab.auto_tab_left);
+        assert!(!tab.auto_tab_right);
+        assert_eq!(tab.tabs.len(), 1);
+        assert_eq!(tab.tabs[0].position, 246);
+        assert_eq!(tab.tabs[0].tab_type, 1);
+        assert_eq!(tab.tabs[0].fill_type, 3);
+        assert_eq!(tab.raw_hwpx_children.as_deref(), Some(inner));
+    }
+
+    #[test]
     fn numbering_raw_para_heads_captures_inner_verbatim_for_lossless_roundtrip() {
         // Finding 21: 모델은 7수준만 표현하지만 HWPX 는 10수준 +
         // align/useInstWidth/autoIndent/checkable/형식문자열을 가진다.
@@ -2106,6 +2354,23 @@ mod tests {
             doc_info.numberings[0].raw_para_heads.as_deref(),
             Some(inner)
         );
+    }
+
+    #[test]
+    fn bullet_captures_inner_verbatim_for_lossless_roundtrip() {
+        let inner = r#"<hh:paraHead level="0" align="RIGHT" useInstWidth="1" autoIndent="0" widthAdjust="12" textOffsetType="HWPUNIT" textOffset="34" numFormat="CIRCLE_DIGIT" charPrIDRef="5" checkable="1"/><hh:image bright="1" contrast="2" effect="GRAY_SCALE" binaryItemIDRef="BIN0001"/>"#;
+        let xml = format!(
+            r#"<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"><hh:refList><hh:bullets itemCnt="1"><hh:bullet id="1" char="□" useImage="1">{inner}</hh:bullet></hh:bullets></hh:refList></hh:head>"#
+        );
+
+        let (doc_info, _) = parse_hwpx_header(&xml).unwrap();
+        let bullet = &doc_info.bullets[0];
+
+        assert_eq!(bullet.bullet_char, '□');
+        assert_eq!(bullet.image_bullet, 1);
+        assert_eq!(bullet.width_adjust, 12);
+        assert_eq!(bullet.text_distance, 34);
+        assert_eq!(bullet.raw_hwpx_children.as_deref(), Some(inner));
     }
 
     #[test]
@@ -2163,6 +2428,83 @@ mod tests {
 
         assert_eq!(doc_info.para_shapes[0].attr1 & (1 << 7), 1 << 7);
         assert_eq!(doc_info.para_shapes[1].attr1 & (1 << 7), 0);
+    }
+
+    #[test]
+    fn test_parse_hwpx_para_shape_break_latin_and_line_wrap_bits() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:paraProperties itemCnt="3">
+      <hh:paraPr id="1" tabPrIDRef="0">
+        <hh:breakSetting breakLatinWord="KEEP_WORD" breakNonLatinWord="BREAK_WORD" widowOrphan="0" keepWithNext="0" keepLines="0" pageBreakBefore="0" lineWrap="BREAK"/>
+      </hh:paraPr>
+      <hh:paraPr id="2" tabPrIDRef="0">
+        <hh:breakSetting breakLatinWord="HYPHENATION" breakNonLatinWord="BREAK_WORD" widowOrphan="0" keepWithNext="0" keepLines="0" pageBreakBefore="0" lineWrap="SQUEEZE"/>
+      </hh:paraPr>
+      <hh:paraPr id="3" tabPrIDRef="0">
+        <hh:breakSetting breakLatinWord="BREAK_WORD" breakNonLatinWord="BREAK_WORD" widowOrphan="0" keepWithNext="0" keepLines="0" pageBreakBefore="0" lineWrap="KEEP"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+  </hh:refList>
+</hh:head>"##;
+
+        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
+
+        assert_eq!((doc_info.para_shapes[0].attr1 >> 5) & 0x03, 0);
+        assert_eq!(doc_info.para_shapes[0].attr2 & 0x03, 0);
+        assert_eq!((doc_info.para_shapes[1].attr1 >> 5) & 0x03, 1);
+        assert_eq!(doc_info.para_shapes[1].attr2 & 0x03, 1);
+        assert_eq!((doc_info.para_shapes[2].attr1 >> 5) & 0x03, 2);
+        assert_eq!(doc_info.para_shapes[2].attr2 & 0x03, 2);
+    }
+
+    #[test]
+    fn test_parse_hwpx_para_shape_suppress_line_numbers_and_checked() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:paraProperties itemCnt="2">
+      <hh:paraPr id="1" tabPrIDRef="0" suppressLineNumbers="1" checked="1">
+        <hh:align horizontal="JUSTIFY" vertical="BASELINE"/>
+      </hh:paraPr>
+      <hh:paraPr id="2" tabPrIDRef="0" suppressLineNumbers="0" checked="0">
+        <hh:align horizontal="JUSTIFY" vertical="BASELINE"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+  </hh:refList>
+</hh:head>"##;
+
+        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
+
+        assert!(doc_info.para_shapes[0].suppress_line_numbers);
+        assert!(doc_info.para_shapes[0].checked);
+        assert!(!doc_info.para_shapes[1].suppress_line_numbers);
+        assert!(!doc_info.para_shapes[1].checked);
+    }
+
+    #[test]
+    fn test_parse_hwpx_para_shape_auto_spacing_fields() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head">
+  <hh:refList>
+    <hh:paraProperties itemCnt="2">
+      <hh:paraPr id="1" tabPrIDRef="0">
+        <hh:autoSpacing eAsianEng="1" eAsianNum="0"/>
+      </hh:paraPr>
+      <hh:paraPr id="2" tabPrIDRef="0">
+        <hh:autoSpacing eAsianEng="0" eAsianNum="1"/>
+      </hh:paraPr>
+    </hh:paraProperties>
+  </hh:refList>
+</hh:head>"##;
+
+        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
+
+        assert_eq!(doc_info.para_shapes[0].auto_spacing_easian_eng, Some(true));
+        assert_eq!(doc_info.para_shapes[0].auto_spacing_easian_num, Some(false));
+        assert_eq!(doc_info.para_shapes[1].auto_spacing_easian_eng, Some(false));
+        assert_eq!(doc_info.para_shapes[1].auto_spacing_easian_num, Some(true));
     }
 
     #[test]
@@ -2337,6 +2679,27 @@ mod tests {
     }
 
     #[test]
+    fn ref_list_track_changes_are_captured_verbatim() {
+        let xml = r##"<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"><hh:refList><hh:styles/><hh:trackChanges itemCnt="2"><hh:trackChange type="Insert" id="1"/><hh:trackChange type="Delete" id="2"/></hh:trackChanges><hh:trackChangeAuthors itemCnt="1"><hh:trackChangeAuthor name="fixture" id="1"/></hh:trackChangeAuthors></hh:refList><hh:trackchageConfig flags="56"/></hh:head>"##;
+        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
+        let raw = doc_info
+            .hwpx_ref_list_track_change_xml
+            .as_deref()
+            .expect("refList track-change XML");
+
+        assert!(raw.contains(r#"<hh:trackChanges itemCnt="2">"#), "{raw}");
+        assert!(
+            raw.contains(r#"<hh:trackChange type="Delete" id="2"/>"#),
+            "{raw}"
+        );
+        assert!(
+            raw.contains(r#"<hh:trackChangeAuthors itemCnt="1">"#),
+            "{raw}"
+        );
+        assert!(!raw.contains("<hh:styles"), "{raw}");
+    }
+
+    #[test]
     fn test_parse_hwpx_subst_font_captures_all_attributes() {
         // HFT 글꼴이 TTF 대체 글꼴을 갖는 경우(부모와 type 이 다를 수 있음) +
         // substFont 와 typeInfo 가 함께 있는 경우 두 가지를 모두 검증.
@@ -2385,6 +2748,34 @@ mod tests {
             })
         );
         assert_eq!(ttf.type_info, Some([2, 3, 6, 0, 0, 1, 1, 1, 1, 1]));
+    }
+
+    #[test]
+    fn font_captures_children_for_lossless_roundtrip() {
+        let xml = r##"<?xml version="1.0" encoding="UTF-8"?>
+<hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"
+         xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
+  <hh:refList>
+    <hh:fontfaces itemCnt="1">
+      <hh:fontface lang="HANGUL" fontCnt="1">
+        <hh:font id="0" face="바탕" type="TTF" isEmbedded="0">
+          <hp:switch><hp:default><hh:substFont face="함초롬바탕" type="TTF" isEmbedded="0" binaryItemIDRef=""/></hp:default></hp:switch>
+          <hh:typeInfo familyType="FCAT_GOTHIC" weight="6" proportion="0" contrast="0" strokeVariation="1" armStyle="1" letterform="1" midline="1" xHeight="1"/>
+        </hh:font>
+      </hh:fontface>
+    </hh:fontfaces>
+  </hh:refList>
+</hh:head>"##;
+
+        let (doc_info, _) = parse_hwpx_header(xml).unwrap();
+        let font = &doc_info.font_faces[0][0];
+        let raw = font
+            .raw_hwpx_children
+            .as_deref()
+            .expect("font child XML should be captured");
+        assert!(raw.contains("<hp:switch>"), "{raw}");
+        assert!(raw.contains("<hh:typeInfo "), "{raw}");
+        assert_eq!(font.type_info, Some([2, 3, 6, 0, 0, 1, 1, 1, 1, 1]));
     }
 
     #[test]
@@ -2588,7 +2979,8 @@ mod tests {
         let xml = format!(
             r##"<?xml version="1.0" encoding="UTF-8"?>
 <hh:head xmlns:hh="http://www.hancom.co.kr/hwpml/2011/head"
-         xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core">
+         xmlns:hc="http://www.hancom.co.kr/hwpml/2011/core"
+         xmlns:hp="http://www.hancom.co.kr/hwpml/2011/paragraph">
   <hh:refList>
     <hh:borderFills itemCnt="1">{border_fill_xml}</hh:borderFills>
   </hh:refList>
@@ -2618,6 +3010,55 @@ mod tests {
             bf.diagonal.diagonal_type, 0,
             "diagonal 요소 없음 → diagonal_type 0 (대각선 미표시)"
         );
+    }
+
+    #[test]
+    fn border_fill_preserves_hwpx_effect_attrs() {
+        let bf = parse_single_border_fill(
+            r#"<hh:borderFill id="7" threeD="1" shadow="1" centerLine="CROSS" breakCellSeparateLine="1">
+                 <hh:slash type="NONE" Crooked="0" isCounter="0"/>
+                 <hh:backSlash type="NONE" Crooked="0" isCounter="0"/>
+               </hh:borderFill>"#,
+        );
+        assert!(bf.three_d);
+        assert!(bf.shadow);
+        assert_eq!(bf.center_line.as_deref(), Some("CROSS"));
+        assert!(bf.break_cell_separate_line);
+        assert_eq!(bf.attr & 0x2003, 0x2003);
+    }
+
+    #[test]
+    fn border_fill_captures_children_for_lossless_roundtrip() {
+        let bf = parse_single_border_fill(
+            r##"<hh:borderFill id="9" threeD="1" shadow="1" centerLine="CROSS" breakCellSeparateLine="1">
+                 <hp:switch>
+                   <hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/paragraph">
+                     <hh:leftBorder type="DASH" width="0.4 mm" color="#112233"/>
+                   </hp:case>
+                   <hp:default>
+                     <hh:leftBorder type="SOLID" width="0.1 mm" color="#000000"/>
+                   </hp:default>
+                 </hp:switch>
+                 <hh:rightBorder type="DOT" width="0.2 mm" color="#445566"/>
+                 <hc:fillBrush><hc:winBrush faceColor="#DDEEFF" hatchColor="#000000" alpha="0"/></hc:fillBrush>
+               </hh:borderFill>"##,
+        );
+
+        let raw = bf
+            .raw_hwpx_children
+            .as_deref()
+            .expect("borderFill child XML should be captured");
+        assert!(raw.contains("<hp:switch>"), "{raw}");
+        assert!(
+            raw.contains(r##"<hc:winBrush faceColor="#DDEEFF""##),
+            "{raw}"
+        );
+        assert!(bf.three_d);
+        assert!(bf.shadow);
+        assert_eq!(bf.center_line.as_deref(), Some("CROSS"));
+        assert!(bf.break_cell_separate_line);
+        assert_eq!(bf.borders[1].line_type, BorderLineType::Dot);
+        assert!(matches!(bf.fill.fill_type, FillType::Solid));
     }
 
     #[test]

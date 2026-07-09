@@ -17,7 +17,7 @@ use quick_xml::Writer;
 
 use crate::model::document::{DocInfo, DocProperties, Document};
 use crate::model::style::{
-    border_width_mm_str, Alignment, BorderFill, BorderLine, BorderLineType, CharShape,
+    border_width_mm_str, Alignment, BorderFill, BorderLine, BorderLineType, Bullet, CharShape,
     DiagonalLine, FillType, Font, HeadType, LineSpacingType, Numbering, ParaShape, Style,
     SubstFont, TabDef,
 };
@@ -79,8 +79,14 @@ pub fn write_header(doc: &Document, ctx: &SerializeContext) -> Result<Vec<u8>, S
     write_char_properties(&mut w, &doc.doc_info, ctx)?;
     write_tab_properties(&mut w, &doc.doc_info)?;
     write_numberings(&mut w, &doc.doc_info)?;
+    write_bullets(&mut w, &doc.doc_info)?;
     write_para_properties(&mut w, &doc.doc_info, ctx)?;
     write_styles(&mut w, &doc.doc_info, ctx)?;
+    if let Some(raw) = &doc.doc_info.hwpx_ref_list_track_change_xml {
+        w.get_mut()
+            .write_all(raw.as_bytes())
+            .map_err(|e| SerializeError::XmlError(format!("refList track-change splice: {e}")))?;
+    }
     end_tag(&mut w, "hh:refList")?;
 
     // 문서 설정 tail: 원본 HWPX 가 있으면 그대로 splice(compatibleDocument/
@@ -167,7 +173,13 @@ fn write_fontfaces<W: Write>(w: &mut Writer<W>, doc_info: &DocInfo) -> Result<()
             // substFont(대체 글꼴)·typeInfo(파나포스 10바이트)가 IR에 있으면
             // 자식으로 복원한다. 원본 순서는 substFont → typeInfo. 둘 다 없으면
             // 종전대로 self-closing.
-            if font.subst_font.is_some() || font.type_info.is_some() {
+            if let Some(raw) = &font.raw_hwpx_children {
+                start_tag_attrs(w, "hh:font", &font_attrs)?;
+                w.get_mut()
+                    .write_all(raw.as_bytes())
+                    .map_err(|e| SerializeError::XmlError(format!("font child splice: {e}")))?;
+                end_tag(w, "hh:font")?;
+            } else if font.subst_font.is_some() || font.type_info.is_some() {
                 start_tag_attrs(w, "hh:font", &font_attrs)?;
                 if let Some(sf) = &font.subst_font {
                     write_subst_font(w, sf)?;
@@ -293,17 +305,43 @@ fn write_border_fill<W: Write>(
     bf: &BorderFill,
 ) -> Result<(), SerializeError> {
     // 속성 순서 (BorderFillType.cpp:64-68): id, threeD, shadow, centerLine, breakCellSeparateLine
-    start_tag_attrs(
-        w,
-        "hh:borderFill",
-        &[
-            ("id", &(id + 1).to_string()), // HWPX 관찰: id는 1-based
-            ("threeD", "0"),
-            ("shadow", "0"),
-            ("centerLine", "NONE"),
-            ("breakCellSeparateLine", "0"),
-        ],
-    )?;
+    let three_d = if bf.three_d || (bf.attr & 0x0001) != 0 {
+        "1"
+    } else {
+        "0"
+    };
+    let shadow = if bf.shadow || (bf.attr & 0x0002) != 0 {
+        "1"
+    } else {
+        "0"
+    };
+    let center_line = bf
+        .center_line
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("NONE");
+    let break_cell_separate_line = if bf.break_cell_separate_line {
+        "1"
+    } else {
+        "0"
+    };
+    let id_s = (id + 1).to_string();
+    let attrs = [
+        ("id", id_s.as_str()), // HWPX 관찰: id는 1-based
+        ("threeD", three_d),
+        ("shadow", shadow),
+        ("centerLine", center_line),
+        ("breakCellSeparateLine", break_cell_separate_line),
+    ];
+    start_tag_attrs(w, "hh:borderFill", &attrs)?;
+
+    if let Some(raw) = &bf.raw_hwpx_children {
+        w.get_mut()
+            .write_all(raw.as_bytes())
+            .map_err(|e| SerializeError::XmlError(format!("borderFill child splice: {e}")))?;
+        end_tag(w, "hh:borderFill")?;
+        return Ok(());
+    }
 
     // 자식 순서 (BorderFillType.cpp:51-58):
     // slash, backSlash, leftBorder, rightBorder, topBorder, bottomBorder, diagonal, fillBrush
@@ -712,7 +750,13 @@ fn write_tab_pr<W: Write>(w: &mut Writer<W>, id: u16, td: &TabDef) -> Result<(),
     ];
     let attrs_ref: Vec<(&str, &str)> = attrs.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
-    if td.tabs.is_empty() {
+    if let Some(raw) = &td.raw_hwpx_children {
+        start_tag_attrs(w, "hh:tabPr", &attrs_ref)?;
+        w.get_mut()
+            .write_all(raw.as_bytes())
+            .map_err(|e| SerializeError::XmlError(format!("tabPr child splice: {e}")))?;
+        end_tag(w, "hh:tabPr")?;
+    } else if td.tabs.is_empty() {
         empty_tag(w, "hh:tabPr", &attrs_ref)?;
     } else {
         start_tag_attrs(w, "hh:tabPr", &attrs_ref)?;
@@ -831,6 +875,74 @@ fn write_numbering<W: Write>(
 }
 
 // =====================================================================
+// <hh:bullets>
+// =====================================================================
+fn write_bullets<W: Write>(w: &mut Writer<W>, doc_info: &DocInfo) -> Result<(), SerializeError> {
+    if doc_info.bullets.is_empty() {
+        return Ok(());
+    }
+    start_tag_attrs(
+        w,
+        "hh:bullets",
+        &[("itemCnt", &doc_info.bullets.len().to_string())],
+    )?;
+    for (idx, bullet) in doc_info.bullets.iter().enumerate() {
+        write_bullet(w, idx as u16, bullet)?;
+    }
+    end_tag(w, "hh:bullets")?;
+    Ok(())
+}
+
+fn write_bullet<W: Write>(
+    w: &mut Writer<W>,
+    id: u16,
+    bullet: &Bullet,
+) -> Result<(), SerializeError> {
+    let id_s = (id + 1).to_string();
+    let char_s = bullet.bullet_char.to_string();
+    let use_image_s = if bullet.image_bullet != 0 { "1" } else { "0" };
+    start_tag_attrs(
+        w,
+        "hh:bullet",
+        &[("id", &id_s), ("char", &char_s), ("useImage", use_image_s)],
+    )?;
+
+    if let Some(raw) = &bullet.raw_hwpx_children {
+        w.get_mut()
+            .write_all(raw.as_bytes())
+            .map_err(|e| SerializeError::XmlError(format!("bullet child splice: {e}")))?;
+        end_tag(w, "hh:bullet")?;
+        return Ok(());
+    }
+
+    let width_adjust = bullet.width_adjust.to_string();
+    let text_offset = bullet.text_distance.to_string();
+    let checkable = if bullet.check_bullet_char != '\0' {
+        "1"
+    } else {
+        "0"
+    };
+    empty_tag(
+        w,
+        "hh:paraHead",
+        &[
+            ("level", "0"),
+            ("align", "LEFT"),
+            ("useInstWidth", "0"),
+            ("autoIndent", "1"),
+            ("widthAdjust", &width_adjust),
+            ("textOffsetType", "PERCENT"),
+            ("textOffset", &text_offset),
+            ("numFormat", "DIGIT"),
+            ("charPrIDRef", &u32::MAX.to_string()),
+            ("checkable", checkable),
+        ],
+    )?;
+    end_tag(w, "hh:bullet")?;
+    Ok(())
+}
+
+// =====================================================================
 // <hh:paraProperties>
 // =====================================================================
 fn write_para_properties<W: Write>(
@@ -868,6 +980,8 @@ fn write_para_pr<W: Write>(
     let condense = ((ps.attr1 >> 9) & 0x7f).to_string();
     let font_line_height = ((ps.attr1 >> 22) & 1).to_string();
     let snap_to_grid = ((ps.attr1 >> 8) & 1).to_string();
+    let suppress_line_numbers = if ps.suppress_line_numbers { "1" } else { "0" };
+    let checked = if ps.checked { "1" } else { "0" };
     start_tag_attrs(
         w,
         "hh:paraPr",
@@ -877,8 +991,8 @@ fn write_para_pr<W: Write>(
             ("condense", &condense),
             ("fontLineHeight", &font_line_height),
             ("snapToGrid", &snap_to_grid),
-            ("suppressLineNumbers", "0"),
-            ("checked", "0"),
+            ("suppressLineNumbers", suppress_line_numbers),
+            ("checked", checked),
         ],
     )?;
 
@@ -889,8 +1003,10 @@ fn write_para_pr<W: Write>(
     // keepWithNext, keepLines, pageBreakBefore} 를 상수로 하드코딩해, 파서가
     // attr1/attr2 비트로 보존한 값을 직렬화에서 모두 잃었다(예: vertical=CENTER →
     // BASELINE, breakNonLatinWord=BREAK_WORD → KEEP_WORD). 이제 보존 비트에서
-    // 역매핑한다. (breakLatinWord/lineWrap 은 파서가 아직 미수집 → 상수 유지.)
+    // 역매핑한다. breakLatinWord/lineWrap 도 각각 attr1 bits5..6,
+    // attr2 bits0..1 에서 되돌려 원본 줄바꿈 정책을 보존한다.
     let vertical = vertical_alignment_str((ps.attr1 >> 20) & 0x03);
+    let break_latin = break_latin_word_str((ps.attr1 >> 5) & 0x03);
     // attr1 bit7: KEEP_WORD=1, BREAK_WORD=0 (parse_para_shape_child 와 정합).
     let break_non_latin = if (ps.attr1 >> 7) & 1 == 1 {
         "KEEP_WORD"
@@ -901,6 +1017,7 @@ fn write_para_pr<W: Write>(
     let keep_with_next = ((ps.attr2 >> 6) & 1).to_string();
     let keep_lines = ((ps.attr2 >> 7) & 1).to_string();
     let page_break_before = ((ps.attr2 >> 8) & 1).to_string();
+    let line_wrap = line_wrap_str(ps.attr2 & 0x03);
     empty_tag(
         w,
         "hh:align",
@@ -922,20 +1039,33 @@ fn write_para_pr<W: Write>(
         w,
         "hh:breakSetting",
         &[
-            ("breakLatinWord", "KEEP_WORD"),
+            ("breakLatinWord", break_latin),
             ("breakNonLatinWord", break_non_latin),
             ("widowOrphan", &widow_orphan),
             ("keepWithNext", &keep_with_next),
             ("keepLines", &keep_lines),
             ("pageBreakBefore", &page_break_before),
-            ("lineWrap", "BREAK"),
+            ("lineWrap", line_wrap),
         ],
     )?;
 
+    let auto_spacing_easian_eng = if ps.auto_spacing_easian_eng.unwrap_or(false) {
+        "1"
+    } else {
+        "0"
+    };
+    let auto_spacing_easian_num = if ps.auto_spacing_easian_num.unwrap_or(false) {
+        "1"
+    } else {
+        "0"
+    };
     empty_tag(
         w,
         "hh:autoSpacing",
-        &[("eAsianEng", "0"), ("eAsianNum", "0")],
+        &[
+            ("eAsianEng", auto_spacing_easian_eng),
+            ("eAsianNum", auto_spacing_easian_num),
+        ],
     )?;
 
     // margin + lineSpacing 은 한컴 원본과 동일하게 <hp:switch>(case/default)로 감싼다.
@@ -1073,6 +1203,22 @@ fn vertical_alignment_str(bits: u32) -> &'static str {
         2 => "CENTER",
         3 => "BOTTOM",
         _ => "BASELINE",
+    }
+}
+
+fn break_latin_word_str(bits: u32) -> &'static str {
+    match bits & 0x03 {
+        1 => "HYPHENATION",
+        2 => "BREAK_WORD",
+        _ => "KEEP_WORD",
+    }
+}
+
+fn line_wrap_str(bits: u32) -> &'static str {
+    match bits & 0x03 {
+        1 => "SQUEEZE",
+        2 => "KEEP",
+        _ => "BREAK",
     }
 }
 
@@ -1253,6 +1399,28 @@ mod tests {
     }
 
     #[test]
+    fn write_header_splices_ref_list_track_changes_verbatim() {
+        let bytes = include_bytes!("../../../samples/hwpx/ref/ref_empty.hwpx");
+        let mut doc = parse_hwpx(bytes).expect("parse");
+        doc.doc_info.hwpx_ref_list_track_change_xml = Some(
+            r#"<hh:trackChanges itemCnt="2"><hh:trackChange type="Insert" id="1"/><hh:trackChange type="Delete" id="2"/></hh:trackChanges><hh:trackChangeAuthors itemCnt="1"><hh:trackChangeAuthor name="fixture" id="1"/></hh:trackChangeAuthors>"#
+                .to_string(),
+        );
+        let ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_header(&doc, &ctx).unwrap()).unwrap();
+        let ref_list_end = xml.find("</hh:refList>").expect("refList end");
+        let track_start = xml
+            .find(r#"<hh:trackChanges itemCnt="2">"#)
+            .expect("trackChanges");
+
+        assert!(track_start < ref_list_end, "{xml}");
+        assert!(
+            xml.contains(r#"<hh:trackChangeAuthors itemCnt="1">"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
     fn write_header_falls_back_to_hardcoded_tail_when_absent() {
         let bytes = include_bytes!("../../../samples/hwpx/ref/ref_empty.hwpx");
         let mut doc = parse_hwpx(bytes).expect("parse");
@@ -1342,6 +1510,30 @@ mod tests {
     }
 
     #[test]
+    fn write_fontfaces_splices_raw_font_children() {
+        let mut doc_info = DocInfo::default();
+        doc_info.font_faces = vec![Vec::new(); 7];
+        let raw = r#"<hp:switch><hp:default><hh:substFont face="함초롬바탕" type="TTF" isEmbedded="0" binaryItemIDRef=""/></hp:default></hp:switch><hh:typeInfo familyType="FCAT_GOTHIC" weight="6" proportion="0" contrast="0" strokeVariation="1" armStyle="1" letterform="1" midline="1" xHeight="1"/>"#;
+        doc_info.font_faces[0].push(Font {
+            name: "바탕".to_string(),
+            alt_type: 1,
+            raw_hwpx_children: Some(raw.to_string()),
+            type_info: Some([1, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            ..Default::default()
+        });
+
+        let mut writer = Writer::new(Vec::new());
+        write_fontfaces(&mut writer, &doc_info).expect("write fontfaces");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(xml.contains(raw), "{xml}");
+        assert!(
+            !xml.contains(r#"familyType="FCAT_MYUNGJO""#),
+            "raw font child XML should prevent semantic fallback typeInfo generation: {xml}"
+        );
+    }
+
+    #[test]
     fn write_fontfaces_emits_type_info_child_only_when_present() {
         let mut doc_info = DocInfo::default();
         doc_info.font_faces = vec![Vec::new(); 7];
@@ -1416,6 +1608,54 @@ mod tests {
         assert!(
             xml.contains(r#"<hh:backSlash type="CENTER_BELOW" Crooked="0" isCounter="0"/>"#),
             "backSlash 방향 비트가 CENTER_BELOW로 보존되어야 함: {xml}"
+        );
+    }
+
+    #[test]
+    fn write_border_fill_preserves_hwpx_effect_attrs() {
+        let bf = BorderFill {
+            three_d: true,
+            shadow: true,
+            center_line: Some("CROSS".to_string()),
+            break_cell_separate_line: true,
+            ..BorderFill::default()
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 2, &bf).expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(xml.contains(r#"<hh:borderFill id="3" threeD="1" shadow="1" centerLine="CROSS" breakCellSeparateLine="1">"#), "{xml}");
+    }
+
+    #[test]
+    fn write_border_fill_splices_raw_hwpx_children() {
+        let raw = r##"<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/paragraph"><hh:leftBorder type="DASH" width="0.4 mm" color="#112233"/></hp:case><hp:default><hh:leftBorder type="SOLID" width="0.1 mm" color="#000000"/></hp:default></hp:switch><hc:fillBrush><hc:winBrush faceColor="#DDEEFF" hatchColor="#000000" alpha="0"/></hc:fillBrush>"##;
+        let bf = BorderFill {
+            raw_hwpx_children: Some(raw.to_string()),
+            borders: [BorderLine {
+                line_type: BorderLineType::Dot,
+                width: 2,
+                color: 0x00112233,
+            }; 4],
+            fill: crate::model::style::Fill {
+                fill_type: FillType::Solid,
+                ..Default::default()
+            },
+            ..BorderFill::default()
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        write_border_fill(&mut writer, 4, &bf).expect("write borderFill");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(
+            xml.contains(raw),
+            "raw borderFill child XML must be spliced verbatim: {xml}"
+        );
+        assert!(
+            !xml.contains(r#"<hh:leftBorder type="DOT""#),
+            "semantic fallback children must not be generated when raw child XML exists: {xml}"
         );
     }
 
@@ -1568,6 +1808,84 @@ mod tests {
     }
 
     #[test]
+    fn write_para_pr_emits_break_latin_and_line_wrap_from_preserved_bits() {
+        let mut ps = ParaShape::default();
+        ps.attr1 = 1 << 5; // breakLatinWord = HYPHENATION
+        ps.attr2 = 1; // lineWrap = SQUEEZE
+
+        let mut writer = Writer::new(Vec::new());
+        write_para_pr(&mut writer, 1, &ps).expect("write paraPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"breakLatinWord="HYPHENATION""#),
+            "breakLatinWord 는 attr1 bits5..6 에서 와야 함: {xml}"
+        );
+        assert!(
+            xml.contains(r#"lineWrap="SQUEEZE""#),
+            "lineWrap 은 attr2 bits0..1 에서 와야 함: {xml}"
+        );
+
+        ps.attr1 = 2 << 5; // breakLatinWord = BREAK_WORD
+        ps.attr2 = 2; // lineWrap = KEEP
+        let mut writer = Writer::new(Vec::new());
+        write_para_pr(&mut writer, 1, &ps).expect("write paraPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"breakLatinWord="BREAK_WORD""#),
+            "breakLatinWord=BREAK_WORD 역매핑: {xml}"
+        );
+        assert!(
+            xml.contains(r#"lineWrap="KEEP""#),
+            "lineWrap=KEEP 역매핑: {xml}"
+        );
+    }
+
+    #[test]
+    fn write_para_pr_emits_suppress_line_numbers_and_checked() {
+        let mut ps = ParaShape::default();
+        ps.suppress_line_numbers = true;
+        ps.checked = true;
+
+        let mut writer = Writer::new(Vec::new());
+        write_para_pr(&mut writer, 1, &ps).expect("write paraPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(
+            xml.contains(r#"suppressLineNumbers="1""#),
+            "suppressLineNumbers 는 ParaShape 필드에서 와야 함: {xml}"
+        );
+        assert!(
+            xml.contains(r#"checked="1""#),
+            "checked 는 ParaShape 필드에서 와야 함: {xml}"
+        );
+    }
+
+    #[test]
+    fn write_para_pr_emits_auto_spacing_fields() {
+        let mut ps = ParaShape::default();
+        ps.auto_spacing_easian_eng = Some(true);
+        ps.auto_spacing_easian_num = Some(false);
+
+        let mut writer = Writer::new(Vec::new());
+        write_para_pr(&mut writer, 1, &ps).expect("write paraPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"<hh:autoSpacing eAsianEng="1" eAsianNum="0"/>"#),
+            "autoSpacing 은 HWPX 전용 필드에서 와야 함: {xml}"
+        );
+
+        ps.auto_spacing_easian_eng = Some(false);
+        ps.auto_spacing_easian_num = Some(true);
+        let mut writer = Writer::new(Vec::new());
+        write_para_pr(&mut writer, 1, &ps).expect("write paraPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"<hh:autoSpacing eAsianEng="0" eAsianNum="1"/>"#),
+            "autoSpacing eAsianNum 도 보존되어야 함: {xml}"
+        );
+    }
+
+    #[test]
     fn write_para_pr_default_vertical_is_baseline() {
         // 기본 ParaShape(attr1=0) 의 vertical 은 BASELINE(bits 20..21 = 0). 파싱된
         // 문단은 항상 bit7 을 명시 설정하므로 round-trip 은 정확하다(이 테스트는
@@ -1713,6 +2031,33 @@ mod tests {
     }
 
     #[test]
+    fn write_tab_pr_splices_raw_hwpx_children() {
+        let inner = r#"<hp:switch><hp:case hp:required-namespace="http://www.hancom.co.kr/hwpml/2016/HwpUnitChar"><hh:tabItem pos="123" type="RIGHT" leader="DASH" unit="HWPUNIT"/></hp:case><hp:default><hh:tabItem pos="246" type="RIGHT" leader="DASH"/></hp:default></hp:switch>"#;
+        let tab = TabDef {
+            raw_hwpx_children: Some(inner.to_string()),
+            tabs: vec![crate::model::style::TabItem {
+                position: 999,
+                tab_type: 0,
+                fill_type: 0,
+            }],
+            auto_tab_left: true,
+            auto_tab_right: false,
+            ..TabDef::default()
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        write_tab_pr(&mut writer, 0, &tab).expect("write tabPr");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert_eq!(
+            xml,
+            format!(r#"<hh:tabPr id="0" autoTabLeft="1" autoTabRight="0">{inner}</hh:tabPr>"#)
+        );
+        assert!(!xml.contains(r#"pos="999""#));
+        assert!(xml.contains(r#"unit="HWPUNIT""#));
+    }
+
+    #[test]
     fn write_numbering_splices_raw_para_heads_verbatim() {
         // Finding 21: 원본 paraHead 구간이 있으면 그대로 splice 되어, 모델의
         // 7수준으로 표현 못하는 level 8 self-closing 까지 byte-exact 복원.
@@ -1744,5 +2089,58 @@ mod tests {
 
         assert_eq!(xml.matches("<hh:paraHead").count(), 10);
         assert!(xml.starts_with(r#"<hh:numbering id="1" start="0">"#));
+    }
+
+    #[test]
+    fn write_header_emits_bullet_table() {
+        let mut doc = Document::default();
+        doc.doc_info.para_shapes.push(ParaShape::default());
+        doc.doc_info.bullets.push(Bullet {
+            bullet_char: '❏',
+            text_distance: 50,
+            ..Bullet::default()
+        });
+        doc.doc_info.bullets.push(Bullet {
+            bullet_char: '❍',
+            image_bullet: 1,
+            ..Bullet::default()
+        });
+        let ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_header(&doc, &ctx).unwrap()).unwrap();
+
+        assert!(xml.contains(r#"<hh:bullets itemCnt="2">"#));
+        assert!(xml.contains(r#"<hh:bullet id="1" char="❏" useImage="0">"#));
+        assert!(xml.contains(r#"<hh:bullet id="2" char="❍" useImage="1">"#));
+        assert!(xml.contains(r#"textOffset="50""#));
+        assert!(xml.find("<hh:bullets").unwrap() > xml.find("</hh:numberings>").unwrap_or(0));
+        assert!(xml.find("<hh:bullets").unwrap() < xml.find("<hh:paraProperties").unwrap());
+    }
+
+    #[test]
+    fn write_bullet_splices_raw_hwpx_children() {
+        let bullet = Bullet {
+            bullet_char: '□',
+            image_bullet: 1,
+            width_adjust: 12,
+            text_distance: 34,
+            raw_hwpx_children: Some(
+                r#"<hh:paraHead level="0" align="RIGHT" useInstWidth="1" autoIndent="0" widthAdjust="12" textOffsetType="HWPUNIT" textOffset="34" numFormat="CIRCLE_DIGIT" charPrIDRef="5" checkable="1"/><hh:image bright="1" contrast="2" effect="GRAY_SCALE" binaryItemIDRef="BIN0001"/>"#
+                    .to_string(),
+            ),
+            ..Bullet::default()
+        };
+
+        let mut writer = Writer::new(Vec::new());
+        write_bullet(&mut writer, 0, &bullet).expect("write bullet");
+        let xml = String::from_utf8(writer.into_inner()).unwrap();
+
+        assert!(xml.contains(r#"<hh:bullet id="1" char="□" useImage="1">"#));
+        assert!(xml.contains(r#"align="RIGHT""#), "{xml}");
+        assert!(xml.contains(r#"textOffsetType="HWPUNIT""#), "{xml}");
+        assert!(xml.contains(r#"<hh:image bright="1" contrast="2" effect="GRAY_SCALE" binaryItemIDRef="BIN0001"/>"#), "{xml}");
+        assert!(
+            !xml.contains(r#"align="LEFT" useInstWidth="0" autoIndent="1""#),
+            "raw child XML should prevent fallback paraHead: {xml}"
+        );
     }
 }

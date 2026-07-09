@@ -1,6 +1,6 @@
 //! 텍스트 삽입/삭제/문단 분리·병합/범위 삭제/문단 쿼리 관련 native 메서드
 
-use super::super::helpers::get_textbox_from_shape;
+use super::super::helpers::{get_textbox_from_shape, get_textbox_from_shape_mut};
 use super::super::queries::field_query::rebuild_char_offsets;
 use crate::document_core::{ActiveFieldInfo, DocumentCore};
 use crate::error::HwpError;
@@ -819,7 +819,14 @@ impl DocumentCore {
             .get_mut(control_idx)
         {
             Some(Control::Table(table)) => {
-                if let Some(cell) = table.cells.get_mut(cell_idx) {
+                if cell_idx == 65534 {
+                    if let Some(cap) = table.caption.as_mut() {
+                        if let Some(cell_para) = cap.paragraphs.get_mut(cell_para_idx) {
+                            cell_para.line_segs.clear();
+                            reflow_line_segs(cell_para, final_width, &styles, self.dpi);
+                        }
+                    }
+                } else if let Some(cell) = table.cells.get_mut(cell_idx) {
                     if let Some(cell_para) = cell.paragraphs.get_mut(cell_para_idx) {
                         cell_para.line_segs.clear();
                         reflow_line_segs(cell_para, final_width, &styles, self.dpi);
@@ -2543,24 +2550,54 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("문단 {} 범위 초과", parent_para_idx)))?;
 
         for (i, &(ctrl_idx, cell_idx, cell_para_idx)) in path.iter().enumerate() {
-            let table = match para.controls.get_mut(ctrl_idx) {
-                Some(Control::Table(t)) => t.as_mut(),
+            let ctrl = para.controls.get_mut(ctrl_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("경로[{}]: controls[{}] 범위 초과", i, ctrl_idx))
+            })?;
+            match ctrl {
+                Control::Table(table) => {
+                    let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!("경로[{}]: 셀 {} 범위 초과", i, cell_idx))
+                    })?;
+                    if i == path.len() - 1 {
+                        return Ok(&mut cell.paragraphs);
+                    }
+                    para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 셀문단 {} 범위 초과",
+                            i, cell_para_idx
+                        ))
+                    })?;
+                }
+                Control::Shape(shape) => {
+                    if cell_idx != 0 {
+                        return Err(HwpError::RenderError(format!(
+                            "경로[{}]: 글상자의 cell_index는 0이어야 합니다 ({})",
+                            i, cell_idx
+                        )));
+                    }
+                    let text_box = get_textbox_from_shape_mut(shape).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: controls[{}]가 텍스트 글상자가 아닙니다",
+                            i, ctrl_idx
+                        ))
+                    })?;
+                    if i == path.len() - 1 {
+                        return Ok(&mut text_box.paragraphs);
+                    }
+                    para = text_box.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!(
+                            "경로[{}]: 글상자문단 {} 범위 초과",
+                            i, cell_para_idx
+                        ))
+                    })?;
+                }
                 _ => {
                     return Err(HwpError::RenderError(format!(
-                        "경로[{}]: controls[{}]가 표가 아닙니다",
+                        "경로[{}]: controls[{}] 가 표/글상자가 아닙니다",
                         i, ctrl_idx
                     )))
                 }
-            };
-            let cell = table.cells.get_mut(cell_idx).ok_or_else(|| {
-                HwpError::RenderError(format!("경로[{}]: 셀 {} 범위 초과", i, cell_idx))
-            })?;
-            if i == path.len() - 1 {
-                return Ok(&mut cell.paragraphs);
             }
-            para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
-                HwpError::RenderError(format!("경로[{}]: 셀문단 {} 범위 초과", i, cell_para_idx))
-            })?;
         }
         unreachable!()
     }

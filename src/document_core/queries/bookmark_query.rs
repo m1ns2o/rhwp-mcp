@@ -82,11 +82,12 @@ impl DocumentCore {
 
         // CTRL_DATA 레코드 생성 (ParameterSet: 책갈피 이름)
         let ctrl_data = build_bookmark_ctrl_data(name);
-        if paragraph.ctrl_data_records.len() >= insert_idx {
-            paragraph
-                .ctrl_data_records
-                .insert(insert_idx, Some(ctrl_data));
+        if paragraph.ctrl_data_records.len() < insert_idx {
+            paragraph.ctrl_data_records.resize(insert_idx, None);
         }
+        paragraph
+            .ctrl_data_records
+            .insert(insert_idx, Some(ctrl_data));
 
         // char_offsets에 컨트롤 위치 정보 추가
         if !paragraph.char_offsets.is_empty() {
@@ -94,6 +95,7 @@ impl DocumentCore {
             paragraph.char_offsets.insert(insert_idx, raw_offset);
         }
 
+        section.raw_stream = None;
         self.recompose_section(sec);
 
         Ok(r#"{"ok":true}"#.to_string())
@@ -133,6 +135,7 @@ impl DocumentCore {
             paragraph.char_offsets.remove(ctrl_idx);
         }
 
+        section.raw_stream = None;
         self.recompose_section(sec);
 
         Ok(r#"{"ok":true}"#.to_string())
@@ -181,6 +184,8 @@ impl DocumentCore {
             if ctrl_idx < paragraph.ctrl_data_records.len() {
                 paragraph.ctrl_data_records[ctrl_idx] = Some(build_bookmark_ctrl_data(new_name));
             }
+            section.raw_stream = None;
+            self.recompose_section(sec);
             Ok(r#"{"ok":true}"#.to_string())
         } else {
             Ok(r#"{"ok":false,"error":"해당 컨트롤이 책갈피가 아닙니다."}"#.to_string())

@@ -556,6 +556,7 @@ fn parse_section_def(ctrl_data: &[u8], child_records: &[Record]) -> SectionDef {
     sd.hide_master_page = sd.flags & 0x0004 != 0; // bit 2 (HWP5 스펙, 첫쪽 바탕쪽 감춤)
     sd.hide_border = sd.flags & 0x0008 != 0;
     sd.hide_fill = sd.flags & 0x0010 != 0;
+    sd.hide_page_number = sd.flags & 0x0020 != 0;
     sd.hide_empty_line = sd.flags & 0x00080000 != 0; // bit 19: 빈 줄 감추기
     sd.page_num_type = ((sd.flags >> 20) & 0x03) as u8; // bit 20-21: 쪽 번호 종류 (0=이어서, 1=홀수, 2=짝수)
 
@@ -736,6 +737,7 @@ fn parse_column_def_ctrl(ctrl_data: &[u8]) -> ColumnDef {
     // bit 10-11: 단 방향
     cd.direction = match (attr >> 10) & 0x03 {
         1 => ColumnDirection::RightToLeft,
+        2 => ColumnDirection::Mirror,
         _ => ColumnDirection::LeftToRight,
     };
     // bit 12: 단 너비 동일 여부

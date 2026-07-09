@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::parser::cfb_reader::CfbReader;
+use crate::parser::crypto;
 use crate::parser::header;
 use crate::parser::record::Record;
 use crate::parser::tags;
@@ -192,7 +193,15 @@ pub fn build_inventory(path: &Path, section_filter: Option<u32>) -> Result<Hwp5I
         .to_string();
     let bytes =
         fs::read(path).map_err(|error| format!("파일 읽기 실패 - {source_path}: {error}"))?;
+    build_inventory_from_bytes(&source_path, &sample, &bytes, section_filter)
+}
 
+pub fn build_inventory_from_bytes(
+    source_path: &str,
+    sample: &str,
+    bytes: &[u8],
+    section_filter: Option<u32>,
+) -> Result<Hwp5Inventory, String> {
     let mut cfb = CfbReader::open(&bytes).map_err(|error| format!("CFB 열기 실패: {error}"))?;
     let stream_paths = cfb.list_streams();
     let header_data = cfb
@@ -212,8 +221,8 @@ pub fn build_inventory(path: &Path, section_filter: Option<u32>) -> Result<Hwp5I
         .map_err(|error| format!("DocInfo 읽기 실패: {error}"))?;
     append_record_items(
         &mut items,
-        &sample,
-        &source_path,
+        sample,
+        source_path,
         "/DocInfo",
         None,
         "DocInfo",
@@ -230,10 +239,16 @@ pub fn build_inventory(path: &Path, section_filter: Option<u32>) -> Result<Hwp5I
         let section_data = cfb
             .read_body_text_section(section, compressed, distribution)
             .map_err(|error| format!("BodyText Section{section} 읽기 실패: {error}"))?;
+        let section_data = if distribution {
+            crypto::decrypt_viewtext_section(&section_data, compressed)
+                .map_err(|error| format!("ViewText Section{section} 복호화 실패: {error}"))?
+        } else {
+            section_data
+        };
         append_record_items(
             &mut items,
-            &sample,
-            &source_path,
+            sample,
+            source_path,
             &stream_path,
             Some(section),
             "BodyText",
@@ -242,8 +257,8 @@ pub fn build_inventory(path: &Path, section_filter: Option<u32>) -> Result<Hwp5I
     }
 
     Ok(Hwp5Inventory {
-        source_path,
-        sample,
+        source_path: source_path.to_string(),
+        sample: sample.to_string(),
         compressed,
         encrypted,
         distribution,

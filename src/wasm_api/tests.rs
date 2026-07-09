@@ -14116,7 +14116,12 @@ fn test_save_table_1x1() {
     };
     let new_bf = BorderFill {
         raw_data: None,
+        raw_hwpx_children: None,
         attr: 0,
+        three_d: false,
+        shadow: false,
+        center_line: None,
+        break_cell_separate_line: false,
         borders: [solid_border, solid_border, solid_border, solid_border],
         diagonal: DiagonalLine {
             diagonal_type: 1,
@@ -16056,7 +16061,12 @@ fn test_save_pic_in_table() {
     };
     let new_bf = BorderFill {
         raw_data: None,
+        raw_hwpx_children: None,
         attr: 0,
+        three_d: false,
+        shadow: false,
+        center_line: None,
+        break_cell_separate_line: false,
         borders: [solid_border, solid_border, solid_border, solid_border],
         diagonal: DiagonalLine {
             diagonal_type: 1,

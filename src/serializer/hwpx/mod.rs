@@ -26,12 +26,12 @@ pub mod table;
 pub mod utils;
 pub mod writer;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::model::document::Document;
 
 use super::SerializeError;
-use content::BinDataEntry as ContentBinDataEntry;
+use content::{AuxiliaryEntry as ContentAuxiliaryEntry, BinDataEntry as ContentBinDataEntry};
 use context::SerializeContext;
 use writer::HwpxZipWriter;
 
@@ -111,6 +111,12 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
             .unwrap_or_else(|| SETTINGS_XML.as_bytes()),
     )?;
 
+    // 6b. History/track-change 등 IR 밖 보조 엔트리 — 원본 보존 우선.
+    let passthrough_aux_entries = passthrough_hwpx_aux_entries(doc);
+    for entry in &passthrough_aux_entries {
+        z.write_deflated(entry.path, entry.data)?;
+    }
+
     // 7. META-INF/container.rdf
     z.write_deflated("META-INF/container.rdf", META_INF_CONTAINER_RDF.as_bytes())?;
 
@@ -119,7 +125,7 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     //    3-way 단언(binaryItemIDRef ↔ manifest ↔ ZIP entry) 의 1차 출력 지점.
     let bin_entries = ctx.bin_data_entries();
     let mut zip_bin_entries: HashSet<String> = HashSet::new();
-    for entry in &bin_entries {
+    for entry in bin_entries.iter().filter(|entry| entry.is_embedded) {
         let data = doc
             .bin_data_content
             .iter()
@@ -134,6 +140,24 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
         zip_bin_entries.insert(entry.href.clone());
     }
 
+    // 8b. HWPX native OOXML chart payloads.
+    // Hancom-authored HWPX stores these under Chart/chartN.xml and section
+    // controls reference them via hp:chart@chartIDRef. They are not ordinary
+    // BinData manifest items, so keep them out of the BinData 3-way assertion.
+    for (bin_data_id, href) in ctx.ooxml_chart_entries() {
+        let data = doc
+            .bin_data_content
+            .iter()
+            .find(|b| b.id == bin_data_id)
+            .ok_or_else(|| {
+                SerializeError::XmlError(format!(
+                    "OOXML chart content 누락: bin_data_id={}",
+                    bin_data_id
+                ))
+            })?;
+        z.write_deflated(&href, &data.data)?;
+    }
+
     // 9. Contents/content.hpf — 항상 동적 경로 + BinData 매니페스트 엔트리
     let content_bin_entries: Vec<ContentBinDataEntry> = bin_entries
         .iter()
@@ -141,12 +165,14 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
             id: e.manifest_id.clone(),
             href: e.href.clone(),
             media_type: e.media_type.clone(),
+            is_embedded: e.is_embedded,
         })
         .collect();
     let content_hpf = content::write_content_hpf(
         &section_hrefs,
         &content_bin_entries,
         &master_items,
+        &content_auxiliary_entries(doc, &passthrough_aux_entries),
         doc.hwpx_aux_entry("Contents/content.hpf"),
     )?;
     z.write_deflated("Contents/content.hpf", &content_hpf)?;
@@ -170,13 +196,157 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     z.finish()
 }
 
+struct PassthroughHwpxAuxEntry<'a> {
+    path: &'a str,
+    data: &'a [u8],
+}
+
+fn passthrough_hwpx_aux_entries(doc: &Document) -> Vec<PassthroughHwpxAuxEntry<'_>> {
+    doc.hwpx_aux_entries
+        .iter()
+        .filter(|(path, _)| is_passthrough_hwpx_aux_path(path))
+        .map(|(path, data)| PassthroughHwpxAuxEntry {
+            path: path.as_str(),
+            data: data.as_slice(),
+        })
+        .collect()
+}
+
+fn content_auxiliary_entries(
+    doc: &Document,
+    entries: &[PassthroughHwpxAuxEntry<'_>],
+) -> Vec<ContentAuxiliaryEntry> {
+    let manifest_items = doc
+        .hwpx_aux_entry("Contents/content.hpf")
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(parse_manifest_items_by_href)
+        .unwrap_or_default();
+
+    let mut used_ids = HashSet::new();
+    entries
+        .iter()
+        .enumerate()
+        .map(|(idx, entry)| {
+            let (id, media_type) = manifest_items.get(entry.path).cloned().unwrap_or_else(|| {
+                (
+                    format!("rhwpAux{}", idx),
+                    infer_aux_media_type(entry.path).to_string(),
+                )
+            });
+            let id = unique_manifest_id(id, &mut used_ids);
+            ContentAuxiliaryEntry {
+                id,
+                href: entry.path.to_string(),
+                media_type,
+            }
+        })
+        .collect()
+}
+
+fn parse_manifest_items_by_href(xml: &str) -> BTreeMap<String, (String, String)> {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut buf = Vec::new();
+    let mut out = BTreeMap::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                if xml_local_name(e.name().as_ref()) == b"item" {
+                    let mut id = String::new();
+                    let mut href = String::new();
+                    let mut media_type = String::new();
+                    for attr in e.attributes().flatten() {
+                        match xml_local_name(attr.key.as_ref()) {
+                            b"id" => id = String::from_utf8_lossy(attr.value.as_ref()).to_string(),
+                            b"href" => {
+                                href = String::from_utf8_lossy(attr.value.as_ref()).to_string()
+                            }
+                            b"media-type" => {
+                                media_type =
+                                    String::from_utf8_lossy(attr.value.as_ref()).to_string()
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !href.is_empty() && !id.is_empty() {
+                        out.insert(href, (id, media_type));
+                    }
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    out
+}
+
+fn unique_manifest_id(id: String, used: &mut HashSet<String>) -> String {
+    if used.insert(id.clone()) {
+        return id;
+    }
+    for suffix in 1.. {
+        let candidate = format!("{id}_{suffix}");
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix loop should return")
+}
+
+fn infer_aux_media_type(path: &str) -> &'static str {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".xml") {
+        "application/xml"
+    } else if lower.ends_with(".txt") {
+        "text/plain"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn is_passthrough_hwpx_aux_path(path: &str) -> bool {
+    if path.ends_with('/') {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        p if p.starts_with("history/")
+            || p.starts_with("histories/")
+            || p.starts_with("trackchange/")
+            || p.starts_with("trackchanges/")
+            || p.starts_with("revision/")
+            || p.starts_with("revisions/")
+            || p.starts_with("contents/history/")
+            || p.starts_with("contents/histories/")
+            || p.starts_with("contents/trackchange/")
+            || p.starts_with("contents/trackchanges/")
+            || p.starts_with("contents/revision/")
+            || p.starts_with("contents/revisions/")
+    )
+}
+
+fn xml_local_name(name: &[u8]) -> &[u8] {
+    name.iter()
+        .rposition(|byte| *byte == b':')
+        .map(|idx| &name[idx + 1..])
+        .unwrap_or(name)
+}
+
 /// 3-way BinData 동기화 단언: `ctx.bin_data_entries()`, content.hpf manifest,
 /// ZIP entry 의 href 집합이 모두 일치하는지 확인.
 fn assert_bin_data_3way(
     bin_entries: &[context::BinDataEntry],
     zip_entries: &HashSet<String>,
 ) -> Result<(), SerializeError> {
-    let ctx_hrefs: HashSet<String> = bin_entries.iter().map(|e| e.href.clone()).collect();
+    let ctx_hrefs: HashSet<String> = bin_entries
+        .iter()
+        .filter(|e| e.is_embedded)
+        .map(|e| e.href.clone())
+        .collect();
     if ctx_hrefs != *zip_entries {
         let missing_zip: Vec<_> = ctx_hrefs.difference(zip_entries).cloned().collect();
         let orphan_zip: Vec<_> = zip_entries.difference(&ctx_hrefs).cloned().collect();
@@ -356,6 +526,7 @@ mod tests {
             unknown: 0,
             font_name: "HYhwpEQ".to_string(),
             version_info: "Equation Version 60".to_string(),
+            line_mode: "CHAR".to_string(),
             raw_ctrl_data: Vec::new(),
         })));
         section.paragraphs.push(para);
@@ -377,6 +548,10 @@ mod tests {
             "script XML missing: {}",
             xml
         );
+        assert!(
+            xml.contains(r#"lineMode="CHAR""#),
+            "lineMode missing: {xml}"
+        );
         drop(sec0);
 
         let parsed = parse_hwpx(&bytes).expect("parse back");
@@ -394,6 +569,7 @@ mod tests {
                 assert_eq!(eq.baseline, 120);
                 assert_eq!(eq.font_name, "HYhwpEQ");
                 assert_eq!(eq.version_info, "Equation Version 60");
+                assert_eq!(eq.line_mode, "CHAR");
                 assert!(eq.common.treat_as_char);
                 assert_eq!(eq.common.width, 2400);
                 assert_eq!(eq.common.height, 1200);

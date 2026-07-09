@@ -11,7 +11,7 @@
 use std::fs;
 use std::path::Path;
 
-use rhwp::document_core::DocumentCore;
+use rhwp::document_core::{DocumentCore, TextReplaceLayoutPolicy};
 use rhwp::model::control::Control;
 use rhwp::model::document::Document;
 use rhwp::model::shape::ShapeObject;
@@ -70,6 +70,11 @@ fn parse_replace_result(result: &str) -> (bool, u64) {
     )
 }
 
+fn parse_json_result(result: &str) -> serde_json::Value {
+    serde_json::from_str(result)
+        .unwrap_or_else(|e| panic!("replace 반환 JSON 파싱 실패: {e}: {result}"))
+}
+
 fn load(sample: &str) -> (DocumentCore, Vec<u8>) {
     let repo_root = env!("CARGO_MANIFEST_DIR");
     let path = Path::new(repo_root).join(sample);
@@ -118,7 +123,7 @@ fn replace_all_body_text_survives_hwp_export() {
 fn replace_all_table_cell_text_survives_hwp_export() {
     let (mut core, _) = load("samples/복학원서.hwp");
 
-    let needle = "복학원을 제출합니다";
+    let needle = "복 학 원 서 접 수 증";
     let marker = "RT1385CELL";
     let before = collect_all_text(core.document());
     assert!(before.contains(needle), "sample should contain cell needle");
@@ -139,5 +144,43 @@ fn replace_all_table_cell_text_survives_hwp_export() {
     assert!(
         after.contains(marker),
         "cell replacement must survive export → reparse (#1385)"
+    );
+}
+
+/// MCP `rhwp_replace_text`의 query 기반 단일 치환 경로도 표 셀 첫 매치를 찾아야 한다.
+#[test]
+fn replace_one_query_table_cell_text_survives_hwp_export() {
+    let (mut core, _) = load("samples/복학원서.hwp");
+
+    let needle = "복 학 원 서 접 수 증";
+    let marker = "RT1385ONECELL";
+    let before = collect_all_text(core.document());
+    assert!(before.contains(needle), "sample should contain cell needle");
+    assert!(!before.contains(marker), "marker must not pre-exist");
+
+    let result = core
+        .replace_one_with_layout_policy_native(
+            needle,
+            marker,
+            true,
+            TextReplaceLayoutPolicy::Reflow,
+        )
+        .expect("replace_one query should succeed");
+    let value = parse_json_result(&result);
+    assert_eq!(value["ok"].as_bool(), Some(true), "replace_one: {result}");
+    assert!(
+        value["cellContext"].is_object(),
+        "single query replace should report nested cell context: {result}"
+    );
+
+    let exported = core
+        .export_hwp_with_adapter()
+        .expect("export_hwp should succeed after cell replace_one");
+    let reparsed = DocumentCore::from_bytes(&exported).expect("reparse exported bytes");
+
+    let after = collect_all_text(reparsed.document());
+    assert!(
+        after.contains(marker),
+        "single cell replacement must survive export → reparse"
     );
 }

@@ -56,6 +56,13 @@ const result = await editor.loadFile(buffer, 'document.hwp');
 console.log(`${result.pageCount}페이지 로드 완료`);
 ```
 
+## 빈 문서 생성
+
+```javascript
+const result = await editor.newDocument();
+console.log(`${result.pageCount}페이지 새 문서 생성`);
+```
+
 ## API
 
 ### createEditor(container, options?)
@@ -75,6 +82,71 @@ const editor = await createEditor(document.getElementById('editor'));
 | `studioUrl` | `https://edwardkim.github.io/rhwp/` | rhwp-studio URL |
 | `width` | `'100%'` | iframe 너비 |
 | `height` | `'100%'` | iframe 높이 |
+
+### AI 사이드 패널 설정
+
+임베드한 에디터에서도 우측 AI 패널을 열고 provider/API 설정을 등록할 수 있습니다.
+`configureAi()` 응답에는 API key나 bearer token 원문이 포함되지 않고
+`hasApiKey`/`hasBearerToken`만 반환됩니다.
+
+```javascript
+const editor = await createEditor('#editor');
+
+await editor.configureAi({
+  provider: 'openai',
+  authMode: 'apiKey',
+  model: 'gpt-5.5',
+  apiKey: import.meta.env.VITE_OPENAI_API_KEY,
+});
+
+await editor.openAiPanel(true);
+```
+
+Claude API key 또는 bearer token도 같은 방식으로 등록합니다.
+
+```javascript
+await editor.configureAi({
+  provider: 'anthropic',
+  authMode: 'apiKey',
+  model: 'claude-sonnet-5',
+  apiKey: import.meta.env.VITE_ANTHROPIC_API_KEY,
+});
+```
+
+Gemini API도 같은 `configureAi()` 경로로 등록할 수 있습니다.
+
+```javascript
+await editor.configureAi({
+  provider: 'gemini',
+  authMode: 'apiKey',
+  model: 'gemini-flash-latest',
+  apiKey: import.meta.env.VITE_GEMINI_API_KEY,
+});
+```
+
+OAuth 또는 WIF 기반 토큰 교환은 브라우저가 provider와 직접 client secret을
+주고받지 않도록 프로젝트의 token broker를 거치게 하세요. broker는
+`{ provider, client_id, scope }` JSON을 받아 `{ access_token }` 또는
+`{ token }`을 반환해야 합니다.
+
+```javascript
+await editor.configureAi({
+  provider: 'anthropic',
+  authMode: 'bearer',
+  model: 'claude-sonnet-5',
+  oauthEndpoint: '/api/ai-token',
+  oauthClientId: 'rhwp-editor',
+  oauthScope: 'claude.messages',
+});
+
+await editor.refreshAiOAuthToken();
+```
+
+Codex access token은 Codex local 자동화용 토큰이므로 일반 OpenAI/Gemini/Claude
+API 호출용 credential로 브라우저에 주입하지 마세요.
+
+운영 환경에서는 API key를 브라우저 번들에 직접 넣지 말고 서버 프록시나 token
+broker를 사용하는 구성이 안전합니다.
 
 ### editor.loadFile(data, fileName?)
 

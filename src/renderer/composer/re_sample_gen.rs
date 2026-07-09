@@ -35,6 +35,7 @@ mod tests {
             }
             fonts.push(crate::model::style::Font {
                 raw_data: None,
+                raw_hwpx_children: None,
                 name: name.to_string(),
                 alt_type: 0,
                 alt_name: None,

@@ -439,6 +439,7 @@ fn test_roundtrip_group_picture_child() {
             ..Default::default()
         },
         children: vec![ShapeObject::Picture(Box::new(pic))],
+        raw_component_extra: Vec::new(),
         caption: None,
     };
 

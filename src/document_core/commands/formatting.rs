@@ -8,6 +8,7 @@ use crate::document_core::DocumentCore;
 use crate::error::HwpError;
 use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
+use crate::model::header_footer::HeaderFooterApply;
 use crate::model::paragraph::Paragraph;
 use crate::renderer::composer::reflow_line_segs;
 use crate::renderer::page_layout::PageLayoutInfo;
@@ -43,6 +44,14 @@ fn body_available_width_for_para_shape(
     let margin_left = para_style.map(|s| s.margin_left).unwrap_or(0.0);
     let margin_right = para_style.map(|s| s.margin_right).unwrap_or(0.0);
     (col_width - margin_left - margin_right).max(1.0)
+}
+
+fn header_footer_apply_from_u8(v: u8) -> HeaderFooterApply {
+    match v {
+        1 => HeaderFooterApply::Even,
+        2 => HeaderFooterApply::Odd,
+        _ => HeaderFooterApply::Both,
+    }
 }
 
 impl DocumentCore {
@@ -783,8 +792,12 @@ impl DocumentCore {
                 let page_break_before = ((a1 >> 19) & 1 != 0) || ((a2 >> 8) & 1 != 0);
                 let font_line_height = (a1 >> 22) & 1 != 0;
                 let single_line = (a2 & 0x03) != 0;
-                let auto_space_kr_en = ((a2 >> 4) & 1 != 0) || ((a1 >> 20) & 1 != 0);
-                let auto_space_kr_num = ((a2 >> 5) & 1 != 0) || ((a1 >> 21) & 1 != 0);
+                let auto_space_kr_en = raw_ps
+                    .and_then(|r| r.auto_spacing_easian_eng)
+                    .unwrap_or_else(|| ((a2 >> 4) & 1 != 0) || ((a1 >> 20) & 1 != 0));
+                let auto_space_kr_num = raw_ps
+                    .and_then(|r| r.auto_spacing_easian_num)
+                    .unwrap_or_else(|| ((a2 >> 5) & 1 != 0) || ((a1 >> 21) & 1 != 0));
                 // verticalAlign: attr1 bits 20-21 (autoSpacing과 충돌 시 0)
                 let vertical_align = if !auto_space_kr_en && !auto_space_kr_num {
                     (a1 >> 20) & 0x03
@@ -871,6 +884,7 @@ impl DocumentCore {
         // 없으면 7개 전체 카테고리에 동일 이름으로 신규 등록
         let new_font = crate::model::style::Font {
             raw_data: None,
+            raw_hwpx_children: None,
             name: name.to_string(),
             alt_type: 0,
             alt_name: None,
@@ -918,6 +932,7 @@ impl DocumentCore {
         // 없으면 해당 카테고리에만 등록 (다른 언어 카테고리 font_faces 길이 맞추기)
         let new_font = crate::model::style::Font {
             raw_data: None,
+            raw_hwpx_children: None,
             name: name.to_string(),
             alt_type: 0,
             alt_name: None,
@@ -1500,6 +1515,131 @@ impl DocumentCore {
         Ok("{\"ok\":true}".to_string())
     }
 
+    /// 글자 서식 적용 (네이티브) — 중첩 cell_path 문단.
+    pub fn apply_char_format_in_cell_by_path_native(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        start_offset: usize,
+        end_offset: usize,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("셀 경로가 비어있습니다".to_string()));
+        }
+
+        let mut mods = parse_char_shape_mods(props_json);
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+
+        let base_id = self
+            .resolve_paragraph_by_path(sec_idx, parent_para_idx, path)?
+            .char_shape_id_at(start_offset)
+            .unwrap_or(0);
+        let new_id = self.document.find_or_create_char_shape(base_id, &mods);
+
+        {
+            let cell_para = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            cell_para.apply_char_shape_range(start_offset, end_offset, new_id);
+        }
+
+        if char_shape_mods_affect_text_flow(&mods) {
+            let dpi = self.dpi;
+            let styles = resolve_styles(&self.document.doc_info, dpi);
+            let para_shape_id = self
+                .resolve_paragraph_by_path(sec_idx, parent_para_idx, path)?
+                .para_shape_id;
+            let available_width =
+                body_available_width_for_para_shape(self, sec_idx, para_shape_id, &styles);
+            let cell_para = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            cell_para.line_segs.clear();
+            reflow_line_segs(cell_para, available_width, &styles, dpi);
+        }
+
+        self.mark_cell_control_dirty(sec_idx, parent_para_idx, path[0].0);
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::CharFormatChanged {
+            section: sec_idx,
+            para: parent_para_idx,
+            start: start_offset,
+            end: end_offset,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 문단 서식 적용 (네이티브) — 중첩 cell_path 문단.
+    pub fn apply_para_format_in_cell_by_path_native(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("셀 경로가 비어있습니다".to_string()));
+        }
+
+        let mut mods = parse_para_shape_mods(props_json);
+
+        if json_has_tab_keys(props_json) {
+            let para = self.resolve_paragraph_by_path(sec_idx, parent_para_idx, path)?;
+            let base_tab_def_id = self
+                .document
+                .doc_info
+                .para_shapes
+                .get(para.para_shape_id as usize)
+                .map(|ps| ps.tab_def_id)
+                .unwrap_or(0);
+            let new_td = build_tab_def_from_json(
+                props_json,
+                base_tab_def_id,
+                &self.document.doc_info.tab_defs,
+            );
+            let new_tab_id = self.document.find_or_create_tab_def(new_td);
+            mods.tab_def_id = Some(new_tab_id);
+        }
+
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+        if let Some(arr) = parse_json_i16_array(props_json, "borderSpacing", 4) {
+            mods.border_spacing = Some([arr[0], arr[1], arr[2], arr[3]]);
+        }
+
+        let base_id = self
+            .resolve_paragraph_by_path(sec_idx, parent_para_idx, path)?
+            .para_shape_id;
+        let new_id = self.document.find_or_create_para_shape(base_id, &mods);
+
+        {
+            let cell_para = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            cell_para.para_shape_id = new_id;
+        }
+
+        if mods.line_spacing.is_some() || mods.line_spacing_type.is_some() {
+            let dpi = self.dpi;
+            let styles = resolve_styles(&self.document.doc_info, dpi);
+            let available_width =
+                body_available_width_for_para_shape(self, sec_idx, new_id, &styles);
+            let cell_para = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            reflow_line_segs(cell_para, available_width, &styles, dpi);
+        }
+
+        self.mark_cell_control_dirty(sec_idx, parent_para_idx, path[0].0);
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::ParaFormatChanged {
+            section: sec_idx,
+            para: parent_para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
     /// 문단 서식 ID 직접 복원 (네이티브) — 셀 내 문단.
     pub fn set_cell_para_shape_id_native(
         &mut self,
@@ -1908,6 +2048,489 @@ impl DocumentCore {
             para: parent_para_idx,
         });
         Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 스타일 적용 (네이티브) — 중첩 cell_path 문단.
+    pub fn apply_style_in_cell_by_path_native(
+        &mut self,
+        sec_idx: usize,
+        parent_para_idx: usize,
+        path: &[(usize, usize, usize)],
+        style_id: usize,
+    ) -> Result<String, HwpError> {
+        if path.is_empty() {
+            return Err(HwpError::RenderError("셀 경로가 비어있습니다".to_string()));
+        }
+        if style_id > u8::MAX as usize {
+            return Err(HwpError::RenderError(format!(
+                "스타일 {}은 HWP 문단 style_id 범위를 초과합니다",
+                style_id
+            )));
+        }
+        let style = self
+            .document
+            .doc_info
+            .styles
+            .get(style_id)
+            .cloned()
+            .ok_or_else(|| HwpError::RenderError(format!("스타일 {} 범위 초과", style_id)))?;
+        let new_char_shape_id = style.char_shape_id as u32;
+
+        let (current_style_id, current_psid) = self
+            .resolve_paragraph_by_path(sec_idx, parent_para_idx, path)
+            .map(|p| (p.style_id, p.para_shape_id))?;
+        let old_style = self
+            .document
+            .doc_info
+            .styles
+            .get(current_style_id as usize)
+            .cloned();
+
+        if style.style_type == 1 {
+            let para_shape_id = self
+                .resolve_paragraph_by_path(sec_idx, parent_para_idx, path)?
+                .para_shape_id;
+            let dpi = self.dpi;
+            let styles = resolve_styles(&self.document.doc_info, dpi);
+            let available_width =
+                body_available_width_for_para_shape(self, sec_idx, para_shape_id, &styles);
+            let text_len = {
+                let cell_para =
+                    self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+                cell_para.apply_char_shape_to_entire_text(new_char_shape_id);
+                cell_para.line_segs.clear();
+                reflow_line_segs(cell_para, available_width, &styles, dpi);
+                cell_para.text.chars().count()
+            };
+
+            self.mark_cell_control_dirty(sec_idx, parent_para_idx, path[0].0);
+            self.document.sections[sec_idx].raw_stream = None;
+            self.rebuild_section(sec_idx);
+            self.event_log.push(DocumentEvent::CharFormatChanged {
+                section: sec_idx,
+                para: parent_para_idx,
+                start: 0,
+                end: text_len,
+            });
+            return Ok("{\"ok\":true}".to_string());
+        }
+
+        let new_para_shape_id = match old_style.as_ref() {
+            Some(old) if current_psid != old.para_shape_id => current_psid,
+            _ => self.resolve_style_para_shape_id(style_id, current_psid),
+        };
+
+        let dpi = self.dpi;
+        let styles = resolve_styles(&self.document.doc_info, dpi);
+        let available_width =
+            body_available_width_for_para_shape(self, sec_idx, new_para_shape_id, &styles);
+
+        {
+            let cell_para = self.get_cell_paragraph_mut_by_path(sec_idx, parent_para_idx, path)?;
+            cell_para.style_id = style_id as u8;
+            cell_para.para_shape_id = new_para_shape_id;
+            if let Some(old) = old_style {
+                cell_para.replace_style_char_shape_preserving_overrides(
+                    old.char_shape_id as u32,
+                    new_char_shape_id,
+                );
+            } else {
+                cell_para.set_single_char_shape(new_char_shape_id);
+            }
+            cell_para.line_segs.clear();
+            reflow_line_segs(cell_para, available_width, &styles, dpi);
+        }
+
+        self.mark_cell_control_dirty(sec_idx, parent_para_idx, path[0].0);
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::ParaFormatChanged {
+            section: sec_idx,
+            para: parent_para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 스타일 적용 (네이티브) — header/footer 일반 문단.
+    pub fn apply_header_footer_style_native(
+        &mut self,
+        sec_idx: usize,
+        is_header: bool,
+        apply_to: u8,
+        hf_para_idx: usize,
+        style_id: usize,
+    ) -> Result<String, HwpError> {
+        if style_id > u8::MAX as usize {
+            return Err(HwpError::RenderError(format!(
+                "스타일 {}은 HWP 문단 style_id 범위를 초과합니다",
+                style_id
+            )));
+        }
+        let style = self
+            .document
+            .doc_info
+            .styles
+            .get(style_id)
+            .cloned()
+            .ok_or_else(|| HwpError::RenderError(format!("스타일 {} 범위 초과", style_id)))?;
+        let new_char_shape_id = style.char_shape_id as u32;
+        let apply = header_footer_apply_from_u8(apply_to);
+
+        let (outer_para_idx, outer_control_idx, current_style_id, current_psid) = {
+            let section = self
+                .document
+                .sections
+                .get(sec_idx)
+                .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx)))?;
+            let mut found = None;
+            'outer: for (para_idx, para) in section.paragraphs.iter().enumerate() {
+                for (control_idx, control) in para.controls.iter().enumerate() {
+                    let paragraphs = match control {
+                        Control::Header(header) if is_header && header.apply_to == apply => {
+                            Some(header.paragraphs.as_slice())
+                        }
+                        Control::Footer(footer) if !is_header && footer.apply_to == apply => {
+                            Some(footer.paragraphs.as_slice())
+                        }
+                        _ => None,
+                    };
+                    if let Some(paragraphs) = paragraphs {
+                        let hf_para = paragraphs.get(hf_para_idx).ok_or_else(|| {
+                            let kind = if is_header { "머리말" } else { "꼬리말" };
+                            HwpError::RenderError(format!(
+                                "{} 문단 {} 범위 초과 (총 {}개)",
+                                kind,
+                                hf_para_idx,
+                                paragraphs.len()
+                            ))
+                        })?;
+                        found = Some((
+                            para_idx,
+                            control_idx,
+                            hf_para.style_id,
+                            hf_para.para_shape_id,
+                        ));
+                        break 'outer;
+                    }
+                }
+            }
+            found.ok_or_else(|| {
+                let kind = if is_header { "머리말" } else { "꼬리말" };
+                HwpError::RenderError(format!("{}이 존재하지 않습니다", kind))
+            })?
+        };
+        let old_style = self
+            .document
+            .doc_info
+            .styles
+            .get(current_style_id as usize)
+            .cloned();
+
+        if style.style_type == 1 {
+            let text_len = {
+                let section =
+                    self.document.sections.get_mut(sec_idx).ok_or_else(|| {
+                        HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx))
+                    })?;
+                let outer_para = section.paragraphs.get_mut(outer_para_idx).ok_or_else(|| {
+                    HwpError::RenderError(format!("문단 {} 범위 초과", outer_para_idx))
+                })?;
+                let control = outer_para
+                    .controls
+                    .get_mut(outer_control_idx)
+                    .ok_or_else(|| {
+                        HwpError::RenderError(format!("컨트롤 {} 범위 초과", outer_control_idx))
+                    })?;
+                let paragraphs = match control {
+                    Control::Header(header) => header.paragraphs.as_mut_slice(),
+                    Control::Footer(footer) => footer.paragraphs.as_mut_slice(),
+                    _ => {
+                        return Err(HwpError::RenderError(
+                            "지정된 컨트롤이 머리말/꼬리말이 아닙니다".to_string(),
+                        ))
+                    }
+                };
+                let hf_para = paragraphs.get_mut(hf_para_idx).ok_or_else(|| {
+                    HwpError::RenderError(format!("header/footer 문단 {} 범위 초과", hf_para_idx))
+                })?;
+                hf_para.apply_char_shape_to_entire_text(new_char_shape_id);
+                hf_para.line_segs.clear();
+                hf_para.text.chars().count()
+            };
+
+            self.reflow_hf_paragraph(sec_idx, is_header, apply_to, hf_para_idx);
+            self.document.sections[sec_idx].raw_stream = None;
+            self.rebuild_section(sec_idx);
+            self.event_log.push(DocumentEvent::CharFormatChanged {
+                section: sec_idx,
+                para: outer_para_idx,
+                start: 0,
+                end: text_len,
+            });
+            return Ok("{\"ok\":true}".to_string());
+        }
+
+        let new_para_shape_id = match old_style.as_ref() {
+            Some(old) if current_psid != old.para_shape_id => current_psid,
+            _ => self.resolve_style_para_shape_id(style_id, current_psid),
+        };
+
+        {
+            let section = self
+                .document
+                .sections
+                .get_mut(sec_idx)
+                .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx)))?;
+            let outer_para = section.paragraphs.get_mut(outer_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("문단 {} 범위 초과", outer_para_idx))
+            })?;
+            let control = outer_para
+                .controls
+                .get_mut(outer_control_idx)
+                .ok_or_else(|| {
+                    HwpError::RenderError(format!("컨트롤 {} 범위 초과", outer_control_idx))
+                })?;
+            let paragraphs = match control {
+                Control::Header(header) => header.paragraphs.as_mut_slice(),
+                Control::Footer(footer) => footer.paragraphs.as_mut_slice(),
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "지정된 컨트롤이 머리말/꼬리말이 아닙니다".to_string(),
+                    ))
+                }
+            };
+            let hf_para = paragraphs.get_mut(hf_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("header/footer 문단 {} 범위 초과", hf_para_idx))
+            })?;
+            hf_para.style_id = style_id as u8;
+            hf_para.para_shape_id = new_para_shape_id;
+            if let Some(old) = old_style {
+                hf_para.replace_style_char_shape_preserving_overrides(
+                    old.char_shape_id as u32,
+                    new_char_shape_id,
+                );
+            } else {
+                hf_para.set_single_char_shape(new_char_shape_id);
+            }
+            hf_para.line_segs.clear();
+        }
+
+        self.reflow_hf_paragraph(sec_idx, is_header, apply_to, hf_para_idx);
+        self.document.sections[sec_idx].raw_stream = None;
+        self.rebuild_section(sec_idx);
+        self.event_log.push(DocumentEvent::ParaFormatChanged {
+            section: sec_idx,
+            para: outer_para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 스타일 적용 (네이티브) — header/footer 안 표 셀 문단.
+    pub fn apply_header_footer_cell_style_native(
+        &mut self,
+        sec_idx: usize,
+        outer_para_idx: usize,
+        outer_control_idx: usize,
+        inner_para_idx: usize,
+        inner_control_idx: usize,
+        cell_idx: usize,
+        cell_para_idx: usize,
+        style_id: usize,
+    ) -> Result<String, HwpError> {
+        if style_id > u8::MAX as usize {
+            return Err(HwpError::RenderError(format!(
+                "스타일 {}은 HWP 문단 style_id 범위를 초과합니다",
+                style_id
+            )));
+        }
+        let style = self
+            .document
+            .doc_info
+            .styles
+            .get(style_id)
+            .cloned()
+            .ok_or_else(|| HwpError::RenderError(format!("스타일 {} 범위 초과", style_id)))?;
+        let new_char_shape_id = style.char_shape_id as u32;
+
+        let (current_style_id, current_psid) = {
+            let section = self
+                .document
+                .sections
+                .get(sec_idx)
+                .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx)))?;
+            let outer_para = section.paragraphs.get(outer_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("문단 {} 범위 초과", outer_para_idx))
+            })?;
+            let outer_ctrl = outer_para.controls.get(outer_control_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("컨트롤 {} 범위 초과", outer_control_idx))
+            })?;
+            let inner_paragraphs = match outer_ctrl {
+                Control::Header(header) => header.paragraphs.as_slice(),
+                Control::Footer(footer) => footer.paragraphs.as_slice(),
+                _ => {
+                    return Err(HwpError::RenderError(
+                        "지정된 컨트롤이 머리말/꼬리말이 아닙니다".to_string(),
+                    ))
+                }
+            };
+            let inner_para = inner_paragraphs.get(inner_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("header/footer 문단 {} 범위 초과", inner_para_idx))
+            })?;
+            let table = inner_para
+                .controls
+                .get(inner_control_idx)
+                .and_then(|control| match control {
+                    Control::Table(table) => Some(table.as_ref()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    HwpError::RenderError(format!(
+                        "inner control {}이 header/footer 표가 아닙니다",
+                        inner_control_idx
+                    ))
+                })?;
+            let cell = table
+                .cells
+                .get(cell_idx)
+                .ok_or_else(|| HwpError::RenderError(format!("셀 {} 범위 초과", cell_idx)))?;
+            let cell_para = cell.paragraphs.get(cell_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("셀 문단 {} 범위 초과", cell_para_idx))
+            })?;
+            (cell_para.style_id, cell_para.para_shape_id)
+        };
+        let old_style = self
+            .document
+            .doc_info
+            .styles
+            .get(current_style_id as usize)
+            .cloned();
+
+        if style.style_type == 1 {
+            let text_len = {
+                let table = self.header_footer_table_mut_by_indices(
+                    sec_idx,
+                    outer_para_idx,
+                    outer_control_idx,
+                    inner_para_idx,
+                    inner_control_idx,
+                )?;
+                let cell = table
+                    .cells
+                    .get_mut(cell_idx)
+                    .ok_or_else(|| HwpError::RenderError(format!("셀 {} 범위 초과", cell_idx)))?;
+                let cell_para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                    HwpError::RenderError(format!("셀 문단 {} 범위 초과", cell_para_idx))
+                })?;
+                cell_para.apply_char_shape_to_entire_text(new_char_shape_id);
+                cell_para.line_segs.clear();
+                table.dirty = true;
+                cell_para.text.chars().count()
+            };
+
+            self.document.sections[sec_idx].raw_stream = None;
+            self.recompose_section(sec_idx);
+            self.paginate_if_needed();
+            self.event_log.push(DocumentEvent::CharFormatChanged {
+                section: sec_idx,
+                para: outer_para_idx,
+                start: 0,
+                end: text_len,
+            });
+            return Ok("{\"ok\":true}".to_string());
+        }
+
+        let new_para_shape_id = match old_style.as_ref() {
+            Some(old) if current_psid != old.para_shape_id => current_psid,
+            _ => self.resolve_style_para_shape_id(style_id, current_psid),
+        };
+
+        {
+            let table = self.header_footer_table_mut_by_indices(
+                sec_idx,
+                outer_para_idx,
+                outer_control_idx,
+                inner_para_idx,
+                inner_control_idx,
+            )?;
+            let cell = table
+                .cells
+                .get_mut(cell_idx)
+                .ok_or_else(|| HwpError::RenderError(format!("셀 {} 범위 초과", cell_idx)))?;
+            let cell_para = cell.paragraphs.get_mut(cell_para_idx).ok_or_else(|| {
+                HwpError::RenderError(format!("셀 문단 {} 범위 초과", cell_para_idx))
+            })?;
+            cell_para.style_id = style_id as u8;
+            cell_para.para_shape_id = new_para_shape_id;
+            if let Some(old) = old_style {
+                cell_para.replace_style_char_shape_preserving_overrides(
+                    old.char_shape_id as u32,
+                    new_char_shape_id,
+                );
+            } else {
+                cell_para.set_single_char_shape(new_char_shape_id);
+            }
+            cell_para.line_segs.clear();
+            table.dirty = true;
+        }
+
+        self.document.sections[sec_idx].raw_stream = None;
+        self.recompose_section(sec_idx);
+        self.paginate_if_needed();
+        self.event_log.push(DocumentEvent::ParaFormatChanged {
+            section: sec_idx,
+            para: outer_para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    fn header_footer_table_mut_by_indices(
+        &mut self,
+        sec_idx: usize,
+        outer_para_idx: usize,
+        outer_control_idx: usize,
+        inner_para_idx: usize,
+        inner_control_idx: usize,
+    ) -> Result<&mut crate::model::table::Table, HwpError> {
+        let section = self
+            .document
+            .sections
+            .get_mut(sec_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", sec_idx)))?;
+        let outer_para = section
+            .paragraphs
+            .get_mut(outer_para_idx)
+            .ok_or_else(|| HwpError::RenderError(format!("문단 {} 범위 초과", outer_para_idx)))?;
+        let outer_ctrl = outer_para
+            .controls
+            .get_mut(outer_control_idx)
+            .ok_or_else(|| {
+                HwpError::RenderError(format!("컨트롤 {} 범위 초과", outer_control_idx))
+            })?;
+        let inner_paragraphs = match outer_ctrl {
+            Control::Header(header) => &mut header.paragraphs,
+            Control::Footer(footer) => &mut footer.paragraphs,
+            _ => {
+                return Err(HwpError::RenderError(
+                    "지정된 컨트롤이 머리말/꼬리말이 아닙니다".to_string(),
+                ))
+            }
+        };
+        let inner_para = inner_paragraphs.get_mut(inner_para_idx).ok_or_else(|| {
+            HwpError::RenderError(format!("header/footer 문단 {} 범위 초과", inner_para_idx))
+        })?;
+        inner_para
+            .controls
+            .get_mut(inner_control_idx)
+            .and_then(|control| match control {
+                Control::Table(table) => Some(table.as_mut()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                HwpError::RenderError(format!(
+                    "inner control {}이 header/footer 표가 아닙니다",
+                    inner_control_idx
+                ))
+            })
     }
 
     /// 본문 문단에 글자 서식 적용 헬퍼

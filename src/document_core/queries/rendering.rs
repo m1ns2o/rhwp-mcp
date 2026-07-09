@@ -13,7 +13,7 @@ use crate::renderer::composer::{compose_paragraph, compose_section, ComposedPara
 use crate::renderer::height_measurer::{HeightMeasurer, MeasuredSection, MeasuredTable};
 use crate::renderer::html::HtmlRenderer;
 use crate::renderer::layer_renderer::LayerRenderer;
-use crate::renderer::layout::LayoutEngine;
+use crate::renderer::layout::{LayoutEngine, LayoutOverflow};
 use crate::renderer::page_layout::PageLayoutInfo;
 use crate::renderer::pagination::{MasterPageRef, PageContent, PaginationResult, Paginator};
 use crate::renderer::render_tree::PageRenderTree;
@@ -22,6 +22,26 @@ use crate::renderer::svg::SvgRenderer;
 use crate::renderer::svg_layer::SvgLayerRenderer;
 use std::cell::RefCell;
 use std::fmt::Write as _;
+
+fn normalize_section_visibility_value(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("HIDE_FIRST") || value.eq_ignore_ascii_case("HIDE_ALL") {
+        Some("HIDE_FIRST")
+    } else if value.eq_ignore_ascii_case("SHOW_FIRST") {
+        Some("SHOW_FIRST")
+    } else if value.eq_ignore_ascii_case("SHOW_ALL") {
+        Some("SHOW_ALL")
+    } else {
+        None
+    }
+}
+
+fn section_visibility_value(value: &str, hide_first: bool) -> &'static str {
+    normalize_section_visibility_value(value).unwrap_or(if hide_first {
+        "HIDE_FIRST"
+    } else {
+        "SHOW_ALL"
+    })
+}
 
 fn uses_hwp3_origin_page_tolerance(document: &Document) -> bool {
     let total_paragraphs: usize = document.sections.iter().map(|s| s.paragraphs.len()).sum();
@@ -242,8 +262,16 @@ impl DocumentCore {
 
     /// 페이지 레이어 트리를 생성하여 반환한다 (native bridge / backend replay용).
     pub fn build_page_layer_tree(&self, page_num: u32) -> Result<PageLayerTree, HwpError> {
+        let (tree, _overflows) = self.build_page_layer_tree_with_overflows(page_num)?;
+        Ok(tree)
+    }
+
+    pub fn build_page_layer_tree_with_overflows(
+        &self,
+        page_num: u32,
+    ) -> Result<(PageLayerTree, Vec<LayoutOverflow>), HwpError> {
         let tree = self.build_page_tree_cached(page_num)?;
-        let _overflows = self.layout_engine.take_overflows();
+        let overflows = self.layout_engine.take_overflows();
         let output_options = LayerOutputOptions {
             show_paragraph_marks: self.show_paragraph_marks,
             show_control_codes: self.show_control_codes,
@@ -253,7 +281,7 @@ impl DocumentCore {
         };
         let mut builder =
             LayerBuilder::new(RenderProfile::Screen).with_output_options(output_options);
-        Ok(builder.build(&tree))
+        Ok((builder.build(&tree), overflows))
     }
 
     /// 바이너리 데이터를 0-based `bin_data_content` 인덱스로 반환한다.
@@ -265,34 +293,68 @@ impl DocumentCore {
     }
 
     pub fn render_page_svg_native(&self, page_num: u32) -> Result<String, HwpError> {
+        let (svg, _overflows) = self.render_page_svg_native_with_overflows(page_num)?;
+        Ok(svg)
+    }
+
+    pub fn render_page_svg_native_with_overflows(
+        &self,
+        page_num: u32,
+    ) -> Result<(String, Vec<LayoutOverflow>), HwpError> {
         if matches!(
             std::env::var("RHWP_RENDER_PATH").ok().as_deref(),
             Some("layer-svg")
         ) {
-            return self.render_page_svg_layer_native(page_num);
+            return self.render_page_svg_layer_native_with_overflows(page_num);
         }
-        self.render_page_svg_legacy_native(page_num)
+        self.render_page_svg_legacy_native_with_overflows(page_num)
     }
 
     pub fn render_page_svg_legacy_native(&self, page_num: u32) -> Result<String, HwpError> {
+        let (svg, _overflows) = self.render_page_svg_legacy_native_with_overflows(page_num)?;
+        Ok(svg)
+    }
+
+    pub fn render_page_svg_legacy_native_with_overflows(
+        &self,
+        page_num: u32,
+    ) -> Result<(String, Vec<LayoutOverflow>), HwpError> {
         let tree = self.build_page_tree(page_num)?;
-        let _overflows = self.layout_engine.take_overflows();
+        let overflows = self.layout_engine.take_overflows();
         let mut renderer = SvgRenderer::new();
         renderer.show_paragraph_marks = self.show_paragraph_marks;
         renderer.show_control_codes = self.show_control_codes;
         renderer.debug_overlay = self.debug_overlay;
         renderer.render_tree(&tree);
-        Ok(renderer.output().to_string())
+        Ok((renderer.output().to_string(), overflows))
     }
 
     pub fn render_page_svg_layer_native(&self, page_num: u32) -> Result<String, HwpError> {
-        let layer_tree = self.build_page_layer_tree(page_num)?;
+        let (svg, _overflows) = self.render_page_svg_layer_native_with_overflows(page_num)?;
+        Ok(svg)
+    }
+
+    pub fn render_page_svg_layer_native_with_overflows(
+        &self,
+        page_num: u32,
+    ) -> Result<(String, Vec<LayoutOverflow>), HwpError> {
+        let (layer_tree, overflows) = self.build_page_layer_tree_with_overflows(page_num)?;
         let mut renderer = SvgLayerRenderer::new();
         renderer.inner_mut().show_paragraph_marks = self.show_paragraph_marks;
         renderer.inner_mut().show_control_codes = self.show_control_codes;
         renderer.inner_mut().debug_overlay = self.debug_overlay;
         renderer.render_page(&layer_tree)?;
-        Ok(renderer.output().to_string())
+        Ok((renderer.output().to_string(), overflows))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn render_page_png_from_svg_native_with_overflows(
+        &self,
+        page_num: u32,
+    ) -> Result<(Vec<u8>, u32, u32, Vec<LayoutOverflow>), HwpError> {
+        let (svg, overflows) = self.render_page_svg_native_with_overflows(page_num)?;
+        let (png, width, height) = rasterize_svg_document_to_png(&svg)?;
+        Ok((png, width, height, overflows))
     }
 
     /// PDF export for one page, implemented as the current compatibility path:
@@ -515,6 +577,45 @@ impl DocumentCore {
             Ok(png_bytes)
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn rasterize_svg_document_to_png(svg: &str) -> Result<(Vec<u8>, u32, u32), HwpError> {
+    const MAX_RASTER_PIXELS: u64 = 67_108_864;
+
+    use resvg::{tiny_skia, usvg};
+
+    let mut options = usvg::Options::default();
+    options.resources_dir = None;
+    options.image_href_resolver = usvg::ImageHrefResolver {
+        resolve_data: usvg::ImageHrefResolver::default_data_resolver(),
+        resolve_string: Box::new(|_, _| None),
+    };
+    let fontdb = options.fontdb_mut();
+    fontdb.load_system_fonts();
+    fontdb.set_sans_serif_family("Noto Sans CJK KR");
+    fontdb.set_serif_family("Noto Serif CJK KR");
+    fontdb.set_monospace_family("D2Coding");
+
+    let tree = usvg::Tree::from_str(svg, &options)
+        .map_err(|error| HwpError::RenderError(format!("SVG raster parse failed: {error}")))?;
+    let size = tree.size().to_int_size();
+    let width = size.width();
+    let height = size.height();
+    let pixels = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 || pixels > MAX_RASTER_PIXELS {
+        return Err(HwpError::RenderError(format!(
+            "SVG raster size out of bounds: {width}x{height}"
+        )));
+    }
+
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
+        .ok_or_else(|| HwpError::RenderError("SVG raster pixmap allocation failed".to_string()))?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let png = pixmap
+        .encode_png()
+        .map_err(|error| HwpError::RenderError(format!("SVG raster PNG encode failed: {error}")))?;
+    Ok((png, width, height))
 }
 
 /// PNG 바이트에 pHYs chunk 를 삽입한다 (IHDR 직후, 첫 IDAT 직전).
@@ -955,22 +1056,91 @@ impl DocumentCore {
             .get(section_idx)
             .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", section_idx)))?;
         let sd = &section.section_def;
+        let tab_stop_val = if sd.tab_stop_val > 0 {
+            sd.tab_stop_val
+        } else {
+            4000
+        };
+        let tab_stop_unit = if sd.tab_stop_unit.is_empty() {
+            "HWPUNIT"
+        } else {
+            &sd.tab_stop_unit
+        };
+        let tab_stop_unit = super::super::helpers::json_escape(tab_stop_unit);
+        let visibility_border = super::super::helpers::json_escape(section_visibility_value(
+            &sd.visibility_border,
+            sd.hide_border,
+        ));
+        let visibility_fill = super::super::helpers::json_escape(section_visibility_value(
+            &sd.visibility_fill,
+            sd.hide_fill,
+        ));
+        let section_id = super::super::helpers::json_escape(&sd.section_id);
         Ok(format!(
-            "{{\"pageNum\":{},\"pageNumType\":{},\"pictureNum\":{},\"tableNum\":{},\"equationNum\":{},\
-            \"columnSpacing\":{},\"defaultTabSpacing\":{},\
+            "{{\"sectionId\":\"{}\",\"pageNum\":{},\"pageNumType\":{},\"pictureNum\":{},\"tableNum\":{},\"equationNum\":{},\
+            \"columnSpacing\":{},\"lineGrid\":{},\"charGrid\":{},\"wonggojiFormat\":{},\"defaultTabSpacing\":{},\
+            \"tabStopVal\":{},\"tabStopUnit\":\"{}\",\
+            \"textDirection\":{},\"outlineShapeIDRef\":{},\"memoShapeIDRef\":{},\"textVerticalWidthHead\":{},\
             \"hideHeader\":{},\"hideFooter\":{},\"hideMasterPage\":{},\
-            \"hideBorder\":{},\"hideFill\":{},\"hideEmptyLine\":{}}}",
+            \"hideBorder\":{},\"visibilityBorder\":\"{}\",\"hideFill\":{},\"visibilityFill\":\"{}\",\
+            \"hidePageNumber\":{},\"hideEmptyLine\":{},\"showLineNumber\":{},\
+            \"lineNumberRestartType\":{},\"lineNumberCountBy\":{},\"lineNumberDistance\":{},\"lineNumberStartNumber\":{}}}",
+            section_id,
             sd.page_num, sd.page_num_type,
             sd.picture_num, sd.table_num, sd.equation_num,
-            sd.column_spacing, sd.default_tab_spacing,
+            sd.column_spacing, sd.line_grid, sd.char_grid, sd.wonggoji_format, sd.default_tab_spacing,
+            tab_stop_val, tab_stop_unit,
+            sd.text_direction, sd.outline_numbering_id, sd.memo_shape_id_ref, sd.text_vertical_width_head,
             sd.hide_header, sd.hide_footer, sd.hide_master_page,
-            sd.hide_border, sd.hide_fill, sd.hide_empty_line,
+            sd.hide_border, visibility_border, sd.hide_fill, visibility_fill,
+            sd.hide_page_number, sd.hide_empty_line,
+            sd.show_line_number,
+            sd.line_number_restart_type, sd.line_number_count_by,
+            sd.line_number_distance, sd.line_number_start_number,
         ))
     }
 
     /// 단일 구역의 SectionDef 필드를 JSON에서 업데이트 (재조판 없이)
     fn apply_section_def_json(&mut self, section_idx: usize, json: &str) -> Result<(), HwpError> {
-        use super::super::helpers::{json_bool, json_u16, json_u32};
+        use super::super::helpers::{json_bool, json_i16, json_str, json_u16, json_u32};
+
+        fn json_u16_alias(json: &str, primary: &str, alias: &str) -> Option<u16> {
+            json_u16(json, primary).or_else(|| json_u16(json, alias))
+        }
+
+        fn json_u32_alias(json: &str, primary: &str, alias: &str) -> Option<u32> {
+            json_u32(json, primary).or_else(|| json_u32(json, alias))
+        }
+
+        fn json_i16_alias(json: &str, primary: &str, alias: &str) -> Option<i16> {
+            json_i16(json, primary).or_else(|| json_i16(json, alias))
+        }
+
+        fn json_bool_alias(json: &str, primary: &str, alias: &str) -> Option<bool> {
+            json_bool(json, primary).or_else(|| json_bool(json, alias))
+        }
+
+        fn json_str_alias(json: &str, primary: &str, alias: &str) -> Option<String> {
+            json_str(json, primary).or_else(|| json_str(json, alias))
+        }
+
+        fn json_visibility_alias(
+            json: &str,
+            primary: &str,
+            alias: &str,
+        ) -> Result<Option<&'static str>, HwpError> {
+            let Some(value) = json_str_alias(json, primary, alias) else {
+                return Ok(None);
+            };
+            normalize_section_visibility_value(&value)
+                .map(Some)
+                .ok_or_else(|| {
+                    HwpError::RenderError(format!(
+                        "{} 값은 HIDE_FIRST, SHOW_FIRST, SHOW_ALL 중 하나여야 합니다",
+                        primary
+                    ))
+                })
+        }
 
         let section = self
             .document
@@ -979,44 +1149,107 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", section_idx)))?;
         let sd = &mut section.section_def;
 
-        if let Some(v) = json_u16(json, "pageNum") {
+        if let Some(v) = json_str_alias(json, "sectionId", "section_id") {
+            sd.section_id = v;
+        }
+        if let Some(v) = json_u16_alias(json, "pageNum", "page_num") {
             sd.page_num = v;
         }
-        if let Some(v) = json_u16(json, "pageNumType") {
+        if let Some(v) = json_u16_alias(json, "pageNumType", "page_num_type") {
             sd.page_num_type = v as u8;
         }
-        if let Some(v) = json_u16(json, "pictureNum") {
+        if let Some(v) = json_u16_alias(json, "pictureNum", "picture_num") {
             sd.picture_num = v;
         }
-        if let Some(v) = json_u16(json, "tableNum") {
+        if let Some(v) = json_u16_alias(json, "tableNum", "table_num") {
             sd.table_num = v;
         }
-        if let Some(v) = json_u16(json, "equationNum") {
+        if let Some(v) = json_u16_alias(json, "equationNum", "equation_num") {
             sd.equation_num = v;
         }
-        if let Some(v) = json_u16(json, "columnSpacing") {
+        if let Some(v) = json_u16_alias(json, "columnSpacing", "column_spacing") {
             sd.column_spacing = v as i16;
         }
-        if let Some(v) = json_u32(json, "defaultTabSpacing") {
+        if let Some(v) = json_i16_alias(json, "lineGrid", "line_grid") {
+            sd.line_grid = v;
+        }
+        if let Some(v) = json_i16_alias(json, "charGrid", "char_grid") {
+            sd.char_grid = v;
+        }
+        if let Some(v) = json_u16_alias(json, "wonggojiFormat", "wonggoji_format") {
+            sd.wonggoji_format = (v.min(u8::MAX as u16)) as u8;
+        }
+        if let Some(v) = json_u32_alias(json, "defaultTabSpacing", "default_tab_spacing") {
             sd.default_tab_spacing = v;
         }
-        if let Some(v) = json_bool(json, "hideHeader") {
+        if let Some(v) = json_u32_alias(json, "tabStopVal", "tab_stop_val") {
+            sd.tab_stop_val = v;
+        }
+        if let Some(v) = json_str_alias(json, "tabStopUnit", "tab_stop_unit") {
+            sd.tab_stop_unit = v;
+        }
+        if let Some(v) = json_u16_alias(json, "textDirection", "text_direction") {
+            sd.text_direction = v.min(2) as u8;
+        }
+        if let Some(v) = json_u16_alias(json, "outlineShapeIDRef", "outline_shape_id_ref")
+            .or_else(|| json_u16_alias(json, "outlineNumberingId", "outline_numbering_id"))
+        {
+            sd.outline_numbering_id = v;
+        }
+        if let Some(v) = json_u16_alias(json, "memoShapeIDRef", "memo_shape_id_ref") {
+            sd.memo_shape_id_ref = v;
+        }
+        if let Some(v) = json_u32_alias(json, "textVerticalWidthHead", "text_vertical_width_head") {
+            sd.text_vertical_width_head = v;
+        }
+        if let Some(v) = json_bool_alias(json, "hideHeader", "hide_header") {
             sd.hide_header = v;
         }
-        if let Some(v) = json_bool(json, "hideFooter") {
+        if let Some(v) = json_bool_alias(json, "hideFooter", "hide_footer") {
             sd.hide_footer = v;
         }
-        if let Some(v) = json_bool(json, "hideMasterPage") {
+        if let Some(v) = json_bool_alias(json, "hideMasterPage", "hide_master_page") {
             sd.hide_master_page = v;
         }
-        if let Some(v) = json_bool(json, "hideBorder") {
+        if let Some(v) = json_bool_alias(json, "hideBorder", "hide_border") {
             sd.hide_border = v;
+            sd.visibility_border = if v { "HIDE_FIRST" } else { "SHOW_ALL" }.to_string();
         }
-        if let Some(v) = json_bool(json, "hideFill") {
+        if let Some(v) = json_visibility_alias(json, "visibilityBorder", "visibility_border")? {
+            sd.visibility_border = v.to_string();
+            sd.hide_border = v == "HIDE_FIRST";
+        }
+        if let Some(v) = json_bool_alias(json, "hideFill", "hide_fill") {
             sd.hide_fill = v;
+            sd.visibility_fill = if v { "HIDE_FIRST" } else { "SHOW_ALL" }.to_string();
         }
-        if let Some(v) = json_bool(json, "hideEmptyLine") {
+        if let Some(v) = json_visibility_alias(json, "visibilityFill", "visibility_fill")? {
+            sd.visibility_fill = v.to_string();
+            sd.hide_fill = v == "HIDE_FIRST";
+        }
+        if let Some(v) = json_bool_alias(json, "hidePageNumber", "hide_page_number") {
+            sd.hide_page_number = v;
+        }
+        if let Some(v) = json_bool_alias(json, "hideFirstPageNum", "hide_first_page_num") {
+            sd.hide_page_number = v;
+        }
+        if let Some(v) = json_bool_alias(json, "hideEmptyLine", "hide_empty_line") {
             sd.hide_empty_line = v;
+        }
+        if let Some(v) = json_bool_alias(json, "showLineNumber", "show_line_number") {
+            sd.show_line_number = v;
+        }
+        if let Some(v) = json_u16_alias(json, "lineNumberRestartType", "line_number_restart_type") {
+            sd.line_number_restart_type = v as u8;
+        }
+        if let Some(v) = json_u16_alias(json, "lineNumberCountBy", "line_number_count_by") {
+            sd.line_number_count_by = v;
+        }
+        if let Some(v) = json_u32_alias(json, "lineNumberDistance", "line_number_distance") {
+            sd.line_number_distance = v;
+        }
+        if let Some(v) = json_u16_alias(json, "lineNumberStartNumber", "line_number_start_number") {
+            sd.line_number_start_number = v;
         }
 
         // flags 비트플래그 재구성 (파서와 동일한 비트 위치)
@@ -1033,6 +1266,7 @@ impl DocumentCore {
         set_bit(flags, 0x0004, sd.hide_master_page); // bit 2 (HWP5 스펙, 첫쪽 바탕쪽 감춤)
         set_bit(flags, 0x0008, sd.hide_border); // bit 3
         set_bit(flags, 0x0010, sd.hide_fill); // bit 4
+        set_bit(flags, 0x0020, sd.hide_page_number); // bit 5
         set_bit(flags, 0x00080000, sd.hide_empty_line); // bit 19
                                                         // bit 20-21: 쪽 번호 종류
         *flags &= !0x00300000; // clear bits 20-21
@@ -1043,19 +1277,37 @@ impl DocumentCore {
         if let Some(para) = section.paragraphs.get_mut(0) {
             for ctrl in &mut para.controls {
                 if let Control::SectionDef(ref mut s) = ctrl {
+                    s.section_id = updated_sd.section_id.clone();
                     s.page_num = updated_sd.page_num;
                     s.page_num_type = updated_sd.page_num_type;
                     s.picture_num = updated_sd.picture_num;
                     s.table_num = updated_sd.table_num;
                     s.equation_num = updated_sd.equation_num;
                     s.column_spacing = updated_sd.column_spacing;
+                    s.line_grid = updated_sd.line_grid;
+                    s.char_grid = updated_sd.char_grid;
+                    s.wonggoji_format = updated_sd.wonggoji_format;
                     s.default_tab_spacing = updated_sd.default_tab_spacing;
+                    s.tab_stop_val = updated_sd.tab_stop_val;
+                    s.tab_stop_unit = updated_sd.tab_stop_unit.clone();
+                    s.text_direction = updated_sd.text_direction;
+                    s.outline_numbering_id = updated_sd.outline_numbering_id;
+                    s.memo_shape_id_ref = updated_sd.memo_shape_id_ref;
+                    s.text_vertical_width_head = updated_sd.text_vertical_width_head;
                     s.hide_header = updated_sd.hide_header;
                     s.hide_footer = updated_sd.hide_footer;
                     s.hide_master_page = updated_sd.hide_master_page;
                     s.hide_border = updated_sd.hide_border;
+                    s.visibility_border = updated_sd.visibility_border.clone();
                     s.hide_fill = updated_sd.hide_fill;
+                    s.visibility_fill = updated_sd.visibility_fill.clone();
+                    s.hide_page_number = updated_sd.hide_page_number;
                     s.hide_empty_line = updated_sd.hide_empty_line;
+                    s.show_line_number = updated_sd.show_line_number;
+                    s.line_number_restart_type = updated_sd.line_number_restart_type;
+                    s.line_number_count_by = updated_sd.line_number_count_by;
+                    s.line_number_distance = updated_sd.line_number_distance;
+                    s.line_number_start_number = updated_sd.line_number_start_number;
                     s.flags = updated_sd.flags;
                     break;
                 }
@@ -1258,6 +1510,7 @@ impl DocumentCore {
         }
         pbf.attr = attr;
         pbf.border_fill_id = border_fill_id;
+        pbf.raw_hwpx_children = None;
 
         let apply_page = json_str(json, "applyPage").unwrap_or_else(|| "all".to_string());
         let hide_first = apply_page == "exceptFirst";
@@ -1266,11 +1519,23 @@ impl DocumentCore {
         } else {
             sd.hide_border = hide_first;
         }
+        sd.visibility_border = if sd.hide_border {
+            "HIDE_FIRST"
+        } else {
+            "SHOW_ALL"
+        }
+        .to_string();
         if let Some(v) = json_bool(json, "hideFill") {
             sd.hide_fill = v;
         } else {
             sd.hide_fill = hide_first;
         }
+        sd.visibility_fill = if sd.hide_fill {
+            "HIDE_FIRST"
+        } else {
+            "SHOW_ALL"
+        }
+        .to_string();
 
         let flags = &mut sd.flags;
         if pbf.ui_basis == PageBorderUiBasis::Page {
@@ -1298,7 +1563,9 @@ impl DocumentCore {
                 if let Control::SectionDef(ref mut ctrl_sd) = ctrl {
                     ctrl_sd.page_border_fill = updated_sd.page_border_fill.clone();
                     ctrl_sd.hide_border = updated_sd.hide_border;
+                    ctrl_sd.visibility_border = updated_sd.visibility_border.clone();
                     ctrl_sd.hide_fill = updated_sd.hide_fill;
+                    ctrl_sd.visibility_fill = updated_sd.visibility_fill.clone();
                     ctrl_sd.flags = updated_sd.flags;
                     break;
                 }
@@ -1348,7 +1615,12 @@ impl DocumentCore {
         section_idx: usize,
         json: &str,
     ) -> Result<String, HwpError> {
+        use super::super::helpers::{json_bool, json_u32};
         use crate::model::page::BindingMethod;
+
+        fn json_u32_alias(json: &str, primary: &str, alias: &str) -> Option<u32> {
+            json_u32(json, primary).or_else(|| json_u32(json, alias))
+        }
 
         let section = self
             .document
@@ -1357,33 +1629,31 @@ impl DocumentCore {
             .ok_or_else(|| HwpError::RenderError(format!("구역 {} 범위 초과", section_idx)))?;
         let pd = &mut section.section_def.page_def;
 
-        use super::super::helpers::{json_bool, json_u32};
-
         if let Some(v) = json_u32(json, "width") {
             pd.width = v;
         }
         if let Some(v) = json_u32(json, "height") {
             pd.height = v;
         }
-        if let Some(v) = json_u32(json, "marginLeft") {
+        if let Some(v) = json_u32_alias(json, "marginLeft", "margin_left") {
             pd.margin_left = v;
         }
-        if let Some(v) = json_u32(json, "marginRight") {
+        if let Some(v) = json_u32_alias(json, "marginRight", "margin_right") {
             pd.margin_right = v;
         }
-        if let Some(v) = json_u32(json, "marginTop") {
+        if let Some(v) = json_u32_alias(json, "marginTop", "margin_top") {
             pd.margin_top = v;
         }
-        if let Some(v) = json_u32(json, "marginBottom") {
+        if let Some(v) = json_u32_alias(json, "marginBottom", "margin_bottom") {
             pd.margin_bottom = v;
         }
-        if let Some(v) = json_u32(json, "marginHeader") {
+        if let Some(v) = json_u32_alias(json, "marginHeader", "margin_header") {
             pd.margin_header = v;
         }
-        if let Some(v) = json_u32(json, "marginFooter") {
+        if let Some(v) = json_u32_alias(json, "marginFooter", "margin_footer") {
             pd.margin_footer = v;
         }
-        if let Some(v) = json_u32(json, "marginGutter") {
+        if let Some(v) = json_u32_alias(json, "marginGutter", "margin_gutter") {
             pd.margin_gutter = v;
         }
         if let Some(v) = json_bool(json, "landscape") {

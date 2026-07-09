@@ -20,7 +20,8 @@ use quick_xml::Writer;
 
 use crate::model::shape::{
     CommonObjAttr, DrawingObjAttr, HorzAlign, HorzRelTo, LineShape, ObjectNumberingType,
-    RectangleShape, ShapeComponentAttr, TextBox, TextFlow, TextWrap, VertAlign, VertRelTo,
+    RectangleShape, ShapeComponentAttr, SizeCriterion, TextBox, TextFlow, TextWrap, VertAlign,
+    VertRelTo,
 };
 use crate::model::style::{Fill, FillType, ImageFillMode, ShapeBorderLine, SolidFill};
 use crate::model::ColorRef;
@@ -51,9 +52,13 @@ pub fn write_rect<W: Write>(
     let tw = text_wrap_str(c.text_wrap);
     let tf = text_flow_str(c.text_flow);
     let group_level = sa.group_level.to_string();
+    let dropcap_style = c.dropcap_style.as_deref().unwrap_or("None");
+    let href = c.href.as_deref().unwrap_or("");
     // 파서는 instid 를 drawing.inst_id 에 보존한다 (0이면 instance_id 대체).
     let instid = if rect.drawing.inst_id != 0 {
         rect.drawing.inst_id
+    } else if c.inst_id != 0 {
+        c.inst_id
     } else {
         c.instance_id
     }
@@ -69,9 +74,9 @@ pub fn write_rect<W: Write>(
             ("numberingType", numbering_type_str(c.numbering_type)),
             ("textWrap", tw),
             ("textFlow", tf),
-            ("lock", "0"),
-            ("dropcapstyle", "None"),
-            ("href", ""),
+            ("lock", bool01(c.lock)),
+            ("dropcapstyle", dropcap_style),
+            ("href", href),
             ("groupLevel", &group_level),
             ("instid", &instid),
             ("ratio", &ratio),
@@ -86,8 +91,9 @@ pub fn write_rect<W: Write>(
     write_rotation_info(w, sa)?;
     write_rendering_info(w, sa)?;
     write_line_shape(w, &rect.drawing.border_line)?;
-    write_fill_brush(w, &rect.drawing.fill)?;
+    write_shape_fill_brush(w, &rect.drawing.fill, ctx)?;
     write_shadow(w, &rect.drawing)?;
+    write_raw_hwpx_child_xml(w, &rect.drawing.raw_hwpx_child_xml)?;
 
     // drawText: 글상자 내부 문단
     if let Some(ref tb) = rect.drawing.text_box {
@@ -132,6 +138,17 @@ pub fn write_line<W: Write>(
     let ex = line.end.x.to_string();
     let ey = line.end.y.to_string();
     let srb = bool01(line.started_right_or_bottom);
+    let group_level = line.drawing.shape_attr.group_level.to_string();
+    let dropcap_style = c.dropcap_style.as_deref().unwrap_or("None");
+    let href = c.href.as_deref().unwrap_or("");
+    let instid = if line.drawing.inst_id != 0 {
+        line.drawing.inst_id
+    } else if c.inst_id != 0 {
+        c.inst_id
+    } else {
+        c.instance_id
+    }
+    .to_string();
 
     start_tag_attrs(
         w,
@@ -142,11 +159,11 @@ pub fn write_line<W: Write>(
             ("numberingType", numbering_type_str(c.numbering_type)),
             ("textWrap", tw),
             ("textFlow", tf),
-            ("lock", "0"),
-            ("dropcapstyle", "None"),
-            ("href", ""),
-            ("groupLevel", "0"),
-            ("instid", &id_str),
+            ("lock", bool01(c.lock)),
+            ("dropcapstyle", dropcap_style),
+            ("href", href),
+            ("groupLevel", &group_level),
+            ("instid", &instid),
             ("startX", &sx),
             ("startY", &sy),
             ("endX", &ex),
@@ -155,6 +172,7 @@ pub fn write_line<W: Write>(
         ],
     )?;
 
+    write_raw_hwpx_child_xml(w, &line.drawing.raw_hwpx_child_xml)?;
     write_sz(w, c)?;
     write_pos(w, c)?;
     write_out_margin(w, c)?;
@@ -187,6 +205,15 @@ pub fn write_container_open<W: Write>(
     let z_order = common.z_order.to_string();
     let tw = text_wrap_str(common.text_wrap);
     let tf = text_flow_str(common.text_flow);
+    let group_level = sa.group_level.to_string();
+    let dropcap_style = common.dropcap_style.as_deref().unwrap_or("None");
+    let href = common.href.as_deref().unwrap_or("");
+    let instid = if common.inst_id != 0 {
+        common.inst_id
+    } else {
+        common.instance_id
+    }
+    .to_string();
 
     start_tag_attrs(
         w,
@@ -197,11 +224,11 @@ pub fn write_container_open<W: Write>(
             ("numberingType", numbering_type_str(common.numbering_type)),
             ("textWrap", tw),
             ("textFlow", tf),
-            ("lock", "0"),
-            ("dropcapstyle", "None"),
-            ("href", ""),
-            ("groupLevel", "0"),
-            ("instid", &id_str),
+            ("lock", bool01(common.lock)),
+            ("dropcapstyle", dropcap_style),
+            ("href", href),
+            ("groupLevel", &group_level),
+            ("instid", &instid),
         ],
     )?;
 
@@ -488,7 +515,7 @@ fn write_matrix<W: Write>(
 
 /// `<hp:lineShape>` — `parse_line_shape_attr` 의 역매핑.
 /// headStyle/tailStyle/alpha 는 파서 미적재 → "NORMAL"/"0" 고정 방출.
-fn write_line_shape<W: Write>(
+pub(super) fn write_line_shape<W: Write>(
     w: &mut Writer<W>,
     bl: &ShapeBorderLine,
 ) -> Result<(), SerializeError> {
@@ -496,18 +523,22 @@ fn write_line_shape<W: Write>(
     let width = bl.width.to_string();
     // style 은 attr 하위 6비트 (NONE=0x40 은 endCap 파싱이 겹쳐 쓰면 소실되는
     // 파서 자체 제약 — 복원 불가 시 SOLID).
-    let style = match bl.attr & 0x3F {
-        2 => "DASH",
-        3 => "DOT",
-        4 => "DASH_DOT",
-        5 => "DASH_DOT_DOT",
-        6 => "LONG_DASH",
-        7 => "CIRCLE",
-        8 => "DOUBLE_SLIM",
-        9 => "SLIM_THICK",
-        10 => "THICK_SLIM",
-        11 => "SLIM_THICK_SLIM",
-        _ => "SOLID",
+    let style = if (bl.attr & 0xFF) == 0x40 {
+        "NONE"
+    } else {
+        match bl.attr & 0x3F {
+            2 => "DASH",
+            3 => "DOT",
+            4 => "DASH_DOT",
+            5 => "DASH_DOT_DOT",
+            6 => "LONG_DASH",
+            7 => "CIRCLE",
+            8 => "DOUBLE_SLIM",
+            9 => "SLIM_THICK",
+            10 => "THICK_SLIM",
+            11 => "SLIM_THICK_SLIM",
+            _ => "SOLID",
+        }
     };
     let end_cap = match (bl.attr >> 6) & 0x0F {
         1 => "FLAT",
@@ -605,6 +636,22 @@ pub(crate) fn write_fill_brush<W: Write>(
     w: &mut Writer<W>,
     fill: &Fill,
 ) -> Result<(), SerializeError> {
+    write_fill_brush_with_context(w, fill, None)
+}
+
+pub(crate) fn write_shape_fill_brush<W: Write>(
+    w: &mut Writer<W>,
+    fill: &Fill,
+    ctx: &SerializeContext,
+) -> Result<(), SerializeError> {
+    write_fill_brush_with_context(w, fill, Some(ctx))
+}
+
+fn write_fill_brush_with_context<W: Write>(
+    w: &mut Writer<W>,
+    fill: &Fill,
+    ctx: Option<&SerializeContext>,
+) -> Result<(), SerializeError> {
     match fill.fill_type {
         // FillType::None 이지만 solid 데이터가 보존돼 있으면(원본 winBrush 가
         // faceColor="none"+무늬없음 으로 빈 채우기였던 경우) winBrush 를 그대로
@@ -646,9 +693,15 @@ pub(crate) fn write_fill_brush<W: Write>(
                     ("alpha", &alpha),
                 ],
             )?;
-            for c in &grad.colors {
+            let has_positions = grad.positions.len() == grad.colors.len();
+            for (idx, c) in grad.colors.iter().enumerate() {
                 let v = color_to_hex(*c);
-                empty_tag(w, "hc:color", &[("value", &v)])?;
+                if has_positions {
+                    let position = grad.positions[idx].to_string();
+                    empty_tag(w, "hc:color", &[("value", &v), ("position", &position)])?;
+                } else {
+                    empty_tag(w, "hc:color", &[("value", &v)])?;
+                }
             }
             end_tag(w, "hc:gradation")?;
             end_tag(w, "hc:fillBrush")
@@ -661,9 +714,53 @@ pub(crate) fn write_fill_brush<W: Write>(
                 _ => "TILE",
             };
             start_tag(w, "hc:fillBrush")?;
-            empty_tag(w, "hc:imgBrush", &[("mode", mode)])?;
+            if let Some(manifest_id) = resolve_image_fill_manifest_id(ctx, img.bin_data_id)? {
+                let bright = img.brightness.to_string();
+                let contrast = img.contrast.to_string();
+                let effect = image_fill_effect_str(img.effect);
+                empty_tag(
+                    w,
+                    "hc:imgBrush",
+                    &[
+                        ("mode", mode),
+                        ("binaryItemIDRef", manifest_id),
+                        ("bright", &bright),
+                        ("contrast", &contrast),
+                        ("effect", effect),
+                    ],
+                )?;
+            } else {
+                empty_tag(w, "hc:imgBrush", &[("mode", mode)])?;
+            }
             end_tag(w, "hc:fillBrush")
         }
+    }
+}
+
+fn resolve_image_fill_manifest_id<'a>(
+    ctx: Option<&'a SerializeContext>,
+    bin_data_id: u16,
+) -> Result<Option<&'a str>, SerializeError> {
+    if bin_data_id == 0 {
+        return Ok(None);
+    }
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    ctx.resolve_bin_id(bin_data_id).map(Some).ok_or_else(|| {
+        SerializeError::XmlError(format!(
+            "<hc:imgBrush> binaryItemIDRef 미등록 bin_data_id={} (BinDataContent 누락)",
+            bin_data_id
+        ))
+    })
+}
+
+fn image_fill_effect_str(effect: u8) -> &'static str {
+    match effect {
+        1 => "GRAY_SCALE",
+        2 => "BLACK_WHITE",
+        3 => "PATTERN_8_8",
+        _ => "REAL_PIC",
     }
 }
 
@@ -725,6 +822,21 @@ fn write_shadow<W: Write>(w: &mut Writer<W>, d: &DrawingObjAttr) -> Result<(), S
     )
 }
 
+pub(crate) fn write_raw_hwpx_child_xml<W: Write>(
+    w: &mut Writer<W>,
+    raw_xml: &[String],
+) -> Result<(), SerializeError> {
+    for raw in raw_xml {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        w.get_mut()
+            .write_all(raw.as_bytes())
+            .map_err(|e| SerializeError::XmlError(format!("shape raw child XML: {e}")))?;
+    }
+    Ok(())
+}
+
 // =====================================================================
 // 꼭짓점 / shapeComment
 // =====================================================================
@@ -764,21 +876,23 @@ pub(super) fn write_shape_comment<W: Write>(
 fn write_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let width = c.width.to_string();
     let height = c.height.to_string();
+    let protect = bool01(c.size_protect);
     empty_tag(
         w,
         "hp:sz",
         &[
             ("width", &width),
-            ("widthRelTo", "ABSOLUTE"),
+            ("widthRelTo", size_criterion_str(c.width_criterion)),
             ("height", &height),
-            ("heightRelTo", "ABSOLUTE"),
-            ("protect", "0"),
+            ("heightRelTo", size_criterion_str(c.height_criterion)),
+            ("protect", protect),
         ],
     )
 }
 
 fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let treat = bool01(c.treat_as_char);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
     empty_tag(
@@ -789,7 +903,7 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
             ("affectLSpacing", "0"),
             ("flowWithText", bool01(c.flow_with_text)),
             ("allowOverlap", bool01(c.allow_overlap)),
-            ("holdAnchorAndSO", "0"),
+            ("holdAnchorAndSO", hold_anchor),
             ("vertRelTo", vert_rel_to_str(c.vert_rel_to)),
             ("horzRelTo", horz_rel_to_str(c.horz_rel_to)),
             ("vertAlign", vert_align_str(c.vert_align)),
@@ -864,6 +978,16 @@ fn text_flow_str(f: TextFlow) -> &'static str {
         TextFlow::LeftOnly => "LEFT_ONLY",
         TextFlow::RightOnly => "RIGHT_ONLY",
         TextFlow::LargestOnly => "LARGEST_ONLY",
+    }
+}
+
+fn size_criterion_str(value: SizeCriterion) -> &'static str {
+    match value {
+        SizeCriterion::Paper => "PAPER",
+        SizeCriterion::Page => "PAGE",
+        SizeCriterion::Column => "COLUMN",
+        SizeCriterion::Para => "PARA",
+        SizeCriterion::Absolute => "ABSOLUTE",
     }
 }
 
@@ -942,6 +1066,107 @@ mod tests {
         let mut rect = RectangleShape::default();
         rect.drawing.text_box = Some(tb);
         rect
+    }
+
+    #[test]
+    fn container_and_line_group_level_reflect_ir() {
+        let common = CommonObjAttr::default();
+        let mut shape_attr = ShapeComponentAttr::default();
+        shape_attr.group_level = 7;
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_container_open(&mut w, &common, &shape_attr).expect("write_container_open");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"groupLevel="7""#),
+            "container groupLevel should preserve ShapeComponentAttr: {xml}"
+        );
+
+        let mut line = LineShape::default();
+        line.drawing.shape_attr.group_level = 3;
+        let xml = serialize_line(&line);
+        assert!(
+            xml.contains(r#"groupLevel="3""#),
+            "line groupLevel should preserve ShapeComponentAttr: {xml}"
+        );
+    }
+
+    #[test]
+    fn shape_href_and_instid_reflect_ir() {
+        let mut rect = RectangleShape::default();
+        rect.common.instance_id = 10;
+        rect.common.inst_id = 20;
+        rect.common.href = Some("?Bookmark;0;0;0;".to_string());
+        rect.drawing.inst_id = 30;
+        let xml = serialize_rect(&rect);
+        assert!(
+            xml.contains(r#"href="?Bookmark;0;0;0;""#),
+            "rect href should preserve CommonObjAttr href: {xml}"
+        );
+        assert!(
+            xml.contains(r#"instid="30""#),
+            "rect instid should prefer DrawingObjAttr inst_id: {xml}"
+        );
+
+        let mut line = LineShape::default();
+        line.common.instance_id = 11;
+        line.common.inst_id = 21;
+        line.common.href = Some("?LineTarget;0;0;0;".to_string());
+        let xml = serialize_line(&line);
+        assert!(
+            xml.contains(r#"href="?LineTarget;0;0;0;""#),
+            "line href should preserve CommonObjAttr href: {xml}"
+        );
+        assert!(
+            xml.contains(r#"instid="21""#),
+            "line instid should preserve CommonObjAttr inst_id: {xml}"
+        );
+
+        let mut common = CommonObjAttr::default();
+        common.instance_id = 12;
+        common.inst_id = 22;
+        common.href = Some("?GroupTarget;0;0;0;".to_string());
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_container_open(&mut w, &common, &ShapeComponentAttr::default())
+            .expect("write_container_open");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"href="?GroupTarget;0;0;0;""#),
+            "container href should preserve CommonObjAttr href: {xml}"
+        );
+        assert!(
+            xml.contains(r#"instid="22""#),
+            "container instid should preserve CommonObjAttr inst_id: {xml}"
+        );
+    }
+
+    #[test]
+    fn shape_dropcap_style_reflects_ir() {
+        let mut rect = RectangleShape::default();
+        rect.common.dropcap_style = Some("DoubleLine".to_string());
+        let xml = serialize_rect(&rect);
+        assert!(
+            xml.contains(r#"dropcapstyle="DoubleLine""#),
+            "rect dropcapstyle should preserve CommonObjAttr value: {xml}"
+        );
+
+        let mut line = LineShape::default();
+        line.common.dropcap_style = Some("DoubleLine".to_string());
+        let xml = serialize_line(&line);
+        assert!(
+            xml.contains(r#"dropcapstyle="DoubleLine""#),
+            "line dropcapstyle should preserve CommonObjAttr value: {xml}"
+        );
+
+        let mut common = CommonObjAttr::default();
+        common.dropcap_style = Some("DoubleLine".to_string());
+        let mut w: Writer<Vec<u8>> = Writer::new(Vec::new());
+        write_container_open(&mut w, &common, &ShapeComponentAttr::default())
+            .expect("write_container_open");
+        let xml = String::from_utf8(w.into_inner()).unwrap();
+        assert!(
+            xml.contains(r#"dropcapstyle="DoubleLine""#),
+            "container dropcapstyle should preserve CommonObjAttr value: {xml}"
+        );
     }
 
     #[test]

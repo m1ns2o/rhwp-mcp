@@ -1,8 +1,8 @@
 //! 머리말/꼬리말 생성·조회·텍스트 편집 관련 native 메서드
 
 use crate::document_core::helpers::{
-    build_tab_def_from_json, json_has_border_keys, json_has_tab_keys, parse_json_i16_array,
-    parse_para_shape_mods,
+    build_tab_def_from_json, json_has_border_keys, json_has_tab_keys, parse_char_shape_mods,
+    parse_json_i16_array, parse_para_shape_mods,
 };
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
@@ -37,6 +37,15 @@ fn apply_label(a: HeaderFooterApply) -> &'static str {
         HeaderFooterApply::Even => "짝수 쪽",
         HeaderFooterApply::Odd => "홀수 쪽",
     }
+}
+
+fn hf_char_shape_mods_affect_text_flow(mods: &crate::model::style::CharShapeMods) -> bool {
+    mods.base_size.is_some()
+        || mods.font_ids.is_some()
+        || mods.ratios.is_some()
+        || mods.spacings.is_some()
+        || mods.relative_sizes.is_some()
+        || mods.char_offsets.is_some()
 }
 
 impl DocumentCore {
@@ -188,7 +197,7 @@ impl DocumentCore {
     }
 
     /// 머리말/꼬리말 내부 문단에 대한 가변 참조를 얻는다.
-    fn get_hf_paragraph_mut(
+    pub(crate) fn get_hf_paragraph_mut(
         &mut self,
         section_idx: usize,
         is_header: bool,
@@ -727,7 +736,7 @@ impl DocumentCore {
     }
 
     /// 머리말/꼬리말 문단 리플로우
-    fn reflow_hf_paragraph(
+    pub(crate) fn reflow_hf_paragraph(
         &mut self,
         section_idx: usize,
         is_header: bool,
@@ -785,6 +794,53 @@ impl DocumentCore {
                 HwpError::RenderError("머리말/꼬리말 문단을 찾을 수 없음".to_string())
             })?;
         Ok(self.build_para_properties_json(para.para_shape_id, section_idx))
+    }
+
+    /// 머리말/꼬리말 문단에 글자 서식을 적용한다.
+    pub fn apply_char_format_in_hf_native(
+        &mut self,
+        section_idx: usize,
+        is_header: bool,
+        apply_to: u8,
+        hf_para_idx: usize,
+        start_offset: usize,
+        end_offset: usize,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        let mut mods = parse_char_shape_mods(props_json);
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+
+        let base_id = {
+            let para = self
+                .get_hf_paragraph_ref(section_idx, is_header, apply_to, hf_para_idx)
+                .ok_or_else(|| {
+                    HwpError::RenderError("머리말/꼬리말 문단을 찾을 수 없음".to_string())
+                })?;
+            para.char_shape_id_at(start_offset).unwrap_or(0)
+        };
+        let new_id = self.document.find_or_create_char_shape(base_id, &mods);
+
+        {
+            let para = self.get_hf_paragraph_mut(section_idx, is_header, apply_to, hf_para_idx)?;
+            para.apply_char_shape_range(start_offset, end_offset, new_id);
+        }
+
+        if hf_char_shape_mods_affect_text_flow(&mods) {
+            self.reflow_hf_paragraph(section_idx, is_header, apply_to, hf_para_idx);
+        }
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.rebuild_section(section_idx);
+        self.event_log.push(DocumentEvent::CharFormatChanged {
+            section: section_idx,
+            para: 0,
+            start: start_offset,
+            end: end_offset,
+        });
+        Ok("{\"ok\":true}".to_string())
     }
 
     /// 머리말/꼬리말 문단에 문단 서식을 적용한다.
@@ -1014,6 +1070,7 @@ impl DocumentCore {
 
             let new_td = TabDef {
                 raw_data: None,
+                raw_hwpx_children: None,
                 attr: 0,
                 tabs: vec![TabItem {
                     position: text_width as u32,

@@ -88,6 +88,9 @@ pub struct FootnoteShape {
     pub print_inline_after_text: bool,
     /// HWP5 미문서화 2바이트. 한컴 UI의 "주석 사이" 값으로 사용된다.
     pub raw_unknown: u16,
+    /// HWPX `<hp:footNotePr>` / `<hp:endNotePr>` child XML 원본 조각.
+    /// 의미 필드는 별도로 파싱하되, 확장 child와 원본 순서를 왕복 저장에서 보존한다.
+    pub raw_hwpx_children: Option<String>,
 }
 
 impl FootnoteShape {

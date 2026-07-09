@@ -14,4 +14,6 @@
 //! - Vision/OCR 분석 (Claude Code Skill의 멀티모달 능력)
 //! - HWPX/HWP5 직렬화 (`crate::serializer`의 책임)
 
+pub mod document_template;
 pub mod exam_paper;
+pub mod government_report;

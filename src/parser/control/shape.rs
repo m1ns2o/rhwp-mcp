@@ -6,10 +6,10 @@ use super::parse_caption;
 use crate::model::control::Control;
 use crate::model::image::{ImageEffect, Picture};
 use crate::model::shape::{
-    ArcShape, Caption, CaptionDirection, ChartShape, ChartType, CommonObjAttr, CurveShape,
-    DrawingObjAttr, EllipseShape, GroupShape, HorzAlign, HorzRelTo, LineShape, OleDrawingAspect,
-    OleShape, PolygonShape, RectangleShape, ShapeComponentAttr, ShapeObject, TextWrap, VertAlign,
-    VertRelTo,
+    apply_rhwp_chart_data_semantic, ArcShape, Caption, CaptionDirection, ChartShape, ChartType,
+    CommonObjAttr, CurveShape, DrawingObjAttr, EllipseShape, GroupShape, HorzAlign, HorzRelTo,
+    LineShape, OleDrawingAspect, OleShape, PolygonShape, RectangleShape, ShapeComponentAttr,
+    ShapeObject, TextWrap, VertAlign, VertRelTo,
 };
 use crate::model::style::{Fill, ShapeBorderLine};
 use crate::model::Padding;
@@ -35,6 +35,7 @@ pub(crate) fn parse_gso_control(ctrl_data: &[u8], child_records: &[Record]) -> C
     let mut shape_tag_data: &[u8] = &[];
     let mut text_paragraphs = Vec::new();
     let mut is_container = false;
+    let mut group_component_tail = Vec::new();
     // Task #195: 차트/OLE 감지
     let mut chart_data_bytes: Option<Vec<u8>> = None;
     let mut ole_tag_data: Option<&[u8]> = None;
@@ -75,22 +76,29 @@ pub(crate) fn parse_gso_control(ctrl_data: &[u8], child_records: &[Record]) -> C
         match record.tag_id {
             tags::HWPTAG_SHAPE_COMPONENT if !shape_component_parsed => {
                 shape_component_parsed = true;
-                let parsed = parse_shape_component_full(&record.data);
-                drawing.shape_attr = parsed.attr;
-                drawing.border_line = parsed.border;
-                drawing.fill = parsed.fill;
-                drawing.shadow_type = parsed.shadow_type;
-                drawing.shadow_color = parsed.shadow_color;
-                drawing.shadow_offset_x = parsed.shadow_offset_x;
-                drawing.shadow_offset_y = parsed.shadow_offset_y;
-                drawing.inst_id = parsed.inst_id;
-                drawing.shadow_alpha = parsed.shadow_alpha;
+                if is_container {
+                    let parsed = parse_shape_component_attr_only(&record.data);
+                    drawing.shape_attr = parsed.attr;
+                    group_component_tail = parsed.raw_trailing;
+                } else {
+                    let parsed = parse_shape_component_full(&record.data);
+                    drawing.shape_attr = parsed.attr;
+                    drawing.border_line = parsed.border;
+                    drawing.fill = parsed.fill;
+                    drawing.shadow_type = parsed.shadow_type;
+                    drawing.shadow_color = parsed.shadow_color;
+                    drawing.shadow_offset_x = parsed.shadow_offset_x;
+                    drawing.shadow_offset_y = parsed.shadow_offset_y;
+                    drawing.inst_id = parsed.inst_id;
+                    drawing.shadow_alpha = parsed.shadow_alpha;
+                }
             }
             tags::HWPTAG_SHAPE_COMPONENT_CONTAINER if !shape_component_parsed => {
                 shape_component_parsed = true;
                 is_container = true;
-                let parsed = parse_shape_component_full(&record.data);
+                let parsed = parse_shape_component_attr_only(&record.data);
                 drawing.shape_attr = parsed.attr;
+                group_component_tail = parsed.raw_trailing;
             }
             tags::HWPTAG_SHAPE_COMPONENT_LINE
             | tags::HWPTAG_SHAPE_COMPONENT_RECTANGLE
@@ -204,7 +212,7 @@ pub(crate) fn parse_gso_control(ctrl_data: &[u8], child_records: &[Record]) -> C
         chart.drawing = drawing;
         chart.raw_chart_data = raw_chart;
         chart.caption = chart.drawing.caption.take();
-        // 단계 4에서 chart_type/title/series를 raw_chart_data에서 추출
+        apply_rhwp_chart_data_semantic(&mut chart);
         return Control::Shape(Box::new(ShapeObject::Chart(Box::new(chart))));
     }
 
@@ -230,6 +238,8 @@ pub(crate) fn parse_gso_control(ctrl_data: &[u8], child_records: &[Record]) -> C
         group.common = common;
         group.shape_attr = drawing.shape_attr;
         group.children = parse_container_children(child_records);
+        group.raw_component_extra =
+            group_component_extra(&group_component_tail, group.children.len());
         group.caption = drawing.caption;
         return Control::Shape(Box::new(ShapeObject::Group(group)));
     }
@@ -446,31 +456,26 @@ struct ShapeComponentParsed {
     shadow_alpha: u8,
 }
 
-/// SHAPE_COMPONENT 레코드 전체 파싱 (ShapeComponentAttr + border_line + fill + shadow)
+struct ShapeComponentBaseParsed {
+    attr: ShapeComponentAttr,
+    raw_trailing: Vec<u8>,
+}
+
+/// SHAPE_COMPONENT 공통 영역 파싱 (ShapeComponentAttr + rendering + trailing).
 ///
 /// 레코드 구조:
 /// - 컨트롤 ID (4바이트) × 1~2회 (GenShapeObject이면 2회)
 /// - ShapeComponentAttr (42바이트)
 /// - Rendering 정보 (2 + 48 + cnt×96 바이트)
-/// - 테두리 선 정보 (13바이트: color 4 + width 4 + attr 4 + outline 1)
-/// - 채우기 정보 (가변)
-/// - 그림자 정보 (16바이트: type 4 + color 4 + offsetX 4 + offsetY 4)
-fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
+fn parse_shape_component_attr_only(data: &[u8]) -> ShapeComponentBaseParsed {
     // 컨트롤 ID 건너뛰기: GenShapeObject(top-level)이면 ID 2회, group child이면 1회
     let is_two_ctrl_id = data.len() >= 8 && data[0..4] == data[4..8];
     let id_offset = if is_two_ctrl_id { 8 } else { 4 };
 
     if data.len() < id_offset {
-        return ShapeComponentParsed {
+        return ShapeComponentBaseParsed {
             attr: ShapeComponentAttr::default(),
-            border: ShapeBorderLine::default(),
-            fill: Fill::default(),
-            shadow_type: 0,
-            shadow_color: 0,
-            shadow_offset_x: 0,
-            shadow_offset_y: 0,
-            inst_id: 0,
-            shadow_alpha: 0,
+            raw_trailing: Vec::new(),
         };
     }
 
@@ -508,7 +513,7 @@ fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
     // 렌더링 행렬 시작 위치
     let rendering_start = id_offset + r.position();
 
-    // Rendering 정보 파싱 (변환 행렬) — 합성 변환 계산 후 border/fill 파싱
+    // Rendering 정보 파싱 (변환 행렬)
     let cnt = r.read_u16().unwrap_or(0) as usize;
     {
         // 아핀 변환 행렬: [a, b, tx, c, d, ty] → (x',y') = (a*x+b*y+tx, c*x+d*y+ty)
@@ -525,15 +530,14 @@ fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
             }
             m
         }
-        // 두 아핀 행렬 합성: result = A × B
         fn compose(a: &[f64; 6], b: &[f64; 6]) -> [f64; 6] {
             [
-                a[0] * b[0] + a[1] * b[3],        // a
-                a[0] * b[1] + a[1] * b[4],        // b
-                a[0] * b[2] + a[1] * b[5] + a[2], // tx
-                a[3] * b[0] + a[4] * b[3],        // c
-                a[3] * b[1] + a[4] * b[4],        // d
-                a[3] * b[2] + a[4] * b[5] + a[5], // ty
+                a[0] * b[0] + a[1] * b[3],
+                a[0] * b[1] + a[1] * b[4],
+                a[0] * b[2] + a[1] * b[5] + a[2],
+                a[3] * b[0] + a[4] * b[3],
+                a[3] * b[1] + a[4] * b[4],
+                a[3] * b[2] + a[4] * b[5] + a[5],
             ]
         }
 
@@ -545,21 +549,41 @@ fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
             result = compose(&result, &rotation);
             result = compose(&result, &scale);
         }
-        // 합성된 아핀 행렬 [a, b, tx, c, d, ty] 추출
-        attr.render_sx = result[0]; // a
-        attr.render_b = result[1]; // b (회전/전단 성분)
-        attr.render_tx = result[2]; // tx
-        attr.render_c = result[3]; // c (회전/전단 성분)
-        attr.render_sy = result[4]; // d
-        attr.render_ty = result[5]; // ty
+        attr.render_sx = result[0];
+        attr.render_b = result[1];
+        attr.render_tx = result[2];
+        attr.render_c = result[3];
+        attr.render_sy = result[4];
+        attr.render_ty = result[5];
     }
 
-    // raw_rendering: 렌더링 행렬만 보존 (border/fill/shadow 제외)
-    // 속성 편집 후에도 렌더링 행렬을 라운드트립 보존하기 위함
     let rendering_end = id_offset + r.position();
     if rendering_start < data.len() {
         attr.raw_rendering = data[rendering_start..rendering_end.min(data.len())].to_vec();
     }
+
+    let raw_trailing = if r.remaining() > 0 {
+        r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+    } else {
+        Vec::new()
+    };
+
+    ShapeComponentBaseParsed { attr, raw_trailing }
+}
+
+/// SHAPE_COMPONENT 레코드 전체 파싱 (ShapeComponentAttr + border_line + fill + shadow)
+///
+/// 레코드 구조:
+/// - 컨트롤 ID (4바이트) × 1~2회 (GenShapeObject이면 2회)
+/// - ShapeComponentAttr (42바이트)
+/// - Rendering 정보 (2 + 48 + cnt×96 바이트)
+/// - 테두리 선 정보 (13바이트: color 4 + width 4 + attr 4 + outline 1)
+/// - 채우기 정보 (가변)
+/// - 그림자 정보 (16바이트: type 4 + color 4 + offsetX 4 + offsetY 4)
+fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
+    let base = parse_shape_component_attr_only(data);
+    let attr = base.attr;
+    let mut r = ByteReader::new(&base.raw_trailing);
 
     // 테두리 선 정보 (13바이트: color 4 + width 4 + attr 4 + outline 1)
     // hwplib 참조: color=readUInt4, thickness=readSInt4, property=readUInt4, outlineStyle=readUInt1
@@ -619,6 +643,20 @@ fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
     }
 }
 
+fn group_component_extra(raw_tail: &[u8], child_count: usize) -> Vec<u8> {
+    if raw_tail.len() < 2 {
+        return raw_tail.to_vec();
+    }
+
+    let encoded_child_count = u16::from_le_bytes([raw_tail[0], raw_tail[1]]) as usize;
+    let synthesized_len = 2 + encoded_child_count.saturating_mul(4) + 4;
+    if encoded_child_count == child_count && raw_tail.len() >= synthesized_len {
+        raw_tail[synthesized_len..].to_vec()
+    } else {
+        Vec::new()
+    }
+}
+
 /// 묶음 개체(Container)의 자식 도형 파싱
 ///
 /// SHAPE_COMPONENT_CONTAINER 또는 첫 SHAPE_COMPONENT 이후의 레코드에서
@@ -626,40 +664,30 @@ fn parse_shape_component_full(data: &[u8]) -> ShapeComponentParsed {
 fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
     let mut children = Vec::new();
 
-    // SHAPE_COMPONENT_CONTAINER 이후 또는 구버전 그룹의 첫 SHAPE_COMPONENT 이후
-    let container_idx = child_records
-        .iter()
-        .position(|r| r.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER);
+    // 그룹 자신의 component 위치 찾기 (캡션 등이 앞에 올 수 있음).
+    // 중첩 그룹 자식도 SHAPE_COMPONENT_CONTAINER를 쓰므로, 전체 범위의 첫
+    // CONTAINER를 무조건 그룹 자신으로 취급하면 앞쪽 형제를 건너뛸 수 있다.
+    let group_component_idx = child_records.iter().position(|r| {
+        r.tag_id == tags::HWPTAG_SHAPE_COMPONENT
+            || r.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER
+    });
 
-    // 첫 SHAPE_COMPONENT 위치 찾기 (캡션 등이 앞에 올 수 있음)
-    let first_sc_idx = child_records
-        .iter()
-        .position(|r| r.tag_id == tags::HWPTAG_SHAPE_COMPONENT);
-
-    let start = match container_idx {
-        Some(idx) => idx + 1,
-        None => {
-            // 구버전: CONTAINER 태그 없이 첫 SHAPE_COMPONENT가 그룹 자체
-            if let Some(sc_idx) = first_sc_idx {
-                sc_idx + 1 // 첫 SHAPE_COMPONENT(그룹 자체) 건너뛰고 자식부터 시작
-            } else {
-                return children;
-            }
-        }
+    let Some(group_component_idx) = group_component_idx else {
+        return children;
     };
+    let start = group_component_idx + 1;
 
     let records = &child_records[start..];
 
-    // SHAPE_COMPONENT를 기준으로 자식 도형 경계 식별
-    // 직접 자식 레벨의 SHAPE_COMPONENT만 경계로 사용 (인라인 컨트롤의 깊은 레벨 제외)
-    let parent_level = first_sc_idx
-        .map(|i| child_records[i].level)
-        .or_else(|| child_records.first().map(|r| r.level))
-        .unwrap_or(0);
+    // 직접 자식 레벨의 SHAPE_COMPONENT/CONTAINER만 경계로 사용한다.
+    let parent_level = child_records[group_component_idx].level;
     let child_level = parent_level + 1;
     let mut comp_indices: Vec<usize> = Vec::new();
     for (i, record) in records.iter().enumerate() {
-        if record.tag_id == tags::HWPTAG_SHAPE_COMPONENT && record.level == child_level {
+        if (record.tag_id == tags::HWPTAG_SHAPE_COMPONENT
+            || record.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER)
+            && record.level == child_level
+        {
             comp_indices.push(i);
         }
     }
@@ -676,29 +704,12 @@ fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
             continue;
         }
 
-        // SHAPE_COMPONENT에서 속성+테두리+채우기+그림자 파싱
-        let parsed = parse_shape_component_full(&child_slice[0].data);
-        let mut child_drawing = DrawingObjAttr {
-            shape_attr: parsed.attr,
-            border_line: parsed.border,
-            fill: parsed.fill,
-            shadow_type: parsed.shadow_type,
-            shadow_color: parsed.shadow_color,
-            shadow_offset_x: parsed.shadow_offset_x,
-            shadow_offset_y: parsed.shadow_offset_y,
-            inst_id: parsed.inst_id,
-            shadow_alpha: parsed.shadow_alpha,
-            text_box: None,
-            caption: None,
-        };
-        // tb_attr: SHAPE_COMPONENT 인라인 텍스트 속성 (미구현, 항상 None)
-        let tb_attr: Option<(i16, i16, i16, i16, u32, u32)> = None;
-
         // 도형 태그 찾기 (직접 자식 level만 — 중첩 Group 자식 제외)
         let direct_child_level = child_slice[0].level + 1;
         let mut shape_tag_id: Option<u16> = None;
         let mut shape_tag_data: &[u8] = &[];
-        for record in &child_slice[1..] {
+        let mut shape_tag_idx: Option<usize> = None;
+        for (offset, record) in child_slice[1..].iter().enumerate() {
             if record.level != direct_child_level {
                 continue;
             }
@@ -712,24 +723,66 @@ fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
                 | tags::HWPTAG_SHAPE_COMPONENT_PICTURE => {
                     shape_tag_id = Some(record.tag_id);
                     shape_tag_data = &record.data;
+                    shape_tag_idx = Some(offset + 1);
                     break;
                 }
                 _ => {}
             }
         }
 
-        // LIST_HEADER 이후 문단 수집 (자식 범위 내)
+        // 중첩 Group 감지: shape tag가 없고 하위 component가 있거나, 자식 자체가 CONTAINER이면 그룹이다.
+        let has_nested_shapes = shape_tag_id.is_none()
+            && child_slice.len() > 1
+            && child_slice[1..].iter().any(|r| {
+                (r.tag_id == tags::HWPTAG_SHAPE_COMPONENT
+                    || r.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER)
+                    && r.level > child_slice[0].level
+            });
+        let is_group_component =
+            child_slice[0].tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER || has_nested_shapes;
+
+        let mut group_raw_component_extra = Vec::new();
+        let mut child_drawing = DrawingObjAttr::default();
+        if is_group_component {
+            let parsed = parse_shape_component_attr_only(&child_slice[0].data);
+            child_drawing.shape_attr = parsed.attr;
+            group_raw_component_extra = parsed.raw_trailing;
+        } else {
+            // SHAPE_COMPONENT에서 속성+테두리+채우기+그림자 파싱
+            let parsed = parse_shape_component_full(&child_slice[0].data);
+            child_drawing.shape_attr = parsed.attr;
+            child_drawing.border_line = parsed.border;
+            child_drawing.fill = parsed.fill;
+            child_drawing.shadow_type = parsed.shadow_type;
+            child_drawing.shadow_color = parsed.shadow_color;
+            child_drawing.shadow_offset_x = parsed.shadow_offset_x;
+            child_drawing.shadow_offset_y = parsed.shadow_offset_y;
+            child_drawing.inst_id = parsed.inst_id;
+            child_drawing.shadow_alpha = parsed.shadow_alpha;
+        }
+        // tb_attr: SHAPE_COMPONENT 인라인 텍스트 속성 (미구현, 항상 None)
+        let tb_attr: Option<(i16, i16, i16, i16, u32, u32)> = None;
+
+        // LIST_HEADER 이후 문단 수집 (자식 범위 내).
+        // 그룹 자식에서는 도형 타입 레코드 앞의 LIST_HEADER를 글상자로,
+        // 도형 타입 레코드 뒤의 LIST_HEADER를 캡션으로 구분한다.
         let mut list_started = false;
         let mut list_header_data: Option<&[u8]> = None;
         let mut list_records: Vec<&Record> = Vec::new();
-        for record in &child_slice[1..] {
-            if record.tag_id == tags::HWPTAG_LIST_HEADER && !list_started {
-                list_started = true;
-                list_header_data = Some(&record.data);
-                continue;
-            }
-            if list_started {
-                list_records.push(record);
+        if !is_group_component {
+            let text_box_end = shape_tag_idx.unwrap_or(child_slice.len());
+            for record in &child_slice[1..text_box_end] {
+                if record.tag_id == tags::HWPTAG_LIST_HEADER
+                    && record.level == direct_child_level
+                    && !list_started
+                {
+                    list_started = true;
+                    list_header_data = Some(&record.data);
+                    continue;
+                }
+                if list_started {
+                    list_records.push(record);
+                }
             }
         }
         if !list_records.is_empty() {
@@ -779,20 +832,58 @@ fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
             }
         }
 
-        // 중첩 Group 감지: shape_tag_id가 없고 하위 SHAPE_COMPONENT가 있으면 재귀
-        let has_nested_shapes = shape_tag_id.is_none()
-            && child_slice.len() > 1
-            && child_slice[1..].iter().any(|r| {
-                r.tag_id == tags::HWPTAG_SHAPE_COMPONENT && r.level > child_slice[0].level
-            });
-        // CONTAINER 태그가 있거나 하위 SHAPE_COMPONENT가 있으면 중첩 Group
-        let has_container_tag = child_slice[1..]
-            .iter()
-            .any(|r| r.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER);
-        if has_container_tag || has_nested_shapes {
+        if is_group_component {
+            let caption_end = child_slice[1..]
+                .iter()
+                .position(|r| {
+                    (r.tag_id == tags::HWPTAG_SHAPE_COMPONENT
+                        || r.tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER)
+                        && r.level == direct_child_level
+                })
+                .map(|idx| idx + 1)
+                .unwrap_or(child_slice.len());
+            if let Some(caption_rel_idx) = child_slice[1..caption_end]
+                .iter()
+                .position(|r| r.tag_id == tags::HWPTAG_LIST_HEADER && r.level == direct_child_level)
+            {
+                let caption_start = 1 + caption_rel_idx;
+                let caption_records: Vec<Record> = child_slice[caption_start..caption_end]
+                    .iter()
+                    .cloned()
+                    .collect();
+                if !caption_records.is_empty() {
+                    child_drawing.caption = Some(parse_caption(&caption_records));
+                }
+            }
+        } else if let Some(tag_idx) = shape_tag_idx {
+            if let Some(caption_rel_idx) = child_slice[tag_idx + 1..]
+                .iter()
+                .position(|r| r.tag_id == tags::HWPTAG_LIST_HEADER && r.level == direct_child_level)
+            {
+                let caption_start = tag_idx + 1 + caption_rel_idx;
+                let caption_records: Vec<Record> =
+                    child_slice[caption_start..].iter().cloned().collect();
+                if !caption_records.is_empty() {
+                    child_drawing.caption = Some(parse_caption(&caption_records));
+                }
+            }
+        }
+
+        let child_common =
+            group_child_common_from_shape_attr(&child_drawing.shape_attr, children.len());
+
+        if is_group_component {
             let mut group = GroupShape::default();
+            group.common = child_common;
             group.shape_attr = child_drawing.shape_attr.clone();
             group.children = parse_container_children(child_slice);
+            group.raw_component_extra =
+                if child_slice[0].tag_id == tags::HWPTAG_SHAPE_COMPONENT_CONTAINER {
+                    group_raw_component_extra
+                } else {
+                    group_component_extra(&group_raw_component_extra, group.children.len())
+                };
+            group.caption = child_drawing.caption.take();
             children.push(ShapeObject::Group(group));
             continue;
         }
@@ -802,50 +893,58 @@ fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
             Some(tags::HWPTAG_SHAPE_COMPONENT_LINE) => {
                 let mut line = LineShape::default();
                 let is_connector = child_drawing.shape_attr.ctrl_id == tags::SHAPE_CONNECTOR_ID;
+                line.common = child_common;
                 line.drawing = child_drawing;
                 parse_line_shape_data(shape_tag_data, &mut line, is_connector);
                 ShapeObject::Line(line)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_RECTANGLE) => {
                 let mut rect = RectangleShape::default();
+                rect.common = child_common;
                 rect.drawing = child_drawing;
                 parse_rect_shape_data(shape_tag_data, &mut rect);
                 ShapeObject::Rectangle(rect)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_ELLIPSE) => {
                 let mut ellipse = EllipseShape::default();
+                ellipse.common = child_common;
                 ellipse.drawing = child_drawing;
                 parse_ellipse_shape_data(shape_tag_data, &mut ellipse);
                 ShapeObject::Ellipse(ellipse)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_ARC) => {
                 let mut arc = ArcShape::default();
+                arc.common = child_common;
                 arc.drawing = child_drawing;
                 parse_arc_shape_data(shape_tag_data, &mut arc);
                 ShapeObject::Arc(arc)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_POLYGON) => {
                 let mut poly = PolygonShape::default();
+                poly.common = child_common;
                 poly.drawing = child_drawing;
                 parse_polygon_shape_data(shape_tag_data, &mut poly);
                 ShapeObject::Polygon(poly)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_CURVE) => {
                 let mut curve = CurveShape::default();
+                curve.common = child_common;
                 curve.drawing = child_drawing;
                 parse_curve_shape_data(shape_tag_data, &mut curve);
                 ShapeObject::Curve(curve)
             }
             Some(tags::HWPTAG_SHAPE_COMPONENT_PICTURE) => {
-                let picture = parse_picture(
-                    CommonObjAttr::default(),
+                let mut picture = parse_picture(
+                    child_common,
                     child_drawing.shape_attr.clone(),
                     shape_tag_data,
                 );
+                picture.caption = child_drawing.caption.take();
                 ShapeObject::Picture(Box::new(picture))
             }
             _ => {
                 let mut rect = RectangleShape::default();
+                rect.common = child_common;
                 rect.drawing = child_drawing;
                 ShapeObject::Rectangle(rect)
             }
@@ -855,6 +954,25 @@ fn parse_container_children(child_records: &[Record]) -> Vec<ShapeObject> {
     }
 
     children
+}
+
+fn group_child_common_from_shape_attr(attr: &ShapeComponentAttr, z_order: usize) -> CommonObjAttr {
+    let mut common = CommonObjAttr::default();
+    common.ctrl_id = tags::CTRL_GEN_SHAPE;
+    common.horizontal_offset = attr.offset_x.max(0) as u32;
+    common.vertical_offset = attr.offset_y.max(0) as u32;
+    common.width = if attr.current_width > 0 {
+        attr.current_width
+    } else {
+        attr.original_width
+    };
+    common.height = if attr.current_height > 0 {
+        attr.current_height
+    } else {
+        attr.original_height
+    };
+    common.z_order = z_order as i32;
+    common
 }
 
 /// 그림 개체 파싱
@@ -976,9 +1094,15 @@ fn parse_line_shape_data(data: &[u8], line: &mut LineShape, is_connector: bool) 
             control_points,
             raw_trailing,
         });
+        line.raw_trailing.clear();
     } else {
         // 일반 선
         line.started_right_or_bottom = r.read_i32().unwrap_or(0) != 0;
+        line.raw_trailing = if r.remaining() > 0 {
+            r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+        } else {
+            Vec::new()
+        };
     }
 }
 
@@ -991,6 +1115,11 @@ fn parse_rect_shape_data(data: &[u8], rect: &mut RectangleShape) {
         rect.x_coords[i] = r.read_i32().unwrap_or(0);
         rect.y_coords[i] = r.read_i32().unwrap_or(0);
     }
+    rect.raw_trailing = if r.remaining() > 0 {
+        r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+    } else {
+        Vec::new()
+    };
 }
 
 /// 타원 도형 데이터 파싱 (60바이트)
@@ -1011,6 +1140,11 @@ fn parse_ellipse_shape_data(data: &[u8], ellipse: &mut EllipseShape) {
     ellipse.start2.y = r.read_i32().unwrap_or(0);
     ellipse.end2.x = r.read_i32().unwrap_or(0);
     ellipse.end2.y = r.read_i32().unwrap_or(0);
+    ellipse.raw_trailing = if r.remaining() > 0 {
+        r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+    } else {
+        Vec::new()
+    };
 }
 
 /// 호 도형 데이터 파싱 (hwplib: UINT8 arcType + 6×INT32 좌표 = 25바이트)
@@ -1023,6 +1157,11 @@ fn parse_arc_shape_data(data: &[u8], arc: &mut ArcShape) {
     arc.axis1.y = r.read_i32().unwrap_or(0);
     arc.axis2.x = r.read_i32().unwrap_or(0);
     arc.axis2.y = r.read_i32().unwrap_or(0);
+    arc.raw_trailing = if r.remaining() > 0 {
+        r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+    } else {
+        Vec::new()
+    };
 }
 
 /// 다각형 도형 데이터 파싱
@@ -1061,8 +1200,11 @@ fn parse_curve_shape_data(data: &[u8], curve: &mut CurveShape) {
             curve.segment_types.push(r.read_u8().unwrap_or(0));
         }
     }
-    // hwplib: sr.skip(4) — 4바이트 패딩
-    let _ = r.read_u32();
+    curve.raw_trailing = if r.remaining() > 0 {
+        r.read_bytes(r.remaining()).unwrap_or_default().to_vec()
+    } else {
+        Vec::new()
+    };
 }
 
 // ============================================================

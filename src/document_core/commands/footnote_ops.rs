@@ -1,8 +1,8 @@
 //! 각주 내용 편집 관련 native 메서드
 
 use super::super::helpers::{
-    build_tab_def_from_json, json_has_border_keys, json_has_tab_keys, parse_json_i16_array,
-    parse_para_shape_mods,
+    build_tab_def_from_json, json_has_border_keys, json_has_tab_keys, parse_char_shape_mods,
+    parse_json_i16_array, parse_para_shape_mods,
 };
 use crate::document_core::DocumentCore;
 use crate::error::HwpError;
@@ -10,6 +10,15 @@ use crate::model::control::Control;
 use crate::model::event::DocumentEvent;
 use crate::model::paragraph::Paragraph;
 use crate::renderer::composer::reflow_line_segs;
+
+fn note_char_shape_mods_affect_text_flow(mods: &crate::model::style::CharShapeMods) -> bool {
+    mods.base_size.is_some()
+        || mods.font_ids.is_some()
+        || mods.ratios.is_some()
+        || mods.spacings.is_some()
+        || mods.relative_sizes.is_some()
+        || mods.char_offsets.is_some()
+}
 
 impl DocumentCore {
     fn renumber_footnotes_in_section(&mut self, section_idx: usize) {
@@ -409,6 +418,50 @@ impl DocumentCore {
         self.event_log.push(DocumentEvent::ParaFormatChanged {
             section: section_idx,
             para: para_idx,
+        });
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// 각주/미주 내부 문단에 글자 서식을 적용한다.
+    pub fn apply_char_format_in_footnote_native(
+        &mut self,
+        section_idx: usize,
+        para_idx: usize,
+        control_idx: usize,
+        fn_para_idx: usize,
+        start_offset: usize,
+        end_offset: usize,
+        props_json: &str,
+    ) -> Result<String, HwpError> {
+        let mut mods = parse_char_shape_mods(props_json);
+        if json_has_border_keys(props_json) {
+            let bf_id = self.create_border_fill_from_json(props_json);
+            mods.border_fill_id = Some(bf_id);
+        }
+
+        let base_id = self
+            .get_footnote_paragraph_ref(section_idx, para_idx, control_idx, fn_para_idx)
+            .ok_or_else(|| HwpError::RenderError("각주/미주 문단을 찾을 수 없음".to_string()))?
+            .char_shape_id_at(start_offset)
+            .unwrap_or(0);
+        let new_id = self.document.find_or_create_char_shape(base_id, &mods);
+        {
+            let fn_para =
+                self.get_footnote_paragraph_mut(section_idx, para_idx, control_idx, fn_para_idx)?;
+            fn_para.apply_char_shape_range(start_offset, end_offset, new_id);
+        }
+
+        if note_char_shape_mods_affect_text_flow(&mods) {
+            self.reflow_footnote_paragraph(section_idx, para_idx, control_idx, fn_para_idx);
+        }
+
+        self.document.sections[section_idx].raw_stream = None;
+        self.rebuild_section(section_idx);
+        self.event_log.push(DocumentEvent::CharFormatChanged {
+            section: section_idx,
+            para: para_idx,
+            start: start_offset,
+            end: end_offset,
         });
         Ok("{\"ok\":true}".to_string())
     }

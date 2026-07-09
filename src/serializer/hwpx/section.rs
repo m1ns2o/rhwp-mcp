@@ -22,16 +22,19 @@
 use quick_xml::Writer;
 
 use crate::model::control::{
-    AutoNumber, AutoNumberType, CharOverlap, Control, Equation, Field, NewNumber, PageHide,
-    PageNumberPos,
+    AutoNumber, AutoNumberType, CharOverlap, Control, Equation, Field, HiddenComment, NewNumber,
+    PageHide, PageNumberPos,
 };
 use crate::model::document::{Document, Section};
-use crate::model::footnote::{Endnote, Footnote};
+use crate::model::footnote::{
+    Endnote, Footnote, FootnoteNumbering, FootnotePlacement, FootnoteShape, NumberFormat,
+};
 use crate::model::header_footer::{Footer, Header, HeaderFooterApply};
 use crate::model::page::{ColumnDef, ColumnDirection, ColumnType};
-use crate::model::paragraph::{ColumnBreakType, LineSeg, Paragraph};
+use crate::model::paragraph::{ColumnBreakType, HwpxTextMarker, LineSeg, Paragraph};
 use crate::model::shape::{
-    CommonObjAttr, HorzAlign, HorzRelTo, ShapeObject, TextWrap, VertAlign, VertRelTo,
+    CommonObjAttr, HorzAlign, HorzRelTo, ObjectNumberingType, ShapeObject, SizeCriterion, TextFlow,
+    TextWrap, VertAlign, VertRelTo,
 };
 
 use super::context::SerializeContext;
@@ -86,7 +89,9 @@ pub fn write_section(
     // linesegarray 치환을 콘텐츠(run 시퀀스) 삽입보다 먼저 두어, 콘텐츠에 포함된
     // 중첩 linesegarray(각주·머리말 등)가 anchor 탐색을 오염시키지 않도록 한다.
     let mut out = replace_first_linesegs(EMPTY_SECTION_XML, &first_linesegs);
+    out = replace_section_def_attrs(&out, &section.section_def);
     out = replace_page_pr(&out, &section.section_def.page_def);
+    out = replace_note_shapes(&out, &section.section_def);
     // 쪽 테두리/배경 — 템플릿의 하드코딩 borderFillIDRef="1"(테두리 없음)을 IR 값으로
     // 치환한다. 누락 시 문서의 쪽 테두리가 소실되어 외곽 4선 노드가 사라진다(#1388 동형).
     out = replace_page_border_fill(&out, &section.section_def);
@@ -227,9 +232,24 @@ pub(crate) fn render_hp_t_content(
     tab_extended: &[[u16; 7]],
     tab_idx: &mut usize,
 ) -> String {
+    render_hp_t_content_with_markers(text, tab_extended, tab_idx, &[])
+}
+
+fn render_hp_t_content_with_markers(
+    text: &str,
+    tab_extended: &[[u16; 7]],
+    tab_idx: &mut usize,
+    markers: &[HwpxTextMarker],
+) -> String {
     let mut t_xml = String::from("<hp:t>");
     let mut buf = String::new();
-    for c in text.chars() {
+    let mut marker_idx = 0usize;
+    for (char_idx, c) in text.chars().enumerate() {
+        while marker_idx < markers.len() && markers[marker_idx].char_idx <= char_idx {
+            flush_buf(&mut t_xml, &mut buf);
+            t_xml.push_str(&markers[marker_idx].raw_xml);
+            marker_idx += 1;
+        }
         match c {
             '\t' => {
                 flush_buf(&mut t_xml, &mut buf);
@@ -253,6 +273,10 @@ pub(crate) fn render_hp_t_content(
         }
     }
     flush_buf(&mut t_xml, &mut buf);
+    while marker_idx < markers.len() {
+        t_xml.push_str(&markers[marker_idx].raw_xml);
+        marker_idx += 1;
+    }
     t_xml.push_str("</hp:t>");
     t_xml
 }
@@ -364,6 +388,7 @@ fn emit_field_end(out: &mut String, para: &Paragraph, control_idx: usize) {
 /// 있어도 경계 위치가 어긋나지 않는다.
 fn split_text_into(splitter: &mut RunSplitter, para: &Paragraph, tab_idx: &mut usize) {
     let mut text_buf = String::new();
+    let mut text_buf_start: Option<usize> = None;
     let mut running_pos = 0u32;
     for (idx, c) in para.text.chars().enumerate() {
         let char_pos = para.char_offsets.get(idx).copied().unwrap_or(running_pos);
@@ -371,10 +396,16 @@ fn split_text_into(splitter: &mut RunSplitter, para: &Paragraph, tab_idx: &mut u
             flush_text_fragment(
                 &mut splitter.content,
                 &mut text_buf,
+                &mut text_buf_start,
+                para,
                 &para.tab_extended,
                 tab_idx,
+                false,
             );
             splitter.cut_before(char_pos);
+        }
+        if text_buf.is_empty() {
+            text_buf_start = Some(idx);
         }
         text_buf.push(c);
         running_pos = char_pos
@@ -384,8 +415,11 @@ fn split_text_into(splitter: &mut RunSplitter, para: &Paragraph, tab_idx: &mut u
     flush_text_fragment(
         &mut splitter.content,
         &mut text_buf,
+        &mut text_buf_start,
+        para,
         &para.tab_extended,
         tab_idx,
+        true,
     );
 }
 
@@ -432,7 +466,13 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
 
     // fast path: 슬롯·필드·경계 없음 — 텍스트 전체를 단일 run 으로
     if slots.is_empty() && para.field_ranges.is_empty() && splitter.single_run() {
-        let t = render_hp_t_content(&para.text, &para.tab_extended, &mut tab_idx);
+        let markers = markers_for_fragment(para, 0, para.text.chars().count(), true);
+        let t = render_hp_t_content_with_markers(
+            &para.text,
+            &para.tab_extended,
+            &mut tab_idx,
+            &markers,
+        );
         splitter.content.push_str(&t);
         return splitter.finish();
     }
@@ -448,6 +488,7 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
 
     // 메인 경로 — UTF-16 위치 축 위에서 슬롯/필드/문자/경계를 함께 처리
     let mut text_buf = String::new();
+    let mut text_buf_start: Option<usize> = None;
     let mut slot_idx = 0usize;
     let mut expected_utf16_pos = 0u32;
     let mut field_end_emitted = vec![false; para.field_ranges.len()];
@@ -484,8 +525,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             flush_text_fragment(
                 &mut splitter.content,
                 &mut text_buf,
+                &mut text_buf_start,
+                para,
                 &para.tab_extended,
                 &mut tab_idx,
+                false,
             );
             // 슬롯 시작 위치의 경계 — 슬롯은 새 run 소속 (규칙 1)
             splitter.cut_before(expected_utf16_pos);
@@ -505,8 +549,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 flush_text_fragment(
                     &mut splitter.content,
                     &mut text_buf,
+                    &mut text_buf_start,
+                    para,
                     &para.tab_extended,
                     &mut tab_idx,
+                    false,
                 );
                 splitter.cut_before(expected_utf16_pos);
                 emit_field_end(&mut splitter.content, para, fr.control_idx);
@@ -536,8 +583,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             flush_text_fragment(
                 &mut splitter.content,
                 &mut text_buf,
+                &mut text_buf_start,
+                para,
                 &para.tab_extended,
                 &mut tab_idx,
+                false,
             );
             splitter.cut_before(expected_utf16_pos);
             render_control_slot(&mut splitter.content, slots[slot_idx], ctx);
@@ -551,12 +601,18 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
             flush_text_fragment(
                 &mut splitter.content,
                 &mut text_buf,
+                &mut text_buf_start,
+                para,
                 &para.tab_extended,
                 &mut tab_idx,
+                false,
             );
             splitter.cut_before(char_pos);
         }
 
+        if text_buf.is_empty() {
+            text_buf_start = Some(idx);
+        }
         text_buf.push(c);
         let width = char_utf16_width(c);
         if char_pos >= expected_utf16_pos {
@@ -576,8 +632,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
                 flush_text_fragment(
                     &mut splitter.content,
                     &mut text_buf,
+                    &mut text_buf_start,
+                    para,
                     &para.tab_extended,
                     &mut tab_idx,
+                    false,
                 );
                 splitter.cut_before(expected_utf16_pos);
                 emit_field_end(&mut splitter.content, para, fr.control_idx);
@@ -593,8 +652,11 @@ fn render_runs(para: &Paragraph, ctx: &mut SerializeContext) -> String {
     flush_text_fragment(
         &mut splitter.content,
         &mut text_buf,
+        &mut text_buf_start,
+        para,
         &para.tab_extended,
         &mut tab_idx,
+        true,
     );
 
     // end_char_idx >= text.len() 인 경우 루프에서 감지되지 않으므로 루프 후에 처리
@@ -672,6 +734,7 @@ pub(crate) fn is_hwpx_inline_slot(control: &Control) -> bool {
             | Control::NewNumber(_)
             | Control::Header(_)
             | Control::Footer(_)
+            | Control::HiddenComment(_)
             | Control::AutoNumber(_)
     )
 }
@@ -679,13 +742,51 @@ pub(crate) fn is_hwpx_inline_slot(control: &Control) -> bool {
 fn flush_text_fragment(
     out: &mut String,
     text_buf: &mut String,
+    text_buf_start: &mut Option<usize>,
+    para: &Paragraph,
     tab_extended: &[[u16; 7]],
     tab_idx: &mut usize,
+    include_end_markers: bool,
 ) {
     if !text_buf.is_empty() {
-        out.push_str(&render_hp_t_content(text_buf, tab_extended, tab_idx));
+        let start = text_buf_start.take().unwrap_or(0);
+        let len = text_buf.chars().count();
+        let markers = markers_for_fragment(para, start, len, include_end_markers);
+        out.push_str(&render_hp_t_content_with_markers(
+            text_buf,
+            tab_extended,
+            tab_idx,
+            &markers,
+        ));
         text_buf.clear();
     }
+}
+
+fn markers_for_fragment(
+    para: &Paragraph,
+    start_char_idx: usize,
+    char_len: usize,
+    include_end_markers: bool,
+) -> Vec<HwpxTextMarker> {
+    if para.hwpx_text_markers.is_empty() {
+        return Vec::new();
+    }
+    let end_char_idx = start_char_idx + char_len;
+    let mut markers: Vec<HwpxTextMarker> = para
+        .hwpx_text_markers
+        .iter()
+        .filter(|marker| {
+            marker.char_idx >= start_char_idx
+                && (marker.char_idx < end_char_idx
+                    || (include_end_markers && marker.char_idx == end_char_idx))
+        })
+        .map(|marker| HwpxTextMarker {
+            char_idx: marker.char_idx.saturating_sub(start_char_idx),
+            raw_xml: marker.raw_xml.clone(),
+        })
+        .collect();
+    markers.sort_by_key(|marker| marker.char_idx);
+    markers
 }
 
 fn render_control_slot(out: &mut String, control: &Control, ctx: &mut SerializeContext) {
@@ -758,12 +859,14 @@ fn render_control_slot(out: &mut String, control: &Control, ctx: &mut SerializeC
         Control::NewNumber(nn) => out.push_str(&render_new_num(nn)),
         Control::Header(h) => out.push_str(&render_header(h, ctx)),
         Control::Footer(f) => out.push_str(&render_footer(f, ctx)),
+        Control::HiddenComment(comment) => out.push_str(&render_hidden_comment(comment, ctx)),
         Control::AutoNumber(an) => out.push_str(&render_autonum(an)),
         Control::Form(form) => match writer_to_string(|w| super::form::write_form(w, form)) {
             // 폼은 <hp:run> 직접 자식 (Table/Picture와 동일, <hp:ctrl> 비포장)
             Ok(xml) => out.push_str(&xml),
             Err(e) => eprintln!("[hwpx] Form 직렬화 실패: {e}"),
         },
+        Control::Ruby(ruby) => out.push_str(&render_dutmal(ruby)),
         Control::CharOverlap(co) => out.push_str(&render_compose(co)),
         // [Task #1379] 셀·글상자 subList 한정 인라인 colPr 방출.
         // 본문 경로(depth 0)는 섹션 템플릿 첫 run 에서 처리하므로 미방출 유지.
@@ -788,26 +891,41 @@ fn generated_field_parameters(field: &Field) -> Option<String> {
 /// `parse_col_pr` / `parse_col_line`(parser/hwpx/section.rs)의 역매핑.
 fn render_col_pr_ctrl(cd: &ColumnDef) -> String {
     let col_type = match cd.column_type {
-        ColumnType::Distribute => "BalancedNewspaper",
-        ColumnType::Parallel => "Parallel",
+        ColumnType::Distribute => "BALANCED_NEWSPAPER",
+        ColumnType::Parallel => "PARALLEL",
         ColumnType::Normal => "NEWSPAPER",
     };
     let layout = match cd.direction {
         ColumnDirection::RightToLeft => "RIGHT",
         ColumnDirection::LeftToRight => "LEFT",
+        ColumnDirection::Mirror => "MIRROR",
     };
     let mut out = format!(
-        r#"<hp:ctrl><hp:colPr id="" type="{}" layout="{}" colCount="{}" sameSz="{}" sameGap="{}""#,
-        col_type, layout, cd.column_count, cd.same_width as u8, cd.spacing,
+        r#"<hp:ctrl><hp:colPr id="{}" type="{}" layout="{}" colCount="{}" sameSz="{}" sameGap="{}""#,
+        xml_escape(&cd.column_id),
+        col_type,
+        layout,
+        cd.column_count,
+        cd.same_width as u8,
+        cd.spacing,
     );
-    if cd.separator_type != 0 {
+    let has_col_sizes = !cd.same_width && !cd.widths.is_empty();
+    if cd.separator_type != 0 || has_col_sizes {
         out.push('>');
-        out.push_str(&format!(
-            r#"<hp:colLine type="{}" width="{} mm" color="{}"/>"#,
-            col_line_type_str(cd.separator_type),
-            line_width_mm(cd.separator_width),
-            super::shape::color_to_hex(cd.separator_color),
-        ));
+        if cd.separator_type != 0 {
+            out.push_str(&format!(
+                r#"<hp:colLine type="{}" width="{} mm" color="{}"/>"#,
+                col_line_type_str(cd.separator_type),
+                line_width_mm(cd.separator_width),
+                super::shape::color_to_hex(cd.separator_color),
+            ));
+        }
+        if has_col_sizes {
+            for (idx, width) in cd.widths.iter().enumerate() {
+                let gap = cd.gaps.get(idx).copied().unwrap_or(0);
+                out.push_str(&format!(r#"<hp:colSz width="{}" gap="{}"/>"#, width, gap));
+            }
+        }
         out.push_str("</hp:colPr></hp:ctrl>");
     } else {
         out.push_str("/></hp:ctrl>");
@@ -882,6 +1000,37 @@ fn render_compose(co: &CharOverlap) -> String {
     }
     out.push_str("</hp:compose>");
     out
+}
+
+/// `<hp:dutmal>` 덧말(Ruby) — `<hp:run>` 직접 자식.
+/// `parse_dutmal`의 보존 필드를 되살려 main/sub text와 핵심 속성을 유지한다.
+fn render_dutmal(ruby: &crate::model::control::Ruby) -> String {
+    let pos_type = ruby.pos_type.as_deref().unwrap_or("TOP");
+    let align = ruby.align.as_deref().unwrap_or(match ruby.alignment {
+        0 => "LEFT",
+        1 => "RIGHT",
+        2 => "CENTER",
+        _ => "CENTER",
+    });
+    let mut attrs = format!(
+        r#" posType="{}" align="{}""#,
+        xml_escape(pos_type),
+        xml_escape(align)
+    );
+    if let Some(value) = ruby.size_ratio.as_deref() {
+        attrs.push_str(&format!(r#" szRatio="{}""#, xml_escape(value)));
+    }
+    if let Some(value) = ruby.option.as_deref() {
+        attrs.push_str(&format!(r#" option="{}""#, xml_escape(value)));
+    }
+    if let Some(value) = ruby.style_id_ref.as_deref() {
+        attrs.push_str(&format!(r#" styleIDRef="{}""#, xml_escape(value)));
+    }
+    format!(
+        r#"<hp:dutmal{attrs}><hp:mainText>{}</hp:mainText><hp:subText>{}</hp:subText></hp:dutmal>"#,
+        xml_escape(&ruby.main_text),
+        xml_escape(&ruby.ruby_text)
+    )
 }
 
 /// 장식 문자(userChar/prefixChar/suffixChar)용 속성값. '\0'(미설정)은 빈 문자열.
@@ -1142,32 +1291,12 @@ fn render_shape(shape: &ShapeObject, ctx: &mut SerializeContext) -> String {
         }
         return xml;
     }
-    let (tag, c, caption, sa) = match shape {
+    let (tag, c, caption, drawing) = match shape {
         ShapeObject::Rectangle(_) | ShapeObject::Line(_) => unreachable!(),
-        ShapeObject::Ellipse(e) => (
-            "ellipse",
-            &e.common,
-            &e.drawing.caption,
-            Some(&e.drawing.shape_attr),
-        ),
-        ShapeObject::Arc(a) => (
-            "arc",
-            &a.common,
-            &a.drawing.caption,
-            Some(&a.drawing.shape_attr),
-        ),
-        ShapeObject::Polygon(p) => (
-            "polygon",
-            &p.common,
-            &p.drawing.caption,
-            Some(&p.drawing.shape_attr),
-        ),
-        ShapeObject::Curve(cv) => (
-            "curve",
-            &cv.common,
-            &cv.drawing.caption,
-            Some(&cv.drawing.shape_attr),
-        ),
+        ShapeObject::Ellipse(e) => ("ellipse", &e.common, &e.drawing.caption, Some(&e.drawing)),
+        ShapeObject::Arc(a) => ("arc", &a.common, &a.drawing.caption, Some(&a.drawing)),
+        ShapeObject::Polygon(p) => ("polygon", &p.common, &p.drawing.caption, Some(&p.drawing)),
+        ShapeObject::Curve(cv) => ("curve", &cv.common, &cv.drawing.caption, Some(&cv.drawing)),
         ShapeObject::Group(_) => unreachable!(),
         ShapeObject::Picture(pic) => {
             return match writer_to_string(|w| picture::write_picture(w, pic, ctx)) {
@@ -1179,42 +1308,225 @@ fn render_shape(shape: &ShapeObject, ctx: &mut SerializeContext) -> String {
             };
         }
         ShapeObject::Chart(ch) => ("chart", &ch.common, &ch.caption, None),
-        ShapeObject::Ole(o) => ("ole", &o.common, &o.caption, None),
+        ShapeObject::Ole(o) => {
+            if let Some(chart_href) = ctx.resolve_ooxml_chart_href(o.bin_data_id as u16) {
+                let chart_href = chart_href.to_string();
+                return render_hwpx_chart_xml(&o.common, &o.caption, &chart_href, Some(o), ctx);
+            }
+            return render_hwpx_ole_xml(o, ctx);
+        }
     };
-    render_common_shape_xml(tag, c, caption, sa, ctx)
+    render_common_shape_xml(tag, c, caption, drawing, ctx)
+}
+
+fn hwpx_numbering_type_attr(c: &CommonObjAttr) -> String {
+    if !(c.numbering_type_explicit || c.hwp5_gen_shape_attr_bit28) {
+        return String::new();
+    }
+    let value = if c.numbering_type == ObjectNumberingType::None && c.hwp5_gen_shape_attr_bit28 {
+        ObjectNumberingType::Picture
+    } else {
+        c.numbering_type
+    };
+    format!(r#" numberingType="{}""#, numbering_type_to_hwpx(value))
+}
+
+fn hwpx_dropcapstyle_attr(c: &CommonObjAttr) -> String {
+    if let Some(value) = c.dropcap_style.as_deref() {
+        return format!(r#" dropcapstyle="{}""#, xml_escape(value));
+    }
+    if c.numbering_type_explicit {
+        return r#" dropcapstyle="None""#.to_string();
+    }
+    String::new()
+}
+
+fn hwpx_href_attr(c: &CommonObjAttr) -> String {
+    c.href
+        .as_deref()
+        .map(|value| format!(r#" href="{}""#, xml_escape(value)))
+        .unwrap_or_default()
+}
+
+fn hwpx_optional_instid_attr(c: &CommonObjAttr) -> String {
+    if c.inst_id == 0 {
+        String::new()
+    } else {
+        format!(r#" instid="{}""#, c.inst_id)
+    }
+}
+
+fn hwpx_object_instid_or_id(c: &CommonObjAttr) -> u32 {
+    if c.inst_id == 0 {
+        c.instance_id
+    } else {
+        c.inst_id
+    }
+}
+
+fn render_hwpx_chart_xml(
+    c: &CommonObjAttr,
+    caption: &Option<crate::model::shape::Caption>,
+    chart_href: &str,
+    chart_ole: Option<&crate::model::shape::OleShape>,
+    ctx: &mut SerializeContext,
+) -> String {
+    let numbering_type = hwpx_numbering_type_attr(c);
+    let dropcap_style = hwpx_dropcapstyle_attr(c);
+    let href = hwpx_href_attr(c);
+    let instid = hwpx_optional_instid_attr(c);
+    let protect = bool01(c.size_protect);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
+    let shape_block = chart_ole
+        .filter(|ole| ole_has_non_default_component_xml(ole))
+        .map(render_hwpx_ole_component_xml)
+        .unwrap_or_default();
+    let mut out = format!(
+        concat!(
+            r#"<hp:chart id="{id}" chartIDRef="{chart}" zOrder="{zo}" textWrap="{tw}" textFlow="{tf}" lock="{lock}"{numbering_type}{dropcap_style}{href}{instid}>"#,
+            "{shape_block}",
+            r#"<hp:sz width="{w}" height="{h}" widthRelTo="{wr}" heightRelTo="{hrel}" protect="{protect}"/>"#,
+            r#"<hp:pos treatAsChar="{tac}" affectLSpacing="0" flowWithText="{flow}" allowOverlap="{overlap}" holdAnchorAndSO="{hold_anchor}" vertRelTo="{vr}" vertAlign="{va}" horzRelTo="{hr}" horzAlign="{ha}" vertOffset="{vo}" horzOffset="{ho}"/>"#,
+            r#"<hp:outMargin left="{ml}" right="{mr}" top="{mt}" bottom="{mb}"/>"#,
+        ),
+        id = c.instance_id,
+        chart = xml_escape(chart_href),
+        zo = c.z_order,
+        tw = text_wrap_to_hwpx(c.text_wrap),
+        tf = text_flow_to_hwpx(c.text_flow),
+        lock = bool01(c.lock),
+        numbering_type = numbering_type,
+        dropcap_style = dropcap_style,
+        href = href,
+        instid = instid,
+        shape_block = shape_block,
+        tac = if c.treat_as_char { "1" } else { "0" },
+        w = c.width,
+        h = c.height,
+        wr = size_criterion_to_hwpx(c.width_criterion),
+        hrel = size_criterion_to_hwpx(c.height_criterion),
+        protect = protect,
+        flow = bool01(c.flow_with_text),
+        overlap = bool01(c.allow_overlap),
+        hold_anchor = hold_anchor,
+        vr = vert_rel_to_hwpx(c.vert_rel_to),
+        va = vert_align_to_hwpx(c.vert_align),
+        hr = horz_rel_to_hwpx(c.horz_rel_to),
+        ha = horz_align_to_hwpx(c.horz_align),
+        vo = c.vertical_offset,
+        ho = c.horizontal_offset,
+        ml = c.margin.left,
+        mr = c.margin.right,
+        mt = c.margin.top,
+        mb = c.margin.bottom,
+    );
+    if let Some(cap) = caption {
+        match writer_to_string(|w| super::table::write_caption(w, cap, ctx)) {
+            Ok(xml) => out.push_str(&xml),
+            Err(e) => eprintln!("[hwpx] Shape(chart) 캡션 직렬화 실패: {e}"),
+        }
+    }
+    match writer_to_string(|w| super::shape::write_shape_comment(w, c)) {
+        Ok(xml) => out.push_str(&xml),
+        Err(e) => eprintln!("[hwpx] Shape(chart) shapeComment 직렬화 실패: {e}"),
+    }
+    out.push_str("</hp:chart>");
+    out
+}
+
+fn ole_has_non_default_component_xml(ole: &crate::model::shape::OleShape) -> bool {
+    let sa = &ole.drawing.shape_attr;
+    let border = ole.drawing.border_line;
+    sa.offset_x != 0
+        || sa.offset_y != 0
+        || sa.group_level != 0
+        || (sa.original_width != 0 && sa.original_width != 7200)
+        || (sa.original_height != 0 && sa.original_height != 7200)
+        || (sa.current_width != 0 && sa.current_width != sa.original_width)
+        || (sa.current_height != 0 && sa.current_height != sa.original_height)
+        || sa.horz_flip
+        || sa.vert_flip
+        || sa.rotation_angle != 0
+        || sa.rotate_image
+        || sa.rotation_center.x != 0
+        || sa.rotation_center.y != 0
+        || !sa.raw_rendering.is_empty()
+        || (ole.extent_x != 0 && ole.extent_x != 7200)
+        || (ole.extent_y != 0 && ole.extent_y != 7200)
+        || !ole.drawing.raw_hwpx_child_xml.is_empty()
+        || border.color != 0
+        || border.width != 0
+        || border.attr != 0
+        || border.outline_style != 0
 }
 
 fn render_common_shape_xml(
     tag: &str,
     c: &CommonObjAttr,
     caption: &Option<crate::model::shape::Caption>,
-    sa: Option<&crate::model::shape::ShapeComponentAttr>,
+    drawing: Option<&crate::model::shape::DrawingObjAttr>,
     ctx: &mut SerializeContext,
 ) -> String {
     // 도형 좌표계 블록(offset/orgSz/curSz/flip/rotationInfo/renderingInfo) — 누락 시
     // 회전/뒤집힘이 소실되어 bbox 가 전치되는 등 렌더가 어긋난다(#1501 동류, polygon 등).
-    let shape_block = sa
-        .map(|sa| {
-            writer_to_string(|w| super::shape::write_shape_component_block(w, sa))
-                .unwrap_or_default()
+    let shape_block = drawing
+        .map(|drawing| {
+            let mut block = writer_to_string(|w| {
+                super::shape::write_shape_component_block(w, &drawing.shape_attr)
+            })
+            .unwrap_or_default();
+            if !drawing.raw_hwpx_child_xml.is_empty() {
+                match writer_to_string(|w| {
+                    super::shape::write_raw_hwpx_child_xml(w, &drawing.raw_hwpx_child_xml)
+                }) {
+                    Ok(xml) => block.push_str(&xml),
+                    Err(e) => eprintln!("[hwpx] Shape({tag}) raw child XML 직렬화 실패: {e}"),
+                }
+            }
+            block
         })
         .unwrap_or_default();
+    let group_level = drawing
+        .map(|drawing| drawing.shape_attr.group_level)
+        .unwrap_or(0);
+    let href = c.href.as_deref().unwrap_or("");
+    let dropcap_style = c.dropcap_style.as_deref().unwrap_or("None");
+    let protect = bool01(c.size_protect);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
+    let instid = drawing
+        .map(|drawing| drawing.inst_id)
+        .filter(|value| *value != 0)
+        .or_else(|| (c.inst_id != 0).then_some(c.inst_id))
+        .unwrap_or(c.instance_id);
     let mut out = format!(
         concat!(
-            r#"<hp:{tag} id="{id}" zOrder="{zo}" textWrap="{tw}" textFlow="BOTH_SIDES" lock="0">"#,
+            r#"<hp:{tag} id="{id}" zOrder="{zo}" numberingType="{nt}" textWrap="{tw}" textFlow="{tf}" lock="{lock}" dropcapstyle="{dropcap_style}" href="{href}" groupLevel="{gl}" instid="{instid}">"#,
             "{block}",
-            r#"<hp:sz width="{w}" height="{h}" widthRelTo="ABSOLUTE" heightRelTo="ABSOLUTE"/>"#,
-            r#"<hp:pos treatAsChar="{tac}" vertRelTo="{vr}" vertAlign="{va}" horzRelTo="{hr}" horzAlign="{ha}" vertOffset="{vo}" horzOffset="{ho}"/>"#,
+            r#"<hp:sz width="{w}" height="{h}" widthRelTo="{wr}" heightRelTo="{hrel}" protect="{protect}"/>"#,
+            r#"<hp:pos treatAsChar="{tac}" affectLSpacing="0" flowWithText="{flow}" allowOverlap="{overlap}" holdAnchorAndSO="{hold_anchor}" vertRelTo="{vr}" vertAlign="{va}" horzRelTo="{hr}" horzAlign="{ha}" vertOffset="{vo}" horzOffset="{ho}"/>"#,
             r#"<hp:outMargin left="{ml}" right="{mr}" top="{mt}" bottom="{mb}"/>"#,
         ),
         tag = tag,
         block = shape_block,
         id = c.instance_id,
         zo = c.z_order,
+        nt = numbering_type_to_hwpx(c.numbering_type),
         tw = text_wrap_to_hwpx(c.text_wrap),
+        tf = text_flow_to_hwpx(c.text_flow),
+        lock = bool01(c.lock),
+        dropcap_style = xml_escape(dropcap_style),
+        href = xml_escape(href),
+        gl = group_level,
+        instid = instid,
         tac = if c.treat_as_char { "1" } else { "0" },
         w = c.width,
         h = c.height,
+        wr = size_criterion_to_hwpx(c.width_criterion),
+        hrel = size_criterion_to_hwpx(c.height_criterion),
+        protect = protect,
+        flow = bool01(c.flow_with_text),
+        overlap = bool01(c.allow_overlap),
+        hold_anchor = hold_anchor,
         vr = vert_rel_to_hwpx(c.vert_rel_to),
         va = vert_align_to_hwpx(c.vert_align),
         hr = horz_rel_to_hwpx(c.horz_rel_to),
@@ -1242,6 +1554,151 @@ fn render_common_shape_xml(
         Err(e) => eprintln!("[hwpx] Shape({tag}) shapeComment 직렬화 실패: {e}"),
     }
     out.push_str(&format!("</hp:{tag}>"));
+    out
+}
+
+fn render_hwpx_ole_component_xml(ole: &crate::model::shape::OleShape) -> String {
+    let mut shape_attr = ole.drawing.shape_attr.clone();
+    let fallback_width = if ole.extent_x > 0 {
+        ole.extent_x as u32
+    } else {
+        ole.common.width
+    };
+    let fallback_height = if ole.extent_y > 0 {
+        ole.extent_y as u32
+    } else {
+        ole.common.height
+    };
+    if shape_attr.original_width == 0 {
+        shape_attr.original_width = fallback_width;
+    }
+    if shape_attr.original_height == 0 {
+        shape_attr.original_height = fallback_height;
+    }
+    if shape_attr.current_width == 0 {
+        shape_attr.current_width = shape_attr.original_width;
+    }
+    if shape_attr.current_height == 0 {
+        shape_attr.current_height = shape_attr.original_height;
+    }
+
+    let mut block = writer_to_string(|w| super::shape::write_shape_component_block(w, &shape_attr))
+        .unwrap_or_default();
+    let extent_x = if ole.extent_x > 0 {
+        ole.extent_x
+    } else {
+        shape_attr.original_width as i32
+    };
+    let extent_y = if ole.extent_y > 0 {
+        ole.extent_y
+    } else {
+        shape_attr.original_height as i32
+    };
+    if extent_x > 0 || extent_y > 0 {
+        block.push_str(&format!(r#"<hc:extent x="{extent_x}" y="{extent_y}"/>"#));
+    }
+    match writer_to_string(|w| super::shape::write_line_shape(w, &ole.drawing.border_line)) {
+        Ok(xml) => block.push_str(&xml),
+        Err(e) => eprintln!("[hwpx] Shape(ole) lineShape 직렬화 실패: {e}"),
+    }
+    if !ole.drawing.raw_hwpx_child_xml.is_empty() {
+        match writer_to_string(|w| {
+            super::shape::write_raw_hwpx_child_xml(w, &ole.drawing.raw_hwpx_child_xml)
+        }) {
+            Ok(xml) => block.push_str(&xml),
+            Err(e) => eprintln!("[hwpx] Shape(ole) raw child XML 직렬화 실패: {e}"),
+        }
+    }
+    block
+}
+
+fn render_hwpx_ole_xml(ole: &crate::model::shape::OleShape, ctx: &mut SerializeContext) -> String {
+    let c = &ole.common;
+    let binary_ref = ctx
+        .resolve_bin_id(ole.bin_data_id as u16)
+        .unwrap_or_default()
+        .to_string();
+    let numbering_type = hwpx_numbering_type_attr(c);
+    let dropcap_style = hwpx_dropcapstyle_attr(c);
+    let href = hwpx_href_attr(c);
+    let instid = hwpx_object_instid_or_id(c);
+    let object_type = ole
+        .hwpx_object_type
+        .as_deref()
+        .map(|value| format!(r#" objectType="{}""#, xml_escape(value)))
+        .unwrap_or_default();
+    let draw_aspect = ole
+        .hwpx_draw_aspect
+        .as_deref()
+        .map(|value| format!(r#" drawAspect="{}""#, xml_escape(value)))
+        .unwrap_or_default();
+    let eq_base_line = ole
+        .hwpx_eq_base_line
+        .as_deref()
+        .map(|value| format!(r#" eqBaseLine="{}""#, xml_escape(value)))
+        .unwrap_or_default();
+    let has_moniker = ole
+        .hwpx_has_moniker
+        .as_deref()
+        .map(|value| format!(r#" hasMoniker="{}""#, xml_escape(value)))
+        .unwrap_or_default();
+    let shape_block = render_hwpx_ole_component_xml(ole);
+    let protect = bool01(c.size_protect);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
+    let mut out = format!(
+        concat!(
+            r#"<hp:ole id="{id}" instid="{instid}" binaryItemIDRef="{binary}" zOrder="{zo}" textWrap="{tw}" textFlow="{tf}" lock="{lock}"{numbering_type}{dropcap_style}{href}{object_type}{draw_aspect}{eq_base_line}{has_moniker}>"#,
+            "{shape_block}",
+            r#"<hp:sz width="{w}" height="{h}" widthRelTo="{wr}" heightRelTo="{hrel}" protect="{protect}"/>"#,
+            r#"<hp:pos treatAsChar="{tac}" affectLSpacing="0" flowWithText="{flow}" allowOverlap="{overlap}" holdAnchorAndSO="{hold_anchor}" vertRelTo="{vr}" vertAlign="{va}" horzRelTo="{hr}" horzAlign="{ha}" vertOffset="{vo}" horzOffset="{ho}"/>"#,
+            r#"<hp:outMargin left="{ml}" right="{mr}" top="{mt}" bottom="{mb}"/>"#,
+        ),
+        id = c.instance_id,
+        instid = instid,
+        binary = xml_escape(&binary_ref),
+        zo = c.z_order,
+        tw = text_wrap_to_hwpx(c.text_wrap),
+        tf = text_flow_to_hwpx(c.text_flow),
+        lock = bool01(c.lock),
+        tac = if c.treat_as_char { "1" } else { "0" },
+        w = c.width,
+        h = c.height,
+        wr = size_criterion_to_hwpx(c.width_criterion),
+        hrel = size_criterion_to_hwpx(c.height_criterion),
+        protect = protect,
+        flow = bool01(c.flow_with_text),
+        overlap = bool01(c.allow_overlap),
+        hold_anchor = hold_anchor,
+        vr = vert_rel_to_hwpx(c.vert_rel_to),
+        va = vert_align_to_hwpx(c.vert_align),
+        hr = horz_rel_to_hwpx(c.horz_rel_to),
+        ha = horz_align_to_hwpx(c.horz_align),
+        vo = c.vertical_offset,
+        ho = c.horizontal_offset,
+        ml = c.margin.left,
+        mr = c.margin.right,
+        mt = c.margin.top,
+        mb = c.margin.bottom,
+        numbering_type = numbering_type,
+        dropcap_style = dropcap_style,
+        href = href,
+        object_type = object_type,
+        draw_aspect = draw_aspect,
+        eq_base_line = eq_base_line,
+        has_moniker = has_moniker,
+        shape_block = shape_block,
+    );
+    if let Some(cap) = ole.caption.as_ref() {
+        match writer_to_string(|w| super::table::write_caption(w, cap, ctx)) {
+            Ok(xml) => out.push_str(&xml),
+            Err(e) => eprintln!("[hwpx] Shape(ole) 캡션 직렬화 실패: {e}"),
+        }
+    }
+    match writer_to_string(|w| super::shape::write_shape_comment(w, c)) {
+        Ok(xml) => out.push_str(&xml),
+        Err(e) => eprintln!("[hwpx] Shape(ole) shapeComment 직렬화 실패: {e}"),
+    }
+    out.push_str("</hp:ole>");
     out
 }
 
@@ -1277,6 +1734,21 @@ fn render_endnote(note: &Endnote, ctx: &mut SerializeContext) -> String {
     render_note_sublist("endNote", note.number, &note.paragraphs, ctx)
 }
 
+fn render_hidden_comment(comment: &HiddenComment, ctx: &mut SerializeContext) -> String {
+    let mut out = r#"<hp:ctrl><hp:hiddenComment><hp:subList id="" textDirection="HORIZONTAL" lineWrap="BREAK" vertAlign="TOP" linkListIDRef="0" linkListNextIDRef="0" textWidth="0" textHeight="0" hasTextRef="0" hasNumRef="0">"#.to_string();
+    let mut vert_cursor: u32 = 0;
+    for p in comment.paragraphs.iter() {
+        let (runs, linesegs, advance) = render_paragraph_parts(p, vert_cursor, ctx);
+        vert_cursor = advance;
+        out.push_str(&render_hp_p_open(p, ctx.next_para_id()));
+        out.push_str(&runs);
+        out.push_str(&linesegs);
+        out.push_str("</hp:p>");
+    }
+    out.push_str("</hp:subList></hp:hiddenComment></hp:ctrl>");
+    out
+}
+
 fn render_equation(eq: &Equation) -> String {
     let c = &eq.common;
     let id = c.instance_id.to_string();
@@ -1285,11 +1757,26 @@ fn render_equation(eq: &Equation) -> String {
     let baseline = eq.baseline.to_string();
     let text_color = color_ref_to_hwpx(eq.color);
     let base_unit = eq.font_size.to_string();
+    let line_mode_attr = if eq.line_mode.is_empty() {
+        String::new()
+    } else {
+        format!(r#" lineMode="{}""#, xml_escape(&eq.line_mode))
+    };
     let font = xml_escape(&eq.font_name);
     let script = xml_escape(&eq.script);
     let width = c.width.to_string();
     let height = c.height.to_string();
+    let text_flow = text_flow_to_hwpx(c.text_flow);
+    let lock = bool01(c.lock);
+    let dropcap_style = xml_escape(c.dropcap_style.as_deref().unwrap_or("None"));
+    let instid = hwpx_object_instid_or_id(c).to_string();
+    let width_rel_to = size_criterion_to_hwpx(c.width_criterion);
+    let height_rel_to = size_criterion_to_hwpx(c.height_criterion);
+    let protect = bool01(c.size_protect);
     let treat = if c.treat_as_char { "1" } else { "0" };
+    let flow = bool01(c.flow_with_text);
+    let overlap = bool01(c.allow_overlap);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
     let margin_left = c.margin.left.to_string();
@@ -1308,7 +1795,7 @@ fn render_equation(eq: &Equation) -> String {
     };
 
     format!(
-        r#"<hp:equation id="{id}" zOrder="{z_order}" numberingType="EQUATION" textWrap="{}" textFlow="BOTH_SIDES" lock="0" dropcapstyle="None" instid="{id}" version="{version}" baseLine="{baseline}" textColor="{text_color}" baseUnit="{base_unit}" font="{font}"><hp:script>{script}</hp:script><hp:sz width="{width}" widthRelTo="ABSOLUTE" height="{height}" heightRelTo="ABSOLUTE"/><hp:pos treatAsChar="{treat}" affectLSpacing="0" flowWithText="1" allowOverlap="0" holdAnchorAndSO="0" vertRelTo="{}" horzRelTo="{}" vertAlign="{}" horzAlign="{}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="{margin_left}" right="{margin_right}" top="{margin_top}" bottom="{margin_bottom}"/>{shape_comment}</hp:equation>"#,
+        r#"<hp:equation id="{id}" zOrder="{z_order}" numberingType="EQUATION" textWrap="{}" textFlow="{text_flow}" lock="{lock}" dropcapstyle="{dropcap_style}" instid="{instid}" version="{version}" baseLine="{baseline}" textColor="{text_color}" baseUnit="{base_unit}"{line_mode_attr} font="{font}"><hp:script>{script}</hp:script><hp:sz width="{width}" widthRelTo="{width_rel_to}" height="{height}" heightRelTo="{height_rel_to}" protect="{protect}"/><hp:pos treatAsChar="{treat}" affectLSpacing="0" flowWithText="{flow}" allowOverlap="{overlap}" holdAnchorAndSO="{hold_anchor}" vertRelTo="{}" horzRelTo="{}" vertAlign="{}" horzAlign="{}" vertOffset="{vert_offset}" horzOffset="{horz_offset}"/><hp:outMargin left="{margin_left}" right="{margin_right}" top="{margin_top}" bottom="{margin_bottom}"/>{shape_comment}</hp:equation>"#,
         text_wrap_to_hwpx(c.text_wrap),
         vert_rel_to_hwpx(c.vert_rel_to),
         horz_rel_to_hwpx(c.horz_rel_to),
@@ -1351,6 +1838,42 @@ fn text_wrap_to_hwpx(wrap: TextWrap) -> &'static str {
         TextWrap::TopAndBottom => "TOP_AND_BOTTOM",
         TextWrap::BehindText => "BEHIND_TEXT",
         TextWrap::InFrontOfText => "IN_FRONT_OF_TEXT",
+    }
+}
+
+fn text_flow_to_hwpx(flow: TextFlow) -> &'static str {
+    match flow {
+        TextFlow::BothSides => "BOTH_SIDES",
+        TextFlow::LeftOnly => "LEFT_ONLY",
+        TextFlow::RightOnly => "RIGHT_ONLY",
+        TextFlow::LargestOnly => "LARGEST_ONLY",
+    }
+}
+
+fn numbering_type_to_hwpx(value: ObjectNumberingType) -> &'static str {
+    match value {
+        ObjectNumberingType::Picture => "PICTURE",
+        ObjectNumberingType::Table => "TABLE",
+        ObjectNumberingType::Equation => "EQUATION",
+        ObjectNumberingType::None => "NONE",
+    }
+}
+
+fn size_criterion_to_hwpx(value: SizeCriterion) -> &'static str {
+    match value {
+        SizeCriterion::Paper => "PAPER",
+        SizeCriterion::Page => "PAGE",
+        SizeCriterion::Column => "COLUMN",
+        SizeCriterion::Para => "PARA",
+        SizeCriterion::Absolute => "ABSOLUTE",
+    }
+}
+
+fn bool01(value: bool) -> &'static str {
+    if value {
+        "1"
+    } else {
+        "0"
     }
 }
 
@@ -1481,9 +2004,17 @@ fn replace_page_pr(xml: &str, page_def: &crate::model::page::PageDef) -> String 
         crate::model::page::BindingMethod::DuplexSided => "LEFT_RIGHT",
         crate::model::page::BindingMethod::TopFlip => "TOP_BOTTOM",
     };
+    let tolerance_attr = if page_def.pagination_bottom_tolerance > 0 {
+        format!(
+            r#" rhwpPaginationBottomTolerance="{}""#,
+            page_def.pagination_bottom_tolerance
+        )
+    } else {
+        String::new()
+    };
     let new_page_pr = format!(
-        r#"<hp:pagePr landscape="{}" width="{}" height="{}" gutterType="{}">"#,
-        landscape, page_def.width, page_def.height, gutter_type,
+        r#"<hp:pagePr landscape="{}" width="{}" height="{}" gutterType="{}"{}>"#,
+        landscape, page_def.width, page_def.height, gutter_type, tolerance_attr,
     );
     let out = if xml.contains(TEMPLATE_PAGE_PR) {
         xml.replacen(TEMPLATE_PAGE_PR, &new_page_pr, 1)
@@ -1510,6 +2041,297 @@ fn replace_page_pr(xml: &str, page_def: &crate::model::page::PageDef) -> String 
     } else {
         // 템플릿이 변경됐거나 이미 치환된 경우 — 원본 유지(회귀 방지).
         out
+    }
+}
+
+fn replace_note_shapes(xml: &str, sec_def: &crate::model::document::SectionDef) -> String {
+    let out = replace_one_note_shape(xml, "footNotePr", &sec_def.footnote_shape, false);
+    replace_one_note_shape(&out, "endNotePr", &sec_def.endnote_shape, true)
+}
+
+fn replace_one_note_shape(xml: &str, tag: &str, shape: &FootnoteShape, is_endnote: bool) -> String {
+    const TEMPLATE_FOOTNOTE_PR: &str = r##"<hp:footNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="-1" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="283" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="EACH_COLUMN" beneathText="0"/></hp:footNotePr>"##;
+    const TEMPLATE_ENDNOTE_PR: &str = r##"<hp:endNotePr><hp:autoNumFormat type="DIGIT" userChar="" prefixChar="" suffixChar=")" supscript="0"/><hp:noteLine length="14692344" type="SOLID" width="0.12 mm" color="#000000"/><hp:noteSpacing betweenNotes="0" belowLine="567" aboveLine="850"/><hp:numbering type="CONTINUOUS" newNum="1"/><hp:placement place="END_OF_DOCUMENT" beneathText="0"/></hp:endNotePr>"##;
+    let template = if is_endnote {
+        TEMPLATE_ENDNOTE_PR
+    } else {
+        TEMPLATE_FOOTNOTE_PR
+    };
+    if xml.contains(template) {
+        xml.replacen(template, &render_note_pr(tag, shape, is_endnote), 1)
+    } else {
+        xml.to_string()
+    }
+}
+
+fn render_note_pr(tag: &str, shape: &FootnoteShape, is_endnote: bool) -> String {
+    let mut xml = format!("<hp:{tag}>");
+    if let Some(raw) = &shape.raw_hwpx_children {
+        xml.push_str(raw);
+    } else {
+        xml.push_str(&format!(
+            r#"<hp:autoNumFormat type="{}" userChar="{}" prefixChar="{}" suffixChar="{}" supscript="{}"/>"#,
+            note_number_format_str(shape.number_format),
+            note_char_attr(shape.user_char),
+            note_char_attr(shape.prefix_char),
+            note_char_attr(shape.suffix_char),
+            shape.number_code_superscript as u8,
+        ));
+        xml.push_str(&format!(
+            r#"<hp:noteLine length="{}" type="{}" width="{} mm" color="{}"/>"#,
+            note_separator_length(shape.separator_length),
+            note_line_type_str(shape.separator_line_type),
+            line_width_mm(shape.separator_line_width),
+            super::shape::color_to_hex(shape.separator_color),
+        ));
+        xml.push_str(&format!(
+            r#"<hp:noteSpacing betweenNotes="{}" belowLine="{}" aboveLine="{}"/>"#,
+            shape.between_notes_margin_hu(),
+            shape.separator_below_margin_hu(),
+            shape.separator_above_margin_hu(),
+        ));
+        xml.push_str(&format!(
+            r#"<hp:numbering type="{}" newNum="{}"/>"#,
+            note_numbering_str(shape.numbering),
+            shape.start_number.max(1),
+        ));
+        xml.push_str(&format!(
+            r#"<hp:placement place="{}" beneathText="{}"/>"#,
+            note_placement_str(shape.placement, is_endnote),
+            shape.print_inline_after_text as u8,
+        ));
+    }
+    xml.push_str(&format!("</hp:{tag}>"));
+    xml
+}
+
+fn note_char_attr(value: char) -> String {
+    if value == '\0' {
+        String::new()
+    } else {
+        xml_escape(&value.to_string())
+    }
+}
+
+fn note_separator_length(value: i16) -> String {
+    if value < 0 {
+        value.to_string()
+    } else {
+        (value as u16).to_string()
+    }
+}
+
+fn note_number_format_str(format: NumberFormat) -> &'static str {
+    match format {
+        NumberFormat::Digit => "DIGIT",
+        NumberFormat::CircledDigit => "CIRCLED_DIGIT",
+        NumberFormat::UpperRoman => "ROMAN_CAPITAL",
+        NumberFormat::LowerRoman => "ROMAN_SMALL",
+        NumberFormat::UpperAlpha => "LATIN_CAPITAL",
+        NumberFormat::LowerAlpha => "LATIN_SMALL",
+        NumberFormat::CircledUpperAlpha => "CIRCLED_LATIN_CAPITAL",
+        NumberFormat::CircledLowerAlpha => "CIRCLED_LATIN_SMALL",
+        NumberFormat::HangulSyllable => "HANGUL_SYLLABLE",
+        NumberFormat::CircledHangulSyllable => "CIRCLED_HANGUL_SYLLABLE",
+        NumberFormat::HangulJamo => "HANGUL_JAMO",
+        NumberFormat::CircledHangulJamo => "CIRCLED_HANGUL_JAMO",
+        NumberFormat::HangulDigit => "HANGUL_PHONETIC",
+        NumberFormat::HanjaDigit => "IDEOGRAPH",
+        NumberFormat::CircledHanjaDigit => "CIRCLED_IDEOGRAPH",
+        NumberFormat::HanjaGapEul => "DECAGON_CIRCLE",
+        NumberFormat::HanjaGapEulHanja => "DECAGON_CIRCLE_HANJA",
+        NumberFormat::FourSymbol => "SYMBOL",
+        NumberFormat::UserChar => "USER_CHAR",
+    }
+}
+
+fn note_line_type_str(value: u8) -> &'static str {
+    match value {
+        0 => "NONE",
+        2 => "DASH",
+        3 => "DOT",
+        4 => "DASH_DOT",
+        5 => "DASH_DOT_DOT",
+        6 => "LONG_DASH",
+        7 => "CIRCLE",
+        8 => "DOUBLE_SLIM",
+        9 => "SLIM_THICK",
+        10 => "THICK_SLIM",
+        11 => "SLIM_THICK_SLIM",
+        _ => "SOLID",
+    }
+}
+
+fn note_numbering_str(value: FootnoteNumbering) -> &'static str {
+    match value {
+        FootnoteNumbering::Continue => "CONTINUOUS",
+        FootnoteNumbering::RestartSection => "ON_SECTION",
+        FootnoteNumbering::RestartPage => "ON_PAGE",
+    }
+}
+
+fn note_placement_str(value: FootnotePlacement, is_endnote: bool) -> &'static str {
+    match (is_endnote, value) {
+        (true, FootnotePlacement::BelowText) => "END_OF_SECTION",
+        (true, FootnotePlacement::RightColumn) => "RIGHT_COLUMN",
+        (true, FootnotePlacement::EachColumn) => "END_OF_DOCUMENT",
+        (false, FootnotePlacement::BelowText) => "BELOW_TEXT",
+        (false, FootnotePlacement::RightColumn) => "RIGHT_COLUMN",
+        (false, FootnotePlacement::EachColumn) => "EACH_COLUMN",
+    }
+}
+
+/// 템플릿 `secPr`의 SectionDef 속성 중 HWPX가 직접 표현하는 값을 IR에서 치환한다.
+fn replace_section_def_attrs(xml: &str, sec_def: &crate::model::document::SectionDef) -> String {
+    const TEMPLATE_SECPR_ID_ATTR: &str = r#"<hp:secPr id="""#;
+    const TEMPLATE_SECPR_LAYOUT_ATTRS: &str = r#"textDirection="HORIZONTAL" spaceColumns="1134" tabStop="8000" tabStopVal="4000" tabStopUnit="HWPUNIT" outlineShapeIDRef="1" memoShapeIDRef="0" textVerticalWidthHead="0""#;
+    let column_spacing = if sec_def.column_spacing > 0 {
+        sec_def.column_spacing as i32
+    } else {
+        1134
+    };
+    let default_tab_spacing = if sec_def.default_tab_spacing > 0 {
+        sec_def.default_tab_spacing
+    } else {
+        8000
+    };
+    let tab_stop_val = if sec_def.tab_stop_val > 0 {
+        sec_def.tab_stop_val
+    } else {
+        4000
+    };
+    let tab_stop_unit = if sec_def.tab_stop_unit.is_empty() {
+        "HWPUNIT"
+    } else {
+        &sec_def.tab_stop_unit
+    };
+    let tab_stop_unit = xml_escape(tab_stop_unit);
+    let outline_numbering_id = if sec_def.outline_numbering_id > 0 {
+        sec_def.outline_numbering_id
+    } else {
+        1
+    };
+    let text_direction = match sec_def.text_direction {
+        1 => "VERTICAL",
+        2 => "VERTICALALL",
+        _ => "HORIZONTAL",
+    };
+    let layout_attrs = format!(
+        r#"textDirection="{}" spaceColumns="{}" tabStop="{}" tabStopVal="{}" tabStopUnit="{}" outlineShapeIDRef="{}" memoShapeIDRef="{}" textVerticalWidthHead="{}""#,
+        text_direction,
+        column_spacing,
+        default_tab_spacing,
+        tab_stop_val,
+        tab_stop_unit,
+        outline_numbering_id,
+        sec_def.memo_shape_id_ref,
+        sec_def.text_vertical_width_head,
+    );
+    let mut out = if !sec_def.section_id.is_empty() && xml.contains(TEMPLATE_SECPR_ID_ATTR) {
+        let section_id_attr = format!(r#"<hp:secPr id="{}""#, xml_escape(&sec_def.section_id));
+        xml.replacen(TEMPLATE_SECPR_ID_ATTR, &section_id_attr, 1)
+    } else {
+        xml.to_string()
+    };
+    out = if out.contains(TEMPLATE_SECPR_LAYOUT_ATTRS) {
+        out.replacen(TEMPLATE_SECPR_LAYOUT_ATTRS, &layout_attrs, 1)
+    } else {
+        out
+    };
+
+    const TEMPLATE_START_NUM: &str =
+        r#"<hp:startNum pageStartsOn="BOTH" page="0" pic="0" tbl="0" equation="0"/>"#;
+    let start_num = format!(
+        r#"<hp:startNum pageStartsOn="{}" page="{}" pic="{}" tbl="{}" equation="{}"/>"#,
+        page_starts_on_str(sec_def.page_num_type),
+        sec_def.page_num,
+        sec_def.picture_num,
+        sec_def.table_num,
+        sec_def.equation_num,
+    );
+    if out.contains(TEMPLATE_START_NUM) {
+        out = out.replacen(TEMPLATE_START_NUM, &start_num, 1);
+    }
+    out = replace_grid(&out, sec_def);
+    out = replace_visibility(&out, sec_def);
+
+    out
+}
+
+fn replace_grid(xml: &str, sec_def: &crate::model::document::SectionDef) -> String {
+    const TEMPLATE_GRID: &str = r#"<hp:grid lineGrid="0" charGrid="0" wonggojiFormat="0"/>"#;
+    let grid = format!(
+        r#"<hp:grid lineGrid="{}" charGrid="{}" wonggojiFormat="{}"/>"#,
+        sec_def.line_grid, sec_def.char_grid, sec_def.wonggoji_format,
+    );
+    if xml.contains(TEMPLATE_GRID) {
+        xml.replacen(TEMPLATE_GRID, &grid, 1)
+    } else {
+        xml.to_string()
+    }
+}
+
+fn page_starts_on_str(page_num_type: u8) -> &'static str {
+    match page_num_type {
+        1 => "ODD",
+        2 => "EVEN",
+        _ => "BOTH",
+    }
+}
+
+fn normalize_visibility_value(value: &str) -> Option<&'static str> {
+    if value.eq_ignore_ascii_case("HIDE_FIRST") {
+        Some("HIDE_FIRST")
+    } else if value.eq_ignore_ascii_case("HIDE_ALL") {
+        Some("HIDE_ALL")
+    } else if value.eq_ignore_ascii_case("SHOW_FIRST") {
+        Some("SHOW_FIRST")
+    } else if value.eq_ignore_ascii_case("SHOW_ALL") {
+        Some("SHOW_ALL")
+    } else {
+        None
+    }
+}
+
+fn visibility_value(value: &str, hide_first: bool) -> &'static str {
+    normalize_visibility_value(value).unwrap_or(if hide_first { "HIDE_FIRST" } else { "SHOW_ALL" })
+}
+
+fn replace_visibility(xml: &str, sec_def: &crate::model::document::SectionDef) -> String {
+    const TEMPLATE_VISIBILITY: &str = r#"<hp:visibility hideFirstHeader="0" hideFirstFooter="0" hideFirstMasterPage="0" border="SHOW_ALL" fill="SHOW_ALL" hideFirstPageNum="0" hideFirstEmptyLine="0" showLineNumber="0"/>"#;
+    let visibility = format!(
+        r#"<hp:visibility hideFirstHeader="{}" hideFirstFooter="{}" hideFirstMasterPage="{}" border="{}" fill="{}" hideFirstPageNum="{}" hideFirstEmptyLine="{}" showLineNumber="{}"/>"#,
+        sec_def.hide_header as u8,
+        sec_def.hide_footer as u8,
+        sec_def.hide_master_page as u8,
+        visibility_value(&sec_def.visibility_border, sec_def.hide_border),
+        visibility_value(&sec_def.visibility_fill, sec_def.hide_fill),
+        sec_def.hide_page_number as u8,
+        sec_def.hide_empty_line as u8,
+        sec_def.show_line_number as u8,
+    );
+    let out = if xml.contains(TEMPLATE_VISIBILITY) {
+        xml.replacen(TEMPLATE_VISIBILITY, &visibility, 1)
+    } else {
+        xml.to_string()
+    };
+    replace_line_number_shape(&out, sec_def)
+}
+
+fn replace_line_number_shape(xml: &str, sec_def: &crate::model::document::SectionDef) -> String {
+    const TEMPLATE_LINE_NUMBER_SHAPE: &str =
+        r#"<hp:lineNumberShape restartType="0" countBy="0" distance="0" startNumber="0"/>"#;
+    let line_number_shape = format!(
+        r#"<hp:lineNumberShape restartType="{}" countBy="{}" distance="{}" startNumber="{}"/>"#,
+        sec_def.line_number_restart_type,
+        sec_def.line_number_count_by,
+        sec_def.line_number_distance,
+        sec_def.line_number_start_number,
+    );
+    if xml.contains(TEMPLATE_LINE_NUMBER_SHAPE) {
+        xml.replacen(TEMPLATE_LINE_NUMBER_SHAPE, &line_number_shape, 1)
+    } else {
+        xml.to_string()
     }
 }
 
@@ -1573,18 +2395,20 @@ fn render_page_border_fill(ty: &str, pbf: &crate::model::page::PageBorderFill) -
     } else {
         "0"
     };
-    format!(
-        r#"<hp:pageBorderFill type="{ty}" borderFillIDRef="{}" textBorder="{}" headerInside="{}" footerInside="{}" fillArea="{}"><hp:offset left="{}" right="{}" top="{}" bottom="{}"/></hp:pageBorderFill>"#,
-        pbf.border_fill_id,
-        text_border,
-        header_inside,
-        footer_inside,
-        fill_area,
-        pbf.spacing_left,
-        pbf.spacing_right,
-        pbf.spacing_top,
-        pbf.spacing_bottom,
-    )
+    let mut xml = format!(
+        r#"<hp:pageBorderFill type="{ty}" borderFillIDRef="{}" textBorder="{}" headerInside="{}" footerInside="{}" fillArea="{}">"#,
+        pbf.border_fill_id, text_border, header_inside, footer_inside, fill_area,
+    );
+    if let Some(raw) = &pbf.raw_hwpx_children {
+        xml.push_str(raw);
+    } else {
+        xml.push_str(&format!(
+            r#"<hp:offset left="{}" right="{}" top="{}" bottom="{}"/>"#,
+            pbf.spacing_left, pbf.spacing_right, pbf.spacing_top, pbf.spacing_bottom,
+        ));
+    }
+    xml.push_str("</hp:pageBorderFill>");
+    xml
 }
 
 #[cfg(test)]
@@ -1598,6 +2422,390 @@ mod tests {
         let mut doc = Document::default();
         doc.sections.push(section.clone());
         (doc, section)
+    }
+
+    #[test]
+    fn common_shape_attrs_reflect_ir() {
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut common = CommonObjAttr::default();
+        common.instance_id = 42;
+        common.inst_id = 43;
+        common.href = Some("?EllipseTarget;0;0;0;".to_string());
+        common.numbering_type = ObjectNumberingType::Picture;
+        common.numbering_type_explicit = true;
+        common.text_flow = TextFlow::RightOnly;
+        common.lock = true;
+        common.dropcap_style = Some("TripleLine".to_string());
+        common.width_criterion = SizeCriterion::Para;
+        common.height_criterion = SizeCriterion::Page;
+        common.size_protect = true;
+        common.flow_with_text = true;
+        common.allow_overlap = true;
+        common.prevent_page_break = 1;
+
+        let mut drawing = crate::model::shape::DrawingObjAttr::default();
+        drawing.shape_attr.group_level = 5;
+        drawing.inst_id = 44;
+
+        let xml = render_common_shape_xml("ellipse", &common, &None, Some(&drawing), &mut ctx);
+
+        assert!(
+            xml.contains(r#"numberingType="PICTURE""#),
+            "numberingType should reflect CommonObjAttr: {xml}"
+        );
+        assert!(
+            xml.contains(r#"textFlow="RIGHT_ONLY""#),
+            "textFlow should reflect CommonObjAttr: {xml}"
+        );
+        assert!(
+            xml.contains(r#"lock="1""#),
+            "lock should reflect CommonObjAttr: {xml}"
+        );
+        assert!(
+            xml.contains(r#"dropcapstyle="TripleLine""#),
+            "dropcapstyle should reflect CommonObjAttr: {xml}"
+        );
+        assert!(
+            xml.contains(r#"groupLevel="5""#),
+            "groupLevel should reflect ShapeComponentAttr: {xml}"
+        );
+        assert!(
+            xml.contains(r#"href="?EllipseTarget;0;0;0;""#),
+            "href should reflect CommonObjAttr href: {xml}"
+        );
+        assert!(
+            xml.contains(r#"instid="44""#),
+            "instid should prefer DrawingObjAttr inst_id: {xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:sz width="0" height="0" widthRelTo="PARA" heightRelTo="PAGE" protect="1"/>"#
+            ),
+            "sz should reflect CommonObjAttr size criteria/protect: {xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="1" holdAnchorAndSO="1""#
+            ),
+            "pos should reflect CommonObjAttr flow/overlap/hold-anchor values: {xml}"
+        );
+    }
+
+    #[test]
+    fn equation_common_attrs_reflect_ir() {
+        let mut eq = Equation::default();
+        eq.common.instance_id = 77;
+        eq.common.inst_id = 88;
+        eq.common.width = 111;
+        eq.common.height = 222;
+        eq.common.text_wrap = TextWrap::InFrontOfText;
+        eq.common.text_flow = TextFlow::RightOnly;
+        eq.common.lock = true;
+        eq.common.dropcap_style = Some("DoubleLine".to_string());
+        eq.common.width_criterion = SizeCriterion::Para;
+        eq.common.height_criterion = SizeCriterion::Page;
+        eq.common.size_protect = true;
+        eq.common.allow_overlap = true;
+        eq.common.prevent_page_break = 1;
+        eq.common.horz_rel_to = HorzRelTo::Column;
+        eq.common.horz_align = HorzAlign::Right;
+        eq.script = "a over b".to_string();
+        eq.version_info = "Equation Version 60".to_string();
+        eq.font_name = "HYhwpEQ".to_string();
+        eq.line_mode = "CHAR".to_string();
+
+        let xml = render_equation(&eq);
+
+        assert!(xml.contains(r#"textWrap="IN_FRONT_OF_TEXT""#), "{xml}");
+        assert!(xml.contains(r#"textFlow="RIGHT_ONLY""#), "{xml}");
+        assert!(xml.contains(r#"lock="1""#), "{xml}");
+        assert!(xml.contains(r#"dropcapstyle="DoubleLine""#), "{xml}");
+        assert!(xml.contains(r#"instid="88""#), "{xml}");
+        assert!(xml.contains(r#"lineMode="CHAR""#), "{xml}");
+        assert!(
+            xml.contains(
+                r#"<hp:sz width="111" widthRelTo="PARA" height="222" heightRelTo="PAGE" protect="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="0" allowOverlap="1" holdAnchorAndSO="1""#
+            ),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"horzRelTo="COLUMN""#), "{xml}");
+        assert!(xml.contains(r#"horzAlign="RIGHT""#), "{xml}");
+    }
+
+    #[test]
+    fn chart_common_attrs_reflect_ir() {
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut common = CommonObjAttr::default();
+        common.instance_id = 123;
+        common.inst_id = 456;
+        common.width = 111;
+        common.height = 222;
+        common.numbering_type = ObjectNumberingType::Picture;
+        common.numbering_type_explicit = true;
+        common.text_wrap = TextWrap::Tight;
+        common.text_flow = TextFlow::LeftOnly;
+        common.lock = true;
+        common.dropcap_style = Some("DoubleLine".to_string());
+        common.href = Some("?ChartTarget;0;0;0;".to_string());
+        common.width_criterion = SizeCriterion::Para;
+        common.height_criterion = SizeCriterion::Page;
+        common.size_protect = true;
+        common.flow_with_text = true;
+        common.allow_overlap = true;
+        common.prevent_page_break = 1;
+        common.horz_rel_to = HorzRelTo::Column;
+        common.horz_align = HorzAlign::Center;
+
+        let xml = render_hwpx_chart_xml(&common, &None, "Chart/chart2.xml", None, &mut ctx);
+
+        assert!(xml.contains(r#"chartIDRef="Chart/chart2.xml""#), "{xml}");
+        assert!(xml.contains(r#"numberingType="PICTURE""#), "{xml}");
+        assert!(xml.contains(r#"textWrap="TIGHT""#), "{xml}");
+        assert!(xml.contains(r#"textFlow="LEFT_ONLY""#), "{xml}");
+        assert!(xml.contains(r#"lock="1""#), "{xml}");
+        assert!(xml.contains(r#"dropcapstyle="DoubleLine""#), "{xml}");
+        assert!(xml.contains(r#"href="?ChartTarget;0;0;0;""#), "{xml}");
+        assert!(xml.contains(r#"instid="456""#), "{xml}");
+        assert!(
+            xml.contains(
+                r#"<hp:sz width="111" height="222" widthRelTo="PARA" heightRelTo="PAGE" protect="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="1" holdAnchorAndSO="1""#
+            ),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn chart_shape_component_children_reflect_ir() {
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut ole = crate::model::shape::OleShape::default();
+        ole.common.instance_id = 123;
+        ole.common.inst_id = 456;
+        ole.common.width = 111;
+        ole.common.height = 222;
+        ole.common.numbering_type = ObjectNumberingType::Picture;
+        ole.common.numbering_type_explicit = true;
+        ole.common.text_wrap = TextWrap::Tight;
+        ole.common.text_flow = TextFlow::LeftOnly;
+        ole.common.lock = true;
+        ole.common.dropcap_style = Some("DoubleLine".to_string());
+        ole.common.href = Some("?ChartTarget;0;0;0;".to_string());
+        ole.common.width_criterion = SizeCriterion::Para;
+        ole.common.height_criterion = SizeCriterion::Page;
+        ole.common.size_protect = true;
+        ole.common.flow_with_text = true;
+        ole.common.allow_overlap = true;
+        ole.common.prevent_page_break = 1;
+        ole.common.horz_rel_to = HorzRelTo::Column;
+        ole.common.horz_align = HorzAlign::Center;
+        ole.extent_x = 900;
+        ole.extent_y = 901;
+        ole.drawing.shape_attr.offset_x = 11;
+        ole.drawing.shape_attr.offset_y = 22;
+        ole.drawing.shape_attr.original_width = 700;
+        ole.drawing.shape_attr.original_height = 800;
+        ole.drawing.shape_attr.current_width = 701;
+        ole.drawing.shape_attr.current_height = 801;
+        ole.drawing.shape_attr.horz_flip = true;
+        ole.drawing.shape_attr.rotation_angle = 12;
+        ole.drawing.shape_attr.rotation_center.x = 350;
+        ole.drawing.shape_attr.rotation_center.y = 400;
+        ole.drawing.shape_attr.rotate_image = true;
+        ole.drawing.border_line = crate::model::style::ShapeBorderLine {
+            width: 77,
+            attr: 2,
+            ..Default::default()
+        };
+        ole.drawing.raw_hwpx_child_xml.push(
+            r#"<hp:vendorExt custom="chart"><hp:nested value="1"/></hp:vendorExt>"#.to_string(),
+        );
+
+        let xml = render_hwpx_chart_xml(
+            &ole.common,
+            &ole.caption,
+            "Chart/chart2.xml",
+            Some(&ole),
+            &mut ctx,
+        );
+
+        assert!(xml.contains(r#"chartIDRef="Chart/chart2.xml""#), "{xml}");
+        assert!(xml.contains(r#"<hp:offset x="11" y="22"/>"#), "{xml}");
+        assert!(
+            xml.contains(r#"<hp:orgSz width="700" height="800"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:curSz width="701" height="801"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:flip horizontal="1" vertical="0"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:rotationInfo angle="12" centerX="350" centerY="400" rotateimage="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<hp:renderingInfo>"#), "{xml}");
+        assert!(xml.contains(r#"<hc:extent x="900" y="901"/>"#), "{xml}");
+        assert!(
+            xml.contains(r##"<hp:lineShape color="#000000" width="77" style="DASH""##),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:vendorExt custom="chart"><hp:nested value="1"/></hp:vendorExt>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn chart_default_shape_component_children_are_not_emitted() {
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut ole = crate::model::shape::OleShape::default();
+        ole.common.instance_id = 123;
+        ole.common.width = 111;
+        ole.common.height = 222;
+        ole.extent_x = 7200;
+        ole.extent_y = 7200;
+
+        let xml = render_hwpx_chart_xml(
+            &ole.common,
+            &ole.caption,
+            "Chart/chart2.xml",
+            Some(&ole),
+            &mut ctx,
+        );
+
+        assert!(!xml.contains("<hp:offset "), "{xml}");
+        assert!(!xml.contains("<hp:orgSz "), "{xml}");
+        assert!(!xml.contains("<hp:curSz "), "{xml}");
+        assert!(!xml.contains("<hp:renderingInfo>"), "{xml}");
+        assert!(!xml.contains("<hc:extent "), "{xml}");
+        assert!(!xml.contains("<hp:lineShape "), "{xml}");
+        assert!(xml.contains(r#"<hp:sz width="111" height="222""#), "{xml}");
+    }
+
+    #[test]
+    fn ole_common_attrs_reflect_ir() {
+        let doc = Document::default();
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let mut ole = crate::model::shape::OleShape::default();
+        ole.common.instance_id = 321;
+        ole.common.inst_id = 654;
+        ole.common.width = 333;
+        ole.common.height = 444;
+        ole.common.numbering_type = ObjectNumberingType::Picture;
+        ole.common.numbering_type_explicit = true;
+        ole.common.text_wrap = TextWrap::TopAndBottom;
+        ole.common.text_flow = TextFlow::LargestOnly;
+        ole.common.lock = true;
+        ole.common.dropcap_style = Some("DoubleLine".to_string());
+        ole.common.href = Some("?OleTarget;0;0;0;".to_string());
+        ole.common.width_criterion = SizeCriterion::Page;
+        ole.common.height_criterion = SizeCriterion::Absolute;
+        ole.common.size_protect = true;
+        ole.common.flow_with_text = true;
+        ole.common.allow_overlap = true;
+        ole.common.prevent_page_break = 1;
+        ole.common.horz_rel_to = HorzRelTo::Column;
+        ole.common.horz_align = HorzAlign::Right;
+        ole.extent_x = 900;
+        ole.extent_y = 901;
+        ole.drawing.shape_attr.offset_x = 11;
+        ole.drawing.shape_attr.offset_y = 22;
+        ole.drawing.shape_attr.original_width = 700;
+        ole.drawing.shape_attr.original_height = 800;
+        ole.drawing.shape_attr.current_width = 701;
+        ole.drawing.shape_attr.current_height = 801;
+        ole.drawing.shape_attr.horz_flip = true;
+        ole.drawing.shape_attr.rotation_angle = 12;
+        ole.drawing.shape_attr.rotation_center.x = 350;
+        ole.drawing.shape_attr.rotation_center.y = 400;
+        ole.drawing.shape_attr.rotate_image = true;
+        ole.drawing.border_line = crate::model::style::ShapeBorderLine {
+            width: 77,
+            attr: 2,
+            ..Default::default()
+        };
+        ole.drawing.raw_hwpx_child_xml.push(
+            r#"<hp:vendorExt custom="ole"><hp:nested value="2"/></hp:vendorExt>"#.to_string(),
+        );
+        ole.hwpx_object_type = Some("UNKNOWN".to_string());
+        ole.hwpx_draw_aspect = Some("CONTENT".to_string());
+        ole.hwpx_eq_base_line = Some("0".to_string());
+        ole.hwpx_has_moniker = Some("0".to_string());
+
+        let xml = render_hwpx_ole_xml(&ole, &mut ctx);
+
+        assert!(xml.contains(r#"<hp:ole id="321" instid="654""#), "{xml}");
+        assert!(xml.contains(r#"numberingType="PICTURE""#), "{xml}");
+        assert!(xml.contains(r#"textWrap="TOP_AND_BOTTOM""#), "{xml}");
+        assert!(xml.contains(r#"textFlow="LARGEST_ONLY""#), "{xml}");
+        assert!(xml.contains(r#"lock="1""#), "{xml}");
+        assert!(xml.contains(r#"dropcapstyle="DoubleLine""#), "{xml}");
+        assert!(xml.contains(r#"href="?OleTarget;0;0;0;""#), "{xml}");
+        assert!(xml.contains(r#"objectType="UNKNOWN""#), "{xml}");
+        assert!(xml.contains(r#"drawAspect="CONTENT""#), "{xml}");
+        assert!(xml.contains(r#"eqBaseLine="0""#), "{xml}");
+        assert!(xml.contains(r#"hasMoniker="0""#), "{xml}");
+        assert!(xml.contains(r#"<hp:offset x="11" y="22"/>"#), "{xml}");
+        assert!(
+            xml.contains(r#"<hp:orgSz width="700" height="800"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:curSz width="701" height="801"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:flip horizontal="1" vertical="0"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:rotationInfo angle="12" centerX="350" centerY="400" rotateimage="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(xml.contains(r#"<hp:renderingInfo>"#), "{xml}");
+        assert!(xml.contains(r#"<hc:extent x="900" y="901"/>"#), "{xml}");
+        assert!(
+            xml.contains(r##"<hp:lineShape color="#000000" width="77" style="DASH""##),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:vendorExt custom="ole"><hp:nested value="2"/></hp:vendorExt>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:sz width="333" height="444" widthRelTo="PAGE" heightRelTo="ABSOLUTE" protect="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:pos treatAsChar="0" affectLSpacing="0" flowWithText="1" allowOverlap="1" holdAnchorAndSO="1""#
+            ),
+            "{xml}"
+        );
     }
 
     #[test]
@@ -1637,6 +2845,384 @@ mod tests {
             ),
             "secPr 에 tabStopVal/tabStopUnit 이 정확 순서로 있어야 함: {}",
             &xml[..600.min(xml.len())]
+        );
+    }
+
+    #[test]
+    fn page_border_fill_splices_raw_hwpx_children() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.page_border_fill.border_fill_id = 2;
+        section.section_def.page_border_fill.spacing_left = 777;
+        section.section_def.page_border_fill.spacing_right = 778;
+        section.section_def.page_border_fill.spacing_top = 779;
+        section.section_def.page_border_fill.spacing_bottom = 780;
+        section.section_def.page_border_fill.raw_hwpx_children = Some(
+            r#"<hp:switch><hp:case hp:required-namespace="custom"/></hp:switch><hp:offset left="10" right="20" top="30" bottom="40"/>"#
+                .to_string(),
+        );
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"<hp:switch><hp:case hp:required-namespace="custom"/></hp:switch>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:offset left="10" right="20" top="30" bottom="40"/>"#),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains(r#"<hp:offset left="777" right="778" top="779" bottom="780"/>"#),
+            "raw child XML should prevent fallback offset generation: {xml}"
+        );
+    }
+
+    #[test]
+    fn note_pr_splices_raw_hwpx_children() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.endnote_shape.separator_length = 999;
+        section.section_def.endnote_shape.raw_hwpx_children = Some(
+            r##"<hp:switch><hp:case hp:required-namespace="custom"/></hp:switch><hp:noteLine length="123" type="DASH" width="0.4 mm" color="#112233"/>"##
+                .to_string(),
+        );
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"<hp:switch><hp:case hp:required-namespace="custom"/></hp:switch>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r##"<hp:noteLine length="123" type="DASH" width="0.4 mm" color="#112233"/>"##
+            ),
+            "{xml}"
+        );
+        assert!(
+            !xml.contains(r#"<hp:noteLine length="999""#),
+            "raw child XML should prevent fallback noteLine generation: {xml}"
+        );
+    }
+
+    #[test]
+    fn note_pr_reflects_semantic_footnote_and_endnote_shapes() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+
+        let footnote = &mut section.section_def.footnote_shape;
+        footnote.number_format = NumberFormat::UserChar;
+        footnote.user_char = '*';
+        footnote.prefix_char = '[';
+        footnote.suffix_char = ']';
+        footnote.number_code_superscript = true;
+        footnote.separator_length = 321;
+        footnote.separator_line_type = 3;
+        footnote.separator_line_width = 9;
+        footnote.separator_color = 0x0033_2211;
+        footnote.raw_unknown = 77;
+        footnote.note_spacing = 88;
+        footnote.separator_margin_top = 99;
+        footnote.numbering = FootnoteNumbering::RestartPage;
+        footnote.start_number = 5;
+        footnote.placement = FootnotePlacement::BelowText;
+        footnote.print_inline_after_text = true;
+
+        let endnote = &mut section.section_def.endnote_shape;
+        endnote.separator_length = 444;
+        endnote.separator_line_type = 2;
+        endnote.separator_line_width = 6;
+        endnote.separator_color = 0x0003_0201;
+        endnote.raw_unknown = 11;
+        endnote.note_spacing = 22;
+        endnote.separator_margin_top = 33;
+        endnote.numbering = FootnoteNumbering::RestartSection;
+        endnote.start_number = 9;
+        endnote.placement = FootnotePlacement::BelowText;
+
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(
+                r#"<hp:autoNumFormat type="USER_CHAR" userChar="*" prefixChar="[" suffixChar="]" supscript="1"/>"#
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r##"<hp:noteLine length="321" type="DOT" width="0.7 mm" color="#112233"/>"##
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:noteSpacing betweenNotes="77" belowLine="88" aboveLine="99"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:numbering type="ON_PAGE" newNum="5"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:placement place="BELOW_TEXT" beneathText="1"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                r##"<hp:noteLine length="444" type="DASH" width="0.4 mm" color="#010203"/>"##
+            ),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:noteSpacing betweenNotes="11" belowLine="22" aboveLine="33"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:numbering type="ON_SECTION" newNum="9"/>"#),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:placement place="END_OF_SECTION" beneathText="0"/>"#),
+            "{xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_def_start_numbers_and_tab_stop() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.page_num = 7;
+        section.section_def.picture_num = 2;
+        section.section_def.table_num = 3;
+        section.section_def.equation_num = 4;
+        section.section_def.default_tab_spacing = 8040;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+        assert!(
+            xml.contains(r#"tabStop="8040" tabStopVal="4000" tabStopUnit="HWPUNIT""#),
+            "secPr tabStop must reflect SectionDef.default_tab_spacing: {}",
+            &xml[..600.min(xml.len())]
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:startNum pageStartsOn="BOTH" page="7" pic="2" tbl="3" equation="4"/>"#
+            ),
+            "startNum must reflect SectionDef start numbers: {}",
+            &xml[..1000.min(xml.len())]
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_tab_stop_val_and_unit() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.default_tab_spacing = 8040;
+        section.section_def.tab_stop_val = 2345;
+        section.section_def.tab_stop_unit = "CUSTOMUNIT".to_string();
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"tabStop="8040" tabStopVal="2345" tabStopUnit="CUSTOMUNIT""#),
+            "secPr tabStopVal/tabStopUnit must reflect SectionDef fields: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_text_direction() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.text_direction = 1;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"<hp:secPr id="" textDirection="VERTICAL""#),
+            "secPr textDirection must reflect SectionDef.text_direction: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_vertical_all_text_direction() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.text_direction = 2;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"<hp:secPr id="" textDirection="VERTICALALL""#),
+            "secPr textDirection must preserve VERTICALALL: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_id() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.section_id = "section&alpha".to_string();
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"<hp:secPr id="section&amp;alpha""#),
+            "secPr id must reflect SectionDef.section_id with XML escaping: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_memo_shape_and_vertical_width_head() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.memo_shape_id_ref = 3;
+        section.section_def.text_vertical_width_head = 456;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"memoShapeIDRef="3" textVerticalWidthHead="456""#),
+            "secPr memoShapeIDRef/textVerticalWidthHead must reflect SectionDef fields: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_outline_shape_id_ref() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.outline_numbering_id = 8;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"outlineShapeIDRef="8""#),
+            "secPr outlineShapeIDRef must reflect SectionDef.outline_numbering_id: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_section_grid() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.line_grid = 1200;
+        section.section_def.char_grid = 900;
+        section.section_def.wonggoji_format = 1;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"<hp:grid lineGrid="1200" charGrid="900" wonggojiFormat="1"/>"#),
+            "grid must reflect SectionDef line/char grid: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_line_number_shape() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.hide_page_number = true;
+        section.section_def.show_line_number = true;
+        section.section_def.line_number_restart_type = 2;
+        section.section_def.line_number_count_by = 3;
+        section.section_def.line_number_distance = 450;
+        section.section_def.line_number_start_number = 7;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"hideFirstPageNum="1""#),
+            "visibility must reflect SectionDef.hide_page_number: {xml}"
+        );
+        assert!(
+            xml.contains(r#"showLineNumber="1""#),
+            "visibility must reflect SectionDef.show_line_number: {xml}"
+        );
+        assert!(
+            xml.contains(
+                r#"<hp:lineNumberShape restartType="2" countBy="3" distance="450" startNumber="7"/>"#
+            ),
+            "lineNumberShape must reflect SectionDef line-number fields: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_visibility_border_and_fill_enums() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.visibility_border = "SHOW_FIRST".to_string();
+        section.section_def.visibility_fill = "HIDE_FIRST".to_string();
+        section.section_def.hide_fill = true;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"border="SHOW_FIRST""#),
+            "visibility border enum must be preserved: {xml}"
+        );
+        assert!(
+            xml.contains(r#"fill="HIDE_FIRST""#),
+            "visibility fill enum must be preserved: {xml}"
+        );
+    }
+
+    #[test]
+    fn secpr_reflects_visibility_hide_all_enum() {
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        let (mut doc, mut section) = make_doc_with_paragraph(para);
+        section.section_def.visibility_border = "hide_all".to_string();
+        section.section_def.visibility_fill = "HIDE_ALL".to_string();
+        section.section_def.hide_border = true;
+        section.section_def.hide_fill = true;
+        doc.sections[0] = section.clone();
+
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(r#"border="HIDE_ALL""#),
+            "visibility border HIDE_ALL enum must not collapse to HIDE_FIRST: {xml}"
+        );
+        assert!(
+            xml.contains(r#"fill="HIDE_ALL""#),
+            "visibility fill HIDE_ALL enum must not collapse to HIDE_FIRST: {xml}"
         );
     }
 
@@ -1684,6 +3270,39 @@ mod tests {
             !xml.contains(r#"colCount="1""#),
             "하드코딩 colCount=1 이 남으면 안 됨 (회귀 가드): {}",
             &xml[..900.min(xml.len())]
+        );
+    }
+
+    #[test]
+    fn body_col_pr_reflects_id_schema_tokens_mirror_and_col_sizes() {
+        use crate::model::page::{ColumnDef, ColumnDirection, ColumnType};
+
+        let mut cd = ColumnDef::default();
+        cd.column_id = "col&alpha".to_string();
+        cd.column_type = ColumnType::Distribute;
+        cd.direction = ColumnDirection::Mirror;
+        cd.column_count = 2;
+        cd.same_width = false;
+        cd.widths = vec![2200, 1800];
+        cd.gaps = vec![300, 0];
+
+        let mut para = Paragraph::default();
+        para.text = "x".to_string();
+        para.controls.push(Control::ColumnDef(cd));
+
+        let (doc, section) = make_doc_with_paragraph(para);
+        let mut ctx = SerializeContext::collect_from_document(&doc);
+        let xml = String::from_utf8(write_section(&section, &doc, 0, &mut ctx).unwrap()).unwrap();
+
+        assert!(
+            xml.contains(
+                r#"<hp:colPr id="col&amp;alpha" type="BALANCED_NEWSPAPER" layout="MIRROR" colCount="2" sameSz="0" sameGap="0">"#
+            ),
+            "colPr attributes must preserve id, schema tokens, mirror layout, and sameSz=false: {xml}"
+        );
+        assert!(
+            xml.contains(r#"<hp:colSz width="2200" gap="300"/><hp:colSz width="1800" gap="0"/>"#),
+            "colPr must emit per-column sizes: {xml}"
         );
     }
 

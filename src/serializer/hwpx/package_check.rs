@@ -8,7 +8,7 @@
 //! 3. 필수 엔트리 존재 (version.xml, header.xml, content.hpf, Preview, settings,
 //!    META-INF/container.xml·container.rdf·manifest.xml)
 //! 4. `Contents/section{N}.xml` 엔트리 수 = IR 섹션 수 (잉여 섹션 엔트리 금지)
-//! 5. `Contents/content.hpf` manifest 가 참조하는 href 가 모두 ZIP 에 실재
+//! 5. `Contents/content.hpf` manifest 가 참조하는 embedded href 가 모두 ZIP 에 실재
 //! 6. `BinData/` 엔트리 수·확장자 멀티셋 = IR `bin_data_content` 보존
 //!
 //! 주의: serializer 가 BinData href 를 `BinData/image{N}.{ext}` 로 재명명하므로
@@ -125,10 +125,10 @@ pub fn check_package(hwpx_bytes: &[u8], doc: &Document) -> PackageCheckReport {
         ));
     }
 
-    // 5. content.hpf manifest href 실재 확인
+    // 5. content.hpf manifest embedded href 실재 확인
     match read_entry_string(&mut archive, "Contents/content.hpf") {
         Ok(hpf) => {
-            for href in extract_hrefs(&hpf) {
+            for href in extract_embedded_hrefs(&hpf) {
                 if !names.contains(href.as_str()) {
                     report.push(format!("content.hpf 참조 엔트리 누락: {href}"));
                 }
@@ -188,22 +188,37 @@ fn read_entry_string(
     Ok(s)
 }
 
-/// XML 텍스트에서 `href="..."` 값을 단순 스캔으로 추출한다.
+/// XML 텍스트에서 embedded `opf:item href="..."` 값을 단순 스캔으로 추출한다.
 ///
 /// content.hpf 는 자체 writer 산출물이므로 따옴표 이스케이프 변형이 없다.
-fn extract_hrefs(xml: &str) -> Vec<String> {
+fn extract_embedded_hrefs(xml: &str) -> Vec<String> {
     let mut hrefs = Vec::new();
     let mut rest = xml;
-    while let Some(pos) = rest.find("href=\"") {
-        rest = &rest[pos + "href=\"".len()..];
-        if let Some(end) = rest.find('"') {
-            hrefs.push(rest[..end].to_string());
-            rest = &rest[end + 1..];
-        } else {
+    while let Some(pos) = rest.find("<opf:item") {
+        rest = &rest[pos + "<opf:item".len()..];
+        if matches!(rest.as_bytes().first(), Some(b'r')) {
+            continue;
+        }
+        let Some(end) = rest.find('>') else {
             break;
+        };
+        let tag = &rest[..end];
+        rest = &rest[end + 1..];
+        if attr_value(tag, "isEmbeded") == Some("0") {
+            continue;
+        }
+        if let Some(href) = attr_value(tag, "href") {
+            hrefs.push(href.to_string());
         }
     }
     hrefs
+}
+
+fn attr_value<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("{name}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')? + start;
+    Some(&tag[start..end])
 }
 
 /// 파일명에서 소문자 확장자 추출 (없으면 빈 문자열).
@@ -316,13 +331,13 @@ mod tests {
     }
 
     #[test]
-    fn extract_hrefs_basic() {
-        let xml = r#"<opf:item href="Contents/header.xml"/><opf:item href="settings.xml"/>"#;
+    fn extract_embedded_hrefs_skips_external_links() {
+        let xml = r#"<opf:item href="Contents/header.xml"/><opf:item href="D:\images\linked.gif" isEmbeded="0"/><opf:itemref idref="section0"/><opf:item href="BinData/image1.png" isEmbeded="1"/>"#;
         assert_eq!(
-            extract_hrefs(xml),
+            extract_embedded_hrefs(xml),
             vec![
                 "Contents/header.xml".to_string(),
-                "settings.xml".to_string()
+                "BinData/image1.png".to_string()
             ]
         );
     }

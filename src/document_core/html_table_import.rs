@@ -750,7 +750,12 @@ impl DocumentCore {
 
         let bf = BorderFill {
             raw_data: None,
+            raw_hwpx_children: None,
             attr: 0,
+            three_d: false,
+            shadow: false,
+            center_line: None,
+            break_cell_separate_line: false,
             borders,
             diagonal: DiagonalLine::default(),
             fill,
@@ -810,7 +815,12 @@ impl DocumentCore {
 
         let bf = BorderFill {
             raw_data: None,
+            raw_hwpx_children: None,
             attr: 0,
+            three_d: false,
+            shadow: false,
+            center_line: None,
+            break_cell_separate_line: false,
             borders,
             diagonal: DiagonalLine::default(),
             fill,

@@ -7,8 +7,8 @@
      데스크톱: 1024px~ (기존 레이아웃 유지)
    ================================================================ */
 
-/* ─── 태블릿 (768~1023px) ────────────────────────────── */
-@media (max-width: 1023px) {
+/* ─── 좁은 화면 (~767px) ────────────────────────────── */
+@media (max-width: 767px) {
   /* 도구 상자: 높이 축소, 라벨 숨김 */
   #icon-toolbar {
     height: 40px;
@@ -39,6 +39,16 @@
   #scroll-container {
     flex: 1;
     min-height: 0;
+  }
+  #ai-chat-panel {
+    flex: 0 0 320px;
+    min-width: 0;
+    max-width: none;
+    border-left: 0;
+    border-top: 1px solid var(--ui-border-strong);
+  }
+  #editor-area.ai-chat-collapsed #ai-chat-panel {
+    display: none;
   }
 }
 
@@ -131,7 +141,13 @@
     touch-action: pan-x pan-y pinch-zoom;
     -webkit-overflow-scrolling: touch;
   }
-
+  #ai-chat-panel {
+    flex-basis: min(42dvh, 310px);
+  }
+  .ai-chat-controls,
+  .ai-chat-settings-actions {
+    grid-template-columns: minmax(0, 1fr);
+  }
   /* ── 상태 표시줄: 최소 정보 ── */
   #status-bar {
     height: 32px;
@@ -252,12 +268,15 @@
     display: flex;
     flex-direction: column;
   }
+  #ai-chat-panel {
+    display: none;
+  }
 }
 
 /* ─── 인쇄 ──────────────────────────────────────────── */
 @media print {
   #menu-bar, #icon-toolbar, #style-bar, #status-bar,
-  #ruler-corner, #h-ruler, #v-ruler {
+  #ruler-corner, #h-ruler, #v-ruler, #ai-chat-panel {
     display: none !important;
   }
   #editor-area {

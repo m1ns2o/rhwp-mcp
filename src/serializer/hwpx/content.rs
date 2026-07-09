@@ -16,6 +16,15 @@ pub struct BinDataEntry {
     pub id: String,
     pub href: String,
     pub media_type: String,
+    pub is_embedded: bool,
+}
+
+/// IR 밖에서 원본 ZIP 엔트리로 보존되는 HWPX 보조 항목 manifest 정보.
+#[derive(Debug, Clone)]
+pub struct AuxiliaryEntry {
+    pub id: String,
+    pub href: String,
+    pub media_type: String,
 }
 
 /// 원본 content.hpf 에서 `<opf:metadata> … </opf:metadata>` 블록(태그 포함)을
@@ -36,6 +45,7 @@ pub fn write_content_hpf(
     section_hrefs: &[String],
     bin_data: &[BinDataEntry],
     master_items: &[(String, String)],
+    auxiliary_entries: &[AuxiliaryEntry],
     original_content_hpf: Option<&[u8]>,
 ) -> Result<Vec<u8>, SerializeError> {
     // 원본 metadata 블록(있으면) — 본문과 무관한 저작자/일자/주제 보존용.
@@ -173,7 +183,19 @@ pub fn write_content_hpf(
                 ("id", entry.id.as_str()),
                 ("href", entry.href.as_str()),
                 ("media-type", entry.media_type.as_str()),
-                ("isEmbeded", "1"),
+                ("isEmbeded", if entry.is_embedded { "1" } else { "0" }),
+            ],
+        )?;
+    }
+
+    for entry in auxiliary_entries {
+        empty_tag(
+            &mut w,
+            "opf:item",
+            &[
+                ("id", entry.id.as_str()),
+                ("href", entry.href.as_str()),
+                ("media-type", entry.media_type.as_str()),
             ],
         )?;
     }
@@ -216,6 +238,7 @@ mod tests {
             &["Contents/section0.xml".to_string()],
             &[],
             &[],
+            &[],
             Some(original.as_bytes()),
         )
         .expect("serialize");
@@ -252,7 +275,7 @@ mod tests {
     /// 원본이 없으면(HWP5 등) 하드코딩 metadata 로 폴백한다.
     #[test]
     fn metadata_falls_back_when_no_original() {
-        let out = write_content_hpf(&["Contents/section0.xml".to_string()], &[], &[], None)
+        let out = write_content_hpf(&["Contents/section0.xml".to_string()], &[], &[], &[], None)
             .expect("serialize");
         let s = String::from_utf8(out).expect("utf8");
         assert!(s.contains(r#"<opf:meta name="creator" content="text">rhwp</opf:meta>"#));

@@ -668,6 +668,7 @@ fn normalize_paragraph_char_border_fills(doc: &mut Document, report: &mut Adapte
             border_fill.fill.image = None;
             border_fill.fill.alpha = 0;
             border_fill.raw_data = None;
+            border_fill.raw_hwpx_children = None;
             report.border_fills_no_fill_normalized += 1;
         }
     }

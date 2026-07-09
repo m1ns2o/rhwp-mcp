@@ -17,6 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use crate::model::bin_data::BinDataType;
 use crate::model::control::Control;
 use crate::model::document::Document;
 use crate::serializer::SerializeError;
@@ -74,6 +75,8 @@ pub struct BinDataEntry {
     pub media_type: String,
     /// IR 상의 bin_data_id (storage_id) — 매핑 역추적용
     pub bin_data_id: u16,
+    /// true면 ZIP 내부 BinData entry, false면 외부 파일 링크.
+    pub is_embedded: bool,
 }
 
 /// 1-pass 스캔으로 구축되는 직렬화 컨텍스트.
@@ -87,6 +90,12 @@ pub struct SerializeContext {
     pub style_ids: IdPool<u16>,
     /// `bin_data_id` (IR) → manifest 엔트리 매핑
     pub bin_data_map: HashMap<u16, BinDataEntry>,
+    /// `bin_data_id` (IR) → HWPX chart XML entry path.
+    ///
+    /// HWPX chart controls reference `Chart/chartN.xml` directly from section
+    /// XML and, in Hancom-authored samples, those chart entries are not listed
+    /// as ordinary BinData manifest items.
+    pub ooxml_chart_map: HashMap<u16, String>,
     /// 문서 전역 문단 ID 카운터 — `<hp:p id="...">` 에 발급한다.
     para_id_counter: u32,
     /// subList(셀·글상자) 직렬화 중첩 깊이 (#1379 3단계).
@@ -155,21 +164,70 @@ impl SerializeContext {
 
         // BinData: bin_data_content의 storage_id → manifest 엔트리 생성
         for (i, bd) in doc.bin_data_content.iter().enumerate() {
+            let bin_data_id = if bd.id == 0 { (i + 1) as u16 } else { bd.id };
             let ext = if bd.extension.is_empty() {
                 "bin"
             } else {
                 bd.extension.as_str()
             };
-            let manifest_id = format!("image{}", i + 1);
+            if ext.eq_ignore_ascii_case("ooxml_chart") {
+                let chart_num = if (60001..=60064).contains(&bin_data_id) {
+                    bin_data_id - 60000
+                } else {
+                    (ctx.ooxml_chart_map.len() + 1) as u16
+                };
+                ctx.ooxml_chart_map
+                    .insert(bin_data_id, format!("Chart/chart{}.xml", chart_num));
+                continue;
+            }
+            let manifest_id = format!("image{}", bin_data_id);
             let href = format!("BinData/{}.{}", manifest_id, ext);
             let media_type = mime_from_ext(ext);
             ctx.bin_data_map.insert(
-                bd.id,
+                bin_data_id,
                 BinDataEntry {
                     manifest_id,
                     href,
                     media_type: media_type.to_string(),
-                    bin_data_id: bd.id,
+                    bin_data_id,
+                    is_embedded: true,
+                },
+            );
+        }
+
+        for (idx, bd) in doc.doc_info.bin_data_list.iter().enumerate() {
+            if !matches!(bd.data_type, BinDataType::Link) {
+                continue;
+            }
+            let bin_data_id = (idx + 1) as u16;
+            if ctx.bin_data_map.contains_key(&bin_data_id) {
+                continue;
+            }
+            let Some(href) = bd
+                .abs_path
+                .as_ref()
+                .filter(|path| !path.is_empty())
+                .or_else(|| bd.rel_path.as_ref().filter(|path| !path.is_empty()))
+                .cloned()
+            else {
+                continue;
+            };
+            let ext = bd
+                .extension
+                .as_deref()
+                .filter(|ext| !ext.is_empty())
+                .or_else(|| extension_from_href(&href))
+                .unwrap_or("bin");
+            let manifest_id = format!("image{}", bin_data_id);
+            let media_type = mime_from_ext(ext);
+            ctx.bin_data_map.insert(
+                bin_data_id,
+                BinDataEntry {
+                    manifest_id,
+                    href,
+                    media_type: media_type.to_string(),
+                    bin_data_id,
+                    is_embedded: false,
                 },
             );
         }
@@ -182,6 +240,24 @@ impl SerializeContext {
         let mut v: Vec<_> = self.bin_data_map.values().cloned().collect();
         v.sort_by_key(|e| e.bin_data_id);
         v
+    }
+
+    /// HWPX chart XML ZIP entries, sorted by path for stable output.
+    pub fn ooxml_chart_entries(&self) -> Vec<(u16, String)> {
+        let mut v: Vec<_> = self
+            .ooxml_chart_map
+            .iter()
+            .map(|(id, href)| (*id, href.clone()))
+            .collect();
+        v.sort_by(|a, b| a.1.cmp(&b.1));
+        v
+    }
+
+    /// `bin_data_id` → `Chart/chartN.xml` 조회.
+    pub fn resolve_ooxml_chart_href(&self, bin_data_id: u16) -> Option<&str> {
+        self.ooxml_chart_map
+            .get(&bin_data_id)
+            .map(|href| href.as_str())
     }
 
     /// `bin_data_id` → manifest id 조회 (Stage 4의 `<hc:img binaryItemIDRef="...">` 용).
@@ -246,6 +322,16 @@ fn mime_from_ext(ext: &str) -> &'static str {
         "tif" | "tiff" => "image/tiff",
         "svg" => "image/svg+xml",
         _ => "application/octet-stream",
+    }
+}
+
+fn extension_from_href(href: &str) -> Option<&str> {
+    let file_name = href.rsplit(['/', '\\']).next().unwrap_or(href);
+    let (_, ext) = file_name.rsplit_once('.')?;
+    if ext.is_empty() {
+        None
+    } else {
+        Some(ext)
     }
 }
 

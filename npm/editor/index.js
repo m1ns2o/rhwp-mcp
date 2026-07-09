@@ -141,6 +141,14 @@ class RhwpEditor {
   }
 
   /**
+   * 빈 HWP 문서를 생성합니다.
+   * @returns { pageCount: number }
+   */
+  async newDocument() {
+    return this._request('newDocument', { skipUnsavedGuard: true });
+  }
+
+  /**
    * 현재 문서의 페이지 수를 반환합니다.
    * @returns 페이지 수
    */
@@ -184,6 +192,43 @@ class RhwpEditor {
    */
   async exportHwpVerify() {
     return this._request('exportHwpVerify');
+  }
+
+  /**
+   * AI 패널 provider/API 설정을 등록합니다.
+   *
+   * settings 예:
+   * { provider: 'openai', authMode: 'apiKey', model: 'gpt-5.5', apiKey: '...' }
+   * { provider: 'anthropic', authMode: 'bearer', model: 'claude-sonnet-5', bearerToken: '...' }
+   * { provider: 'gemini', authMode: 'apiKey', model: 'gemini-flash-latest', apiKey: '...' }
+   * { provider: 'custom', customEndpoint: '/api/ai/chat', bearerToken: '...' }
+   *
+   * 반환값은 secret 값을 제외하고 hasApiKey/hasBearerToken만 알려줍니다.
+   */
+  async configureAi(settings) {
+    return this._request('configureAi', { settings });
+  }
+
+  /**
+   * 현재 AI 패널 설정 요약을 반환합니다. API key/token 원문은 반환하지 않습니다.
+   */
+  async getAiSettings() {
+    return this._request('getAiSettings');
+  }
+
+  /**
+   * AI 사이드 패널을 열거나 닫습니다.
+   */
+  async openAiPanel(open = true) {
+    return this._request('openAiPanel', { open });
+  }
+
+  /**
+   * 설정된 OAuth/token broker URL에서 bearer token을 받아 저장합니다.
+   * broker 응답은 { access_token: string } 또는 { token: string } 형식이어야 합니다.
+   */
+  async refreshAiOAuthToken() {
+    return this._request('refreshAiOAuthToken');
   }
 
   /**

@@ -59,7 +59,7 @@ fn whitelist() -> HashMap<&'static str, Vec<&'static str>> {
         vec!["LEFT", "CENTER", "RIGHT", "INSIDE", "OUTSIDE"],
     );
     m.insert("applyPageType", vec!["BOTH", "EVEN", "ODD"]);
-    m.insert("lineWrap", vec!["BREAK", "SQUEEZE"]);
+    m.insert("lineWrap", vec!["BREAK", "SQUEEZE", "KEEP"]);
     m.insert(
         "familyType",
         vec![

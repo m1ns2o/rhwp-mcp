@@ -158,6 +158,17 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
             hwpx_aux_entries.push((path.to_string(), bytes));
         }
     }
+    for path in reader.file_names() {
+        if is_passthrough_hwpx_aux_path(&path)
+            && !hwpx_aux_entries
+                .iter()
+                .any(|(existing, _)| existing == &path)
+        {
+            if let Ok(bytes) = reader.read_file_bytes(&path) {
+                hwpx_aux_entries.push((path, bytes));
+            }
+        }
+    }
 
     // 2. content.hpf → 섹션 파일 목록 + BinData 목록
     let content_xml = reader.read_file("Contents/content.hpf")?;
@@ -355,6 +366,28 @@ pub fn parse_hwpx(data: &[u8]) -> Result<Document, HwpxError> {
     super::populate_link_image_paths(&mut doc);
 
     Ok(doc)
+}
+
+fn is_passthrough_hwpx_aux_path(path: &str) -> bool {
+    if path.ends_with('/') {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        p if p.starts_with("history/")
+            || p.starts_with("histories/")
+            || p.starts_with("trackchange/")
+            || p.starts_with("trackchanges/")
+            || p.starts_with("revision/")
+            || p.starts_with("revisions/")
+            || p.starts_with("contents/history/")
+            || p.starts_with("contents/histories/")
+            || p.starts_with("contents/trackchange/")
+            || p.starts_with("contents/trackchanges/")
+            || p.starts_with("contents/revision/")
+            || p.starts_with("contents/revisions/")
+    )
 }
 
 #[cfg(test)]

@@ -29,7 +29,8 @@ use std::io::Write;
 use quick_xml::Writer;
 
 use crate::model::shape::{
-    CommonObjAttr, HorzAlign, HorzRelTo, TextFlow, TextWrap, VertAlign, VertRelTo,
+    CommonObjAttr, HorzAlign, HorzRelTo, ObjectNumberingType, SizeCriterion, TextFlow, TextWrap,
+    VertAlign, VertRelTo,
 };
 use crate::model::table::{Cell, Table, TablePageBreak, VerticalAlign};
 
@@ -56,9 +57,14 @@ pub fn write_table<W: Write>(
     // --- <hp:tbl> 시작 태그 + 속성 ---
     let id_str = table.common.instance_id.to_string();
     let z_order = table.common.z_order.to_string();
+    let numbering_type = table_numbering_type_str(
+        table.common.numbering_type,
+        table.common.numbering_type_explicit,
+    );
     let text_wrap = text_wrap_str(table.common.text_wrap);
     let text_flow = text_flow_str(table.common.text_flow);
-    let lock = bool01(false);
+    let lock = bool01(table.common.lock);
+    let dropcap_style = table.common.dropcap_style.as_deref().unwrap_or("None");
     let page_break = table_page_break_str(table.page_break);
     let repeat_header = bool01(table.repeat_header);
     let row_cnt = table.row_count.to_string();
@@ -73,11 +79,11 @@ pub fn write_table<W: Write>(
         &[
             ("id", &id_str),
             ("zOrder", &z_order),
-            ("numberingType", "TABLE"),
+            ("numberingType", numbering_type),
             ("textWrap", text_wrap),
             ("textFlow", text_flow),
             ("lock", lock),
-            ("dropcapstyle", "None"),
+            ("dropcapstyle", dropcap_style),
             ("pageBreak", page_break),
             ("repeatHeader", repeat_header),
             ("rowCnt", &row_cnt),
@@ -118,21 +124,25 @@ pub fn write_table<W: Write>(
 fn write_sz<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let width = c.width.to_string();
     let height = c.height.to_string();
+    let protect = bool01(c.size_protect);
     empty_tag(
         w,
         "hp:sz",
         &[
             ("width", &width),
-            ("widthRelTo", "ABSOLUTE"),
+            ("widthRelTo", size_criterion_str(c.width_criterion)),
             ("height", &height),
-            ("heightRelTo", "ABSOLUTE"),
-            ("protect", "0"),
+            ("heightRelTo", size_criterion_str(c.height_criterion)),
+            ("protect", protect),
         ],
     )
 }
 
 fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), SerializeError> {
     let treat = bool01(c.treat_as_char);
+    let flow_with_text = bool01(c.flow_with_text);
+    let allow_overlap = bool01(c.allow_overlap);
+    let hold_anchor = bool01(c.prevent_page_break != 0);
     let vert_offset = c.vertical_offset.to_string();
     let horz_offset = c.horizontal_offset.to_string();
     empty_tag(
@@ -141,9 +151,9 @@ fn write_pos<W: Write>(w: &mut Writer<W>, c: &CommonObjAttr) -> Result<(), Seria
         &[
             ("treatAsChar", treat),
             ("affectLSpacing", "0"),
-            ("flowWithText", "1"),
-            ("allowOverlap", "0"),
-            ("holdAnchorAndSO", "0"),
+            ("flowWithText", flow_with_text),
+            ("allowOverlap", allow_overlap),
+            ("holdAnchorAndSO", hold_anchor),
             ("vertRelTo", vert_rel_to_str(c.vert_rel_to)),
             ("horzRelTo", horz_rel_to_str(c.horz_rel_to)),
             ("vertAlign", vert_align_str(c.vert_align)),
@@ -229,6 +239,7 @@ fn write_cell<W: Write>(
     let has_margin = bool01(cell.apply_inner_margin);
     let protect = bool01(cell.cell_protect());
     let editable = bool01(cell.editable_in_form());
+    let dirty = bool01(cell.dirty);
     let border_ref = cell.border_fill_id.to_string();
 
     start_tag_attrs(
@@ -240,7 +251,7 @@ fn write_cell<W: Write>(
             ("hasMargin", has_margin),
             ("protect", protect),
             ("editable", editable),
-            ("dirty", "0"),
+            ("dirty", dirty),
             ("borderFillIDRef", &border_ref),
         ],
     )?;
@@ -261,6 +272,17 @@ fn write_sub_list<W: Write>(
     cell: &Cell,
     ctx: &mut SerializeContext,
 ) -> Result<(), SerializeError> {
+    let line_wrap = if cell.sub_list_line_wrap.is_empty() {
+        "BREAK"
+    } else {
+        cell.sub_list_line_wrap.as_str()
+    };
+    let link_list_id = cell.sub_list_link_list_id_ref.to_string();
+    let link_list_next_id = cell.sub_list_link_list_next_id_ref.to_string();
+    let text_width = cell.sub_list_text_width.to_string();
+    let text_height = cell.sub_list_text_height.to_string();
+    let has_text_ref = cell.sub_list_text_ref.to_string();
+    let has_num_ref = cell.sub_list_num_ref.to_string();
     start_tag_attrs(
         w,
         "hp:subList",
@@ -274,14 +296,14 @@ fn write_sub_list<W: Write>(
                     "HORIZONTAL"
                 },
             ),
-            ("lineWrap", "BREAK"),
+            ("lineWrap", line_wrap),
             ("vertAlign", cell_vert_align_str(cell.vertical_align)),
-            ("linkListIDRef", "0"),
-            ("linkListNextIDRef", "0"),
-            ("textWidth", "0"),
-            ("textHeight", "0"),
-            ("hasTextRef", "0"),
-            ("hasNumRef", "0"),
+            ("linkListIDRef", &link_list_id),
+            ("linkListNextIDRef", &link_list_next_id),
+            ("textWidth", &text_width),
+            ("textHeight", &text_height),
+            ("hasTextRef", &has_text_ref),
+            ("hasNumRef", &has_num_ref),
         ],
     )?;
 
@@ -324,21 +346,26 @@ fn write_sub_list_paragraphs<W: Write>(
 /// `<hp:caption>` 직렬화 (#1387) — 자식 순서상 outMargin 과 inMargin 사이 (모듈 doc).
 ///
 /// 속성 순서는 한컴 실물(ta-pic-001-r) 기준: side, fullSz, width, gap, lastWidth.
-/// 캡션 subList 속성은 파서가 적재하지 않으며 samples/hwpx 전수 17건 동일
-/// (vertAlign=TOP lineWrap=BREAK textDirection=HORIZONTAL — 1단계 측정) — 실물 고정값 방출.
+/// 캡션 subList의 lineWrap/textDirection은 실물 기본값을 유지하고, Left/Right 캡션의
+/// 세로 정렬은 `Caption.vert_align`에서 방출한다.
 /// 그림/도형/묶음 캡션(#1403)도 동일 경로를 공유한다 (pub(super)).
 pub(super) fn write_caption<W: Write>(
     w: &mut Writer<W>,
     caption: &crate::model::shape::Caption,
     ctx: &mut SerializeContext,
 ) -> Result<(), SerializeError> {
-    use crate::model::shape::CaptionDirection;
+    use crate::model::shape::{CaptionDirection, CaptionVertAlign};
 
     let side = match caption.direction {
         CaptionDirection::Left => "LEFT",
         CaptionDirection::Right => "RIGHT",
         CaptionDirection::Top => "TOP",
         CaptionDirection::Bottom => "BOTTOM",
+    };
+    let vert_align = match caption.vert_align {
+        CaptionVertAlign::Top => "TOP",
+        CaptionVertAlign::Center => "CENTER",
+        CaptionVertAlign::Bottom => "BOTTOM",
     };
     let full_sz = bool01(caption.include_margin);
     let width = caption.width.to_string();
@@ -362,7 +389,7 @@ pub(super) fn write_caption<W: Write>(
             ("id", ""),
             ("textDirection", "HORIZONTAL"),
             ("lineWrap", "BREAK"),
-            ("vertAlign", "TOP"),
+            ("vertAlign", vert_align),
             ("linkListIDRef", "0"),
             ("linkListNextIDRef", "0"),
             ("textWidth", "0"),
@@ -435,6 +462,25 @@ fn text_flow_str(f: TextFlow) -> &'static str {
         TextFlow::LeftOnly => "LEFT_ONLY",
         TextFlow::RightOnly => "RIGHT_ONLY",
         TextFlow::LargestOnly => "LARGEST_ONLY",
+    }
+}
+
+fn table_numbering_type_str(n: ObjectNumberingType, explicit: bool) -> &'static str {
+    match n {
+        ObjectNumberingType::Picture => "PICTURE",
+        ObjectNumberingType::Equation => "EQUATION",
+        ObjectNumberingType::None if explicit => "NONE",
+        ObjectNumberingType::None | ObjectNumberingType::Table => "TABLE",
+    }
+}
+
+fn size_criterion_str(value: SizeCriterion) -> &'static str {
+    match value {
+        SizeCriterion::Paper => "PAPER",
+        SizeCriterion::Page => "PAGE",
+        SizeCriterion::Column => "COLUMN",
+        SizeCriterion::Para => "PARA",
+        SizeCriterion::Absolute => "ABSOLUTE",
     }
 }
 
@@ -664,6 +710,37 @@ mod tests {
     }
 
     #[test]
+    fn table_numbering_type_and_lock_reflect_ir() {
+        let mut t = empty_table(1, 1);
+        t.common.numbering_type = ObjectNumberingType::Picture;
+        t.common.lock = true;
+
+        let xml = serialize(&t);
+
+        assert!(
+            xml.contains(r#"numberingType="PICTURE""#),
+            "table numberingType should preserve IR value: {xml}"
+        );
+        assert!(
+            xml.contains(r#"lock="1""#),
+            "table lock should preserve IR value: {xml}"
+        );
+    }
+
+    #[test]
+    fn table_dropcap_style_reflects_ir() {
+        let mut t = empty_table(1, 1);
+        t.common.dropcap_style = Some("DoubleLine".to_string());
+
+        let xml = serialize(&t);
+
+        assert!(
+            xml.contains(r#"dropcapstyle="DoubleLine""#),
+            "table dropcapstyle should preserve CommonObjAttr value: {xml}"
+        );
+    }
+
+    #[test]
     fn tr_count_matches_row_count() {
         let t = empty_table(4, 2);
         let xml = serialize(&t);
@@ -747,6 +824,36 @@ mod tests {
         let t = empty_table(1, 1);
         let xml = serialize(&t);
         assert!(xml.contains(r#"<hp:cellSpan colSpan="1" rowSpan="1"/>"#));
+    }
+
+    #[test]
+    fn cell_dirty_attr_reflects_ir() {
+        let mut t = empty_table(1, 1);
+        t.cells[0].dirty = true;
+        let xml = serialize(&t);
+        assert!(
+            xml.contains(r#"dirty="1""#),
+            "hp:tc dirty attr must reflect Cell.dirty: {xml}"
+        );
+    }
+
+    #[test]
+    fn cell_sublist_metadata_reflects_ir() {
+        let mut t = empty_table(1, 1);
+        t.cells[0].sub_list_line_wrap = "SQUEEZE".to_string();
+        t.cells[0].sub_list_link_list_id_ref = 7;
+        t.cells[0].sub_list_link_list_next_id_ref = 8;
+        t.cells[0].sub_list_text_width = 66502;
+        t.cells[0].sub_list_text_height = 3401;
+        t.cells[0].sub_list_text_ref = 1;
+        t.cells[0].sub_list_num_ref = 2;
+        let xml = serialize(&t);
+        assert!(
+            xml.contains(
+                r#"<hp:subList id="" textDirection="HORIZONTAL" lineWrap="SQUEEZE" vertAlign="TOP" linkListIDRef="7" linkListNextIDRef="8" textWidth="66502" textHeight="3401" hasTextRef="1" hasNumRef="2">"#
+            ),
+            "hp:subList attrs must reflect Cell metadata: {xml}"
+        );
     }
 
     #[test]

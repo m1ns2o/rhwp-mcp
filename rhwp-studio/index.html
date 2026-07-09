@@ -459,6 +459,7 @@
         </div>
         <button class="tb-btn" data-cmd="edit:document-history" title="문서 이력 관리 (Ctrl+Shift+H)"><span class="tb-icon-text">⧉</span><span class="tb-label">이력<br/>관리</span></button>
         <button class="tb-btn" data-cmd="edit:compare-documents" title="문서 비교 (Alt+Shift+V)"><span class="tb-icon-text">≍</span><span class="tb-label">문서<br/>비교</span></button>
+        <button class="tb-btn" id="ai-chat-toggle" title="AI 사이드바"><span class="tb-icon-text">AI</span><span class="tb-label">AI</span></button>
       </div>
       <!-- 머리말/꼬리말 편집 모드 전용 도구상자 (숨김) -->
       <div class="tb-group tb-headerfooter-group" style="display:none">
@@ -590,6 +591,7 @@
       <div id="scroll-container">
         <div id="scroll-content"></div>
       </div>
+      <aside id="ai-chat-panel" aria-label="AI chat"></aside>
     </div>
 
     <!-- 하단 상태 바 -->
