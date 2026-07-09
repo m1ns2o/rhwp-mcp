@@ -33,20 +33,7 @@ const VISUAL_XFAIL: &[(&str, &str)] = &[
     // 승격 이력: 514.12px 그룹 자식(보도자료 ×3 + hwpx-h-01) — 컨테이너 shape_attr + pic
     // renderingInfo. 도형 회전 전치(shape-001) — 레거시 도형 shape_attr 블록. 쪽 테두리
     // (expense_report) — pageBorderFill borderFillIDRef. 바탕쪽(exam 6종 + 온새미로) —
-    // masterPage 직렬화. 잔여는 아래 (차트/표/각주/이미지 등 별개 원인).
-    ("143E433F503322BD33.hwpx", "차트 RawSvg→Placeholder 1페이지"),
-    (
-        "2026_oss_rst.hwpx",
-        "459px 변위 + 구조 불일치 1페이지(TextRun)",
-    ),
-    (
-        "el-school-001.hwpx",
-        "구조 불일치 1페이지(도형 변위는 #shape 정정으로 0)",
-    ),
-    ("hy-002.hwpx", "603px 변위 + 구조 불일치 1페이지"),
-    ("footnote-01.hwpx", "613px 변위 + 구조 불일치 4페이지(각주)"),
-    ("aift.hwpx", "621px 변위 + 구조 불일치 5페이지(대형)"),
-    ("k-water-rfp.hwpx", "622px 변위 + 구조 불일치 2페이지(대형)"),
+    // masterPage 직렬화. 2026-07-09 기준 잔여 차트/표/각주/이미지 xfail도 baseline 승격.
 ];
 
 /// 검사 제외 — 샘플 자체가 HWPX 패키지가 아님(HWP5 가 .hwpx 확장자로 저장됨).
