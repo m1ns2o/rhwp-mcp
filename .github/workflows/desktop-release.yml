@@ -74,13 +74,30 @@ jobs:
         with:
           name: rhwp-mcp-desktop-${{ runner.os }}
           path: |
-            desktop/release/**
-            !desktop/release/*-unpacked/**
+            desktop/release/*.AppImage
+            desktop/release/*.dmg
+            desktop/release/*.zip
+            desktop/release/*.exe
+            desktop/release/*.msi
+            desktop/release/*.blockmap
+            desktop/release/latest*.yml
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+          merge-multiple: true
 
       - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            desktop/release/**
-            !desktop/release/*-unpacked/**
+          files: release-artifacts/*
+          fail_on_unmatched_files: true
